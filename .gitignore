@@ -1,0 +1,40 @@
+cd ~/Dow/worker_lambda
+
+cat > .gitignore << 'EOF'
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtualenv
+.venv/
+venv/
+env/
+ENV/
+*.env
+
+# OS
+.DS_Store
+
+# IDE / Editor
+.vscode/
+.idea/
+*.iml
+
+# Test / Cache
+.pytest_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# Build / Package
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
+EOF
