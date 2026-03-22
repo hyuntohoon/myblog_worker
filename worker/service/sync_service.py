@@ -28,6 +28,8 @@ def normalize_release_date(date: Optional[str]) -> Optional[str]:
 
     try:
         y, m, d = date.split("-")
+        if len(y) != 4:
+            return None
         if int(y) <= 0 or int(m) <= 0 or int(d) <= 0:
             return None
         return date

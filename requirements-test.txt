@@ -1,0 +1,4 @@
+# requirements-test.txt
+# 기존 requirements.txt에 추가로 설치
+pytest>=8.0
+allure-pytest>=2.13
