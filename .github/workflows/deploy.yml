@@ -6,11 +6,36 @@ on:
     branches: [main]
 
 jobs:
-  deploy:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-test.txt
+
+      - name: Run tests
+        env:
+          TEST_DB_URL: ${{ secrets.TEST_DB_URL }}
+        run: pytest tests/ -v --alluredir=allure-results
+
+      - name: Upload Allure results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-results
+          path: allure-results/
+
+  deploy:
+    needs: test # ← test job이 통과해야 deploy 실행
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -18,12 +43,11 @@ jobs:
       - name: Build zip
         run: |
           mkdir -p build
-          pip install -r requirements.txt -t build --platform manylinux2014_aarch64 --only-binary=:all:
+          pip install -r requirements.txt -t build \
+            --platform manylinux2014_aarch64 --only-binary=:all:
           cp -r worker build/
-          find build -name "__pycache__" -type d -exec rm -rf {} +
-          find build -name "*.pyc" -delete
-          cd build && zip -r ../bundle.zip . && cd -
-          ls -lh bundle.zip
+          find build -name "__pycache__" -exec rm -rf {} +
+          cd build && zip -r ../bundle.zip .
 
       - name: Deploy to Lambda
         env:
