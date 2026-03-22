@@ -4,6 +4,7 @@ name: Deploy Worker Lambda
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   test:
@@ -22,6 +23,9 @@ jobs:
       - name: Run tests
         env:
           TEST_DB_URL: ${{ secrets.TEST_DB_URL }}
+          SPOTIFY_CLIENT_ID: "test"
+          SPOTIFY_CLIENT_SECRET: "test"
+          DRY_RUN: "true"
         run: pytest tests/ -v --alluredir=allure-results
 
       - name: Upload Allure results
@@ -32,7 +36,7 @@ jobs:
           path: allure-results/
 
   deploy:
-    needs: test # ← test job이 통과해야 deploy 실행
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +51,7 @@ jobs:
             --platform manylinux2014_aarch64 --only-binary=:all:
           cp -r worker build/
           find build -name "__pycache__" -exec rm -rf {} +
+          find build -name "*.pyc" -delete
           cd build && zip -r ../bundle.zip .
 
       - name: Deploy to Lambda
