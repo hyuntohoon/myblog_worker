@@ -38,3 +38,14 @@ dist/
 # Logs
 *.log
 EOF
+# Allure
+allure-results/
+allure-report/
+
+# Lambda bundle
+bundle.zip
+lambda_bundle.zip
+
+# Test DB
+*.db
+*.sqlite3
