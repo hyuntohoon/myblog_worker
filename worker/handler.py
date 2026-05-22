@@ -77,6 +77,6 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         except Exception as e:
             logger.error("[%d/%d] Record failed: %s", i, len(records), e, exc_info=True)
             failed.append(record.get("messageId", str(i)))
-            raise
 
     return {"batchItemFailures": [{"itemIdentifier": mid} for mid in failed]}
+
