@@ -2,11 +2,14 @@
 from __future__ import annotations
 from typing import Dict, Any, List, Optional, Set
 import json
+import logging
 import requests
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 from worker.clients.spotify_client import spotify
 from worker.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 def normalize_release_date(date: Optional[str]) -> Optional[str]:
@@ -70,7 +73,7 @@ def generate_artist_aliases(name: str, genres: List[str]) -> List[str]:
         )
 
         if response.status_code != 200:
-            print(f"  [ALIAS] Gemini API error: {response.status_code}")
+            logger.warning("Gemini API error: %s", response.status_code)
             return []
 
         data = response.json()
@@ -87,13 +90,13 @@ def generate_artist_aliases(name: str, genres: List[str]) -> List[str]:
         if isinstance(aliases, list):
             aliases = [a.strip() for a in aliases if isinstance(a, str) and a.strip()]
             aliases = [a for a in aliases if a.lower() != name.lower()]
-            print(f"  [ALIAS] {name} → {aliases}")
+            logger.info("Aliases for '%s': %s", name, aliases)
             return aliases
 
         return []
 
     except Exception as e:
-        print(f"  [ALIAS] Failed for {name}: {e}")
+        logger.warning("Alias generation failed for '%s': %s", name, e)
         return []
 
 
@@ -178,7 +181,7 @@ class AlbumSyncService:
                 """),
                 artists_list,
             )
-            print(f"  [BULK] artists upserted: {len(artists_list)}")
+            logger.info("artists upserted: %d", len(artists_list))
 
         if album_data:
             self.conn.execute(
@@ -203,7 +206,7 @@ class AlbumSyncService:
                 """),
                 album_data,
             )
-            print(f"  [BULK] albums upserted: {len(album_data)}")
+            logger.info("albums upserted: %d", len(album_data))
 
         if album_artist_pairs:
             self.conn.execute(
@@ -217,7 +220,7 @@ class AlbumSyncService:
                 """),
                 album_artist_pairs,
             )
-            print(f"  [BULK] album_artists linked: {len(album_artist_pairs)}")
+            logger.info("album_artists linked: %d", len(album_artist_pairs))
 
         if track_data:
             self.conn.execute(
@@ -236,7 +239,7 @@ class AlbumSyncService:
                 """),
                 track_data,
             )
-            print(f"  [BULK] tracks upserted: {len(track_data)}")
+            logger.info("tracks upserted: %d", len(track_data))
 
         if track_artist_pairs:
             unique_pairs = list({(p["tid"], p["aid"]): p for p in track_artist_pairs}.values())
@@ -251,7 +254,7 @@ class AlbumSyncService:
                 """),
                 unique_pairs,
             )
-            print(f"  [BULK] track_artists linked: {len(unique_pairs)}")
+            logger.info("track_artists linked: %d", len(unique_pairs))
 
         # 4) 사진 없는 아티스트 enrich
         all_artist_ids: Set[str] = set(all_artists.keys())
@@ -300,7 +303,7 @@ class AlbumSyncService:
                             """),
                             enrich_data,
                         )
-                        print(f"  [BULK] artists enriched: {len(enrich_data)}")
+                        logger.info("artists enriched: %d", len(enrich_data))
 
 
 def generate_and_save_aliases(session_factory) -> None:
@@ -312,7 +315,7 @@ def generate_and_save_aliases(session_factory) -> None:
     """
     api_key = getattr(settings, "GEMINI_API_KEY", None)
     if not api_key:
-        print("  [ALIAS] GEMINI_API_KEY not set, skipping")
+        logger.debug("GEMINI_API_KEY not set, skipping alias generation")
         return
 
     try:
@@ -329,10 +332,10 @@ def generate_and_save_aliases(session_factory) -> None:
             ).fetchall()
 
             if not rows:
-                print("  [ALIAS] No artists need aliases")
+                logger.debug("No artists need aliases")
                 return
 
-            print(f"  [ALIAS] Generating aliases for {len(rows)} artists")
+            logger.info("Generating aliases for %d artists", len(rows))
 
             update_data = []
             for row in rows:
@@ -361,7 +364,7 @@ def generate_and_save_aliases(session_factory) -> None:
                     update_data,
                 )
                 session.commit()
-                print(f"  [ALIAS] Updated aliases for {len(update_data)} artists")
+                logger.info("Updated aliases for %d artists", len(update_data))
 
     except Exception as e:
-        print(f"  [ALIAS] Error: {e}")
+        logger.error("Alias update failed: %s", e, exc_info=True)
