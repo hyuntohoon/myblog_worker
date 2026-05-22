@@ -202,7 +202,8 @@ class AlbumSyncService:
                            album_type   = EXCLUDED.album_type,
                            total_tracks = EXCLUDED.total_tracks,
                            label        = EXCLUDED.label,
-                           popularity   = EXCLUDED.popularity
+                           popularity   = EXCLUDED.popularity,
+                           ext_refs     = EXCLUDED.ext_refs
                 """),
                 album_data,
             )
