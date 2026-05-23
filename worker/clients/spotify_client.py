@@ -1,6 +1,8 @@
-import base64, time, httpx
+import base64, logging, time, httpx
 from typing import Optional, Dict, Any, List
 from worker.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 # Spotify batch limits
 _MAX_ALBUMS  = 20
@@ -62,15 +64,13 @@ class SpotifyClient:
                 params["market"] = mkt
             params["locale"] = "ko_KR"
 
-            # 🔎 요청 URL 프린트
-            full_url = str(httpx.URL(base_url, params=params))
-            print(f"[HTTP] GET {full_url}  (chunk={i // _MAX_ALBUMS + 1}, size={len(chunk)})")
+            logger.debug("GET /albums chunk=%d size=%d", i // _MAX_ALBUMS + 1, len(chunk))
 
             r = httpx.get(base_url, headers=self._headers(), params=params, timeout=20)
             r.raise_for_status()
 
             albums = r.json().get("albums") or []
-            print(f"[HTTP]   → Retrieved {len(albums)} albums")
+            logger.debug("Retrieved %d albums", len(albums))
 
             out.extend(albums)
 
@@ -93,15 +93,13 @@ class SpotifyClient:
 
             params["locale"] = "ko_KR"
 
-            # 🔎 요청 URL 프린트
-            full_url = str(httpx.URL(base_url, params=params))
-            print(f"[HTTP] GET {full_url}  (chunk={i // _MAX_ARTISTS + 1}, size={len(chunk)})")
+            logger.debug("GET /artists chunk=%d size=%d", i // _MAX_ARTISTS + 1, len(chunk))
 
             r = httpx.get(base_url, headers=self._headers(), params=params, timeout=20)
             r.raise_for_status()
 
             artists = r.json().get("artists") or []
-            print(f"[HTTP]   → Retrieved {len(artists)} artists")
+            logger.debug("Retrieved %d artists", len(artists))
 
             out.extend(artists)
 
