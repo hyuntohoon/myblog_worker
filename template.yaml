@@ -1,0 +1,118 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Album sync worker on Lambda (SQS consumer, Python 3.12)
+
+Parameters:
+  SqsQueueArn:
+    Type: String
+    # ARN of the existing album sync SQS queue
+    # e.g. arn:aws:sqs:ap-northeast-2:123456789012:album-sync-queue
+
+  SecretsArn:
+    Type: String
+    Default: ""
+    # JSON keys: DATABASE_URL, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, GEMINI_API_KEY
+
+  SubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+
+  SecurityGroupIds:
+    Type: CommaDelimitedList
+    Default: ""
+
+  LogRetentionInDays:
+    Type: Number
+    Default: 14
+
+  DlqMessageRetentionSeconds:
+    Type: Number
+    Default: 1209600  # 14 days
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Timeout: 120
+    MemorySize: 512
+    Tracing: Active
+    Environment:
+      Variables:
+        ENV: prod
+        SECRETS_ARN: !Ref SecretsArn
+
+Resources:
+  # Dead Letter Queue for failed album sync messages
+  AlbumSyncDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: album-sync-dlq
+      MessageRetentionPeriod: !Ref DlqMessageRetentionSeconds
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: worker.handler.lambda_handler
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !Ref SqsQueueArn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds: !Ref SecurityGroupIds
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSXrayWriteOnlyAccess
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:GetQueueAttributes
+                - sqs:ChangeMessageVisibility
+              Resource: !Ref SqsQueueArn
+            - Effect: Allow
+              Action:
+                - sqs:SendMessage
+              Resource: !GetAtt AlbumSyncDLQ.Arn
+            - Effect: Allow
+              Action: ["secretsmanager:GetSecretValue"]
+              Resource: !Ref SecretsArn
+
+  WorkerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${WorkerFunction}"
+      RetentionInDays: !Ref LogRetentionInDays
+
+  # Alarm: DLQ received messages → something is failing persistently
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: album-sync-dlq-messages
+      AlarmDescription: "Album sync messages reached DLQ — worker is failing after retries"
+      Namespace: AWS/SQS
+      MetricName: NumberOfMessagesSent
+      Dimensions:
+        - Name: QueueName
+          Value: album-sync-dlq
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  DLQUrl:
+    Description: Dead Letter Queue URL (use to inspect failed sync messages)
+    Value: !Ref AlbumSyncDLQ
+  DLQArn:
+    Description: Dead Letter Queue ARN (configure as RedrivePolicy target on main queue)
+    Value: !GetAtt AlbumSyncDLQ.Arn
