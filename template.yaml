@@ -6,20 +6,12 @@ Parameters:
   SqsQueueArn:
     Type: String
     # ARN of the existing album sync SQS queue
-    # e.g. arn:aws:sqs:ap-northeast-2:123456789012:album-sync-queue
+    # prod: arn:aws:sqs:ap-northeast-2:338183196042:blogSQS
 
   SecretsArn:
     Type: String
     Default: ""
     # JSON keys: DATABASE_URL, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, GEMINI_API_KEY
-
-  SubnetIds:
-    Type: CommaDelimitedList
-    Default: ""
-
-  SecurityGroupIds:
-    Type: CommaDelimitedList
-    Default: ""
 
   LogRetentionInDays:
     Type: Number
@@ -62,9 +54,6 @@ Resources:
             BatchSize: 10
             FunctionResponseTypes:
               - ReportBatchItemFailures
-      VpcConfig:
-        SubnetIds: !Ref SubnetIds
-        SecurityGroupIds: !Ref SecurityGroupIds
       Policies:
         - AWSLambdaBasicExecutionRole
         - AWSXrayWriteOnlyAccess
@@ -101,7 +90,7 @@ Resources:
       MetricName: NumberOfMessagesSent
       Dimensions:
         - Name: QueueName
-          Value: album-sync-dlq
+          Value: !GetAtt AlbumSyncDLQ.QueueName
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1
