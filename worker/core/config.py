@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "music-backend"
     ENV: str = "local"
 
-    DATABASE_URL: str = "postgresql+psycopg://blog:blog@127.0.0.1:5433/blog"
+    DATABASE_URL: str = ""
 
     # Spotify
     SPOTIFY_CLIENT_ID: str = ""
@@ -64,6 +64,7 @@ def get_settings() -> Settings:
         if secrets.get("SPOTIFY_CLIENT_SECRET"):
             s.SPOTIFY_CLIENT_SECRET = secrets["SPOTIFY_CLIENT_SECRET"]
         missing = [k for k, v in {
+            "DATABASE_URL": s.DATABASE_URL,
             "SPOTIFY_CLIENT_ID": s.SPOTIFY_CLIENT_ID,
             "SPOTIFY_CLIENT_SECRET": s.SPOTIFY_CLIENT_SECRET,
         }.items() if not v]
