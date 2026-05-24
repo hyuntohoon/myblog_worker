@@ -5,8 +5,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "music-backend"
     ENV: str = "local"
 
-    # DB (not used in this minimal zip, but reserved)
-    DB_URL: str | None = "postgresql+psycopg://blog:blog@127.0.0.1:5433/blog"
+    DATABASE_URL: str = "postgresql+psycopg://blog:blog@127.0.0.1:5433/blog"
 
     # Spotify
     SPOTIFY_CLIENT_ID: str
