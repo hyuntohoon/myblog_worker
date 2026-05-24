@@ -63,6 +63,12 @@ def get_settings() -> Settings:
             s.SPOTIFY_CLIENT_ID = secrets["SPOTIFY_CLIENT_ID"]
         if secrets.get("SPOTIFY_CLIENT_SECRET"):
             s.SPOTIFY_CLIENT_SECRET = secrets["SPOTIFY_CLIENT_SECRET"]
+        missing = [k for k, v in {
+            "SPOTIFY_CLIENT_ID": s.SPOTIFY_CLIENT_ID,
+            "SPOTIFY_CLIENT_SECRET": s.SPOTIFY_CLIENT_SECRET,
+        }.items() if not v]
+        if missing:
+            raise ValueError(f"Required secrets missing after Secrets Manager load: {missing}. Check SECRETS_ARN and IAM policy.")
     return s
 
 
