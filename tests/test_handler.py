@@ -10,9 +10,10 @@ from worker.handler import lambda_handler
 
 
 @pytest.mark.unit
+@patch("worker.handler.spotify")
 @patch("worker.handler.AlbumSyncService")
 @patch("worker.handler.SessionLocal")
-def test_handler_batch_format(mock_session_local, mock_svc_class):
+def test_handler_batch_format(mock_session_local, mock_svc_class, mock_spotify):
     """album_ids 배치 포맷 메시지를 처리하는지 확인."""
     mock_session = MagicMock()
     mock_session_local.return_value.__enter__ = MagicMock(return_value=mock_session)
