@@ -29,7 +29,7 @@ def test_handler_batch_format(mock_session_local, mock_svc_class):
 
     results = lambda_handler(event, None)
 
-    assert results == [True]
+    assert results == {"batchItemFailures": []}
 
 
 @pytest.mark.unit
@@ -37,14 +37,14 @@ def test_handler_empty_records():
     """빈 Records를 넘겨도 에러 없이 동작하는지 확인."""
     event = {"Records": []}
     results = lambda_handler(event, None)
-    assert results == []
+    assert results == {"batchItemFailures": []}
 
 
 @pytest.mark.unit
 @patch("worker.handler.AlbumSyncService")
 @patch("worker.handler.SessionLocal")
 def test_handler_unknown_format(mock_session_local, mock_svc_class):
-    """알 수 없는 메시지 포맷은 스킵하는지 확인."""
+    """알 수 없는 메시지 포맷은 스킵(성공 처리)하는지 확인."""
     event = {
         "Records": [{
             "body": json.dumps({"unknown_field": "value"})
@@ -52,18 +52,19 @@ def test_handler_unknown_format(mock_session_local, mock_svc_class):
     }
 
     results = lambda_handler(event, None)
-    assert results == [True]  # 스킵하되 True 반환
+    assert results == {"batchItemFailures": []}
 
 
 @pytest.mark.unit
 @patch("worker.handler.AlbumSyncService")
 @patch("worker.handler.SessionLocal")
 def test_handler_error_returns_true(mock_session_local, mock_svc_class):
-    """처리 중 에러가 나도 True를 반환하는지 확인 (재시도 비활성 정책)."""
+    """처리 중 에러가 나면 해당 record를 batchItemFailures에 추가하는지 확인."""
     mock_session_local.side_effect = Exception("DB connection failed")
 
     event = {
         "Records": [{
+            "messageId": "msg-001",
             "body": json.dumps({
                 "album_ids": ["abc123"],
                 "market": "KR",
@@ -72,4 +73,4 @@ def test_handler_error_returns_true(mock_session_local, mock_svc_class):
     }
 
     results = lambda_handler(event, None)
-    assert results == [True]
+    assert results == {"batchItemFailures": [{"itemIdentifier": "msg-001"}]}
