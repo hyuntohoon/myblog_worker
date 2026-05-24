@@ -1,3 +1,5 @@
+# Parallel implementation: myblog_music/app/clients/spotify_client.py
+# Auth logic (_get_token/_headers) must stay in sync. See docs/decisions/ADR-0004.
 import base64, logging, time, httpx
 from typing import Optional, Dict, Any, List
 from worker.core.config import settings
