@@ -54,6 +54,12 @@ Resources:
             BatchSize: 10
             FunctionResponseTypes:
               - ReportBatchItemFailures
+        AliasGenerationSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(15 minutes)
+            Description: "Batch-generate Gemini aliases for artists without aliases"
+            Enabled: true
       Policies:
         - AWSLambdaBasicExecutionRole
         - AWSXrayWriteOnlyAccess
