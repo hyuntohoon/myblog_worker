@@ -75,3 +75,40 @@ def test_handler_error_returns_true(mock_session_local, mock_svc_class):
 
     results = lambda_handler(event, None)
     assert results == {"batchItemFailures": [{"itemIdentifier": "msg-001"}]}
+
+
+@pytest.mark.unit
+@patch("worker.handler.generate_and_save_aliases")
+def test_handler_eventbridge_trigger_runs_alias_generation(mock_alias):
+    """EventBridge scheduled event triggers alias generation, not SQS processing."""
+    event = {
+        "source": "aws.events",
+        "detail-type": "Scheduled Event",
+        "detail": {},
+    }
+
+    result = lambda_handler(event, None)
+
+    mock_alias.assert_called_once()
+    assert result == {}
+
+
+@pytest.mark.unit
+@patch("worker.handler.generate_and_save_aliases")
+@patch("worker.handler.AlbumSyncService")
+@patch("worker.handler.SessionLocal")
+def test_handler_sqs_does_not_call_alias_generation(mock_session_local, mock_svc_class, mock_alias):
+    """SQS sync path must NOT trigger alias generation (decoupled)."""
+    mock_session = MagicMock()
+    mock_session_local.return_value.__enter__ = MagicMock(return_value=mock_session)
+    mock_session_local.return_value.__exit__ = MagicMock(return_value=False)
+
+    event = {
+        "Records": [{
+            "body": json.dumps({"album_ids": ["abc123"], "market": "KR"})
+        }]
+    }
+
+    lambda_handler(event, None)
+
+    mock_alias.assert_not_called()

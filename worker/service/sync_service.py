@@ -328,7 +328,7 @@ def generate_and_save_aliases(session_factory) -> None:
                     SELECT spotify_id, name, genres
                     FROM artists
                     WHERE aliases = '[]'::jsonb OR aliases IS NULL
-                    LIMIT 20
+                    LIMIT 10
                 """)
             ).fetchall()
 

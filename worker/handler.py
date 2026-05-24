@@ -38,20 +38,29 @@ def _process_batch(album_ids: List[str], market: str) -> None:
         logger.info("[DRY_RUN] fetched=%d (batch)", len(albums))
         return
 
-    # --- 1) Main sync (transaction 1) ---
     with SessionLocal() as session, session.begin():
         svc = AlbumSyncService(session.connection())
         svc.sync_albums_batch(album_ids, market)
         logger.info("Batch synced to DB: %d albums", len(album_ids))
 
-    # --- 2) AI alias generation (transaction 2, separate) ---
+
+def _run_alias_generation() -> None:
+    """Called by the EventBridge scheduled trigger (not the SQS sync path)."""
     try:
         generate_and_save_aliases(SessionLocal)
     except Exception as e:
-        logger.warning("Alias generation failed (non-critical): %s", e)
+        logger.error("Alias generation failed: %s", e, exc_info=True)
+        raise
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    # EventBridge scheduled rule — run alias generation and return
+    if event.get("source") == "aws.events":
+        logger.info("EventBridge trigger: running alias generation")
+        _run_alias_generation()
+        return {}
+
+    # SQS trigger — album sync
     records = event.get("Records") or []
     logger.info("Received %d records", len(records))
 
@@ -79,4 +88,3 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             failed.append(record.get("messageId", str(i)))
 
     return {"batchItemFailures": [{"itemIdentifier": mid} for mid in failed]}
-
