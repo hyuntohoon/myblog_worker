@@ -5,7 +5,7 @@ AWS Lambda function that consumes SQS album-sync messages and writes album, trac
 ## Stack
 
 - **Runtime**: Python 3.12, Lambda (no FastAPI — pure handler)
-- **DB**: PostgreSQL via SQLAlchemy 2 + psycopg3
+- **DB**: PostgreSQL via SQLAlchemy 2 + psycopg3; table objects from `myblog-shared-db` package (`myblog_shared_db.tables`)
 - **External**: Spotify Web API (via `worker/clients/spotify_client.py`)
 - **Trigger**: AWS SQS (`album-sync-queue`)
 - **Deploy**: `build.sh` → zip
@@ -21,6 +21,9 @@ worker/
 │   └── spotify_client.py ← Spotify API wrapper
 └── service/
     └── sync_service.py  ← AlbumSyncService (bulk upsert), generate_and_save_aliases
+
+Note: `worker/infra/tables.py` was removed (ARCH-6). Table definitions now come from
+`myblog_shared_db.tables`; `sync_service.py` uses raw `sqlalchemy.text()` directly.
 ```
 
 ## Message Formats
