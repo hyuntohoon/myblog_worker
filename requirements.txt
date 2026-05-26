@@ -4,3 +4,4 @@ sqlalchemy
 psycopg[binary]
 boto3
 requests
+myblog-shared-db @ git+https://github.com/hyuntohoon/myblog_shared_db.git@v0.1.0
