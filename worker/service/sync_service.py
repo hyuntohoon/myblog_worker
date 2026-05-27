@@ -3,11 +3,10 @@ from __future__ import annotations
 from typing import Dict, Any, List, Optional, Set
 import json
 import logging
-import requests
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 from worker.clients.spotify_client import spotify
-from worker.core.config import settings
+from worker.clients.musicbrainz_client import fetch_artist_mbid_and_aliases
 
 logger = logging.getLogger(__name__)
 
@@ -38,66 +37,6 @@ def normalize_release_date(date: Optional[str]) -> Optional[str]:
         return date
     except Exception:
         return None
-
-
-def generate_artist_aliases(name: str, genres: List[str]) -> List[str]:
-    """Gemini API로 아티스트 별칭 생성. 실패하면 빈 리스트 반환."""
-    api_key = getattr(settings, "GEMINI_API_KEY", None)
-    if not api_key:
-        return []
-
-    try:
-        response = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}",
-            headers={"Content-Type": "application/json"},
-            json={
-                "contents": [{
-                    "parts": [{
-                        "text": (
-                            f"아티스트 이름: {name}\n"
-                            f"장르: {', '.join(genres) if genres else '알 수 없음'}\n\n"
-                            "이 아티스트를 검색할 때 사용할 수 있는 한국어 별칭, 다른 표기, 줄임말을 JSON 배열로 반환해.\n"
-                            "규칙:\n"
-                            "- 원래 이름은 제외\n"
-                            "- 실제로 한국에서 사용되는 별칭만\n"
-                            "- 한글 발음 표기 포함 (예: C JAMM → 씨잼)\n"
-                            "- 붙여쓰기/띄어쓰기 변형 포함 (예: C JAMM → CJAMM)\n"
-                            "- 없으면 빈 배열 []\n"
-                            "- JSON 배열만 반환하고 다른 텍스트는 쓰지 마\n"
-                            '예시: ["씨잼", "CJAMM"]'
-                        )
-                    }]
-                }]
-            },
-            timeout=10,
-        )
-
-        if response.status_code != 200:
-            logger.warning("Gemini API error: %s", response.status_code)
-            return []
-
-        data = response.json()
-        text_content = data["candidates"][0]["content"]["parts"][0]["text"]
-
-        # JSON 파싱 (마크다운 코드블록 제거)
-        cleaned = text_content.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.split("\n", 1)[-1]
-            cleaned = cleaned.rsplit("```", 1)[0]
-        cleaned = cleaned.strip()
-
-        aliases = json.loads(cleaned)
-        if isinstance(aliases, list):
-            aliases = [a.strip() for a in aliases if isinstance(a, str) and a.strip()]
-            aliases = [a for a in aliases if a.lower() != name.lower()]
-            logger.info("Aliases for '%s': %s", name, aliases)
-            return aliases
-
-        return []
-
-    except Exception as e:
-        logger.warning("Alias generation failed for '%s': %s", name, e)
-        return []
 
 
 class AlbumSyncService:
@@ -308,64 +247,53 @@ class AlbumSyncService:
 
 
 def generate_and_save_aliases(session_factory) -> None:
-    """
-    트랜잭션 밖에서 별도로 호출.
-    aliases가 비어있는 아티스트에 대해 Gemini로 별칭 생성 후 저장.
+    """Called by the EventBridge scheduled trigger after the SQS sync COMMIT.
 
-    handler.py에서 메인 트랜잭션 COMMIT 이후에 호출한다.
+    Fetches aliases from MusicBrainz for artists that have not yet been looked up
+    (musicbrainz_id IS NULL).  Writes musicbrainz_id + aliases in one UPDATE per
+    artist.  If no MB match is found, musicbrainz_id is set to MBID_NOT_FOUND so
+    the artist is skipped on the next scheduled run.
     """
-    api_key = getattr(settings, "GEMINI_API_KEY", None)
-    if not api_key:
-        logger.debug("GEMINI_API_KEY not set, skipping alias generation")
-        return
-
     try:
         with session_factory() as session:
             conn = session.connection()
 
             rows = conn.execute(
                 text("""
-                    SELECT spotify_id, name, genres
+                    SELECT spotify_id, name
                     FROM artists
-                    WHERE aliases = '[]'::jsonb OR aliases IS NULL
+                    WHERE musicbrainz_id IS NULL
                     LIMIT 10
                 """)
             ).fetchall()
 
             if not rows:
-                logger.debug("No artists need aliases")
+                logger.debug("No artists pending MB lookup")
                 return
 
-            logger.info("Generating aliases for %d artists", len(rows))
+            logger.info("Looking up %d artists on MusicBrainz", len(rows))
 
             update_data = []
             for row in rows:
-                sid, name, genres_json = row[0], row[1], row[2]
-
-                genres = []
-                if genres_json:
-                    try:
-                        genres = json.loads(genres_json) if isinstance(genres_json, str) else genres_json
-                    except Exception:
-                        genres = []
-
-                aliases = generate_artist_aliases(name, genres)
+                sid, name = row[0], row[1]
+                mbid, aliases = fetch_artist_mbid_and_aliases(name)
                 update_data.append(dict(
                     sid=sid,
+                    mbid=mbid,
                     aliases=json.dumps(aliases, ensure_ascii=False),
                 ))
 
-            if update_data:
-                conn.execute(
-                    text("""
-                        UPDATE artists
-                        SET aliases = CAST(:aliases AS jsonb)
-                        WHERE spotify_id = :sid
-                    """),
-                    update_data,
-                )
-                session.commit()
-                logger.info("Updated aliases for %d artists", len(update_data))
+            conn.execute(
+                text("""
+                    UPDATE artists
+                    SET musicbrainz_id = :mbid,
+                        aliases        = CAST(:aliases AS jsonb)
+                    WHERE spotify_id = :sid
+                """),
+                update_data,
+            )
+            session.commit()
+            logger.info("MB lookup done for %d artists", len(update_data))
 
     except Exception as e:
         logger.error("Alias update failed: %s", e, exc_info=True)

@@ -18,7 +18,8 @@ worker/
 ├── core/config.py       ← Settings (pydantic BaseSettings)
 ├── infra/db.py          ← SessionLocal factory
 ├── clients/
-│   └── spotify_client.py ← Spotify API wrapper
+│   ├── spotify_client.py      ← Spotify API wrapper
+│   └── musicbrainz_client.py  ← MusicBrainz lookup (1 req/sec rate-limited)
 └── service/
     └── sync_service.py  ← AlbumSyncService (bulk upsert), generate_and_save_aliases
 
@@ -55,7 +56,7 @@ Raising instead of returning causes SQS to retry the **entire batch**. Per-recor
 1. Parse `record["body"]` as JSON
 2. Dispatch to `_process_batch` (Format A) or `_process_single` (Format B)
 3. `AlbumSyncService.sync_albums_batch` — bulk upsert albums, tracks, artists in one transaction
-4. After commit, call `generate_and_save_aliases` (separate transaction) — Gemini API alias generation for artists without aliases
+4. After commit, call `generate_and_save_aliases` (separate transaction) — MusicBrainz alias lookup for artists where `musicbrainz_id IS NULL` (up to 10 per run, 1 req/sec)
 
 ## Hard Rules
 
@@ -74,7 +75,6 @@ AWS_DEFAULT_REGION=ap-northeast-2
 SQS_QUEUE_URL=...
 SPOTIFY_DEFAULT_MARKET=KR
 DRY_RUN=false        # set true to fetch from Spotify without writing to DB
-GEMINI_API_KEY=...   # optional; skip alias generation if unset
 LOCALSTACK_ENDPOINT= # local only
 ```
 

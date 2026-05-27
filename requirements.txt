@@ -3,5 +3,5 @@ pydantic-settings>=2
 sqlalchemy
 psycopg[binary]
 boto3
-requests
+musicbrainzngs>=0.7
 myblog-shared-db @ git+https://github.com/hyuntohoon/myblog_shared_db.git@v0.1.0
