@@ -23,9 +23,6 @@ class Settings(BaseSettings):
     SPOTIFY_API_BASE: str = "https://api.spotify.com/v1"
     SPOTIFY_DEFAULT_MARKET: str = "KR"
 
-    # Gemini (optional — alias generation is skipped when unset)
-    GEMINI_API_KEY: str = ""
-
     # AWS / SQS (for local testing convenience)
     AWS_DEFAULT_REGION: str = "ap-northeast-2"
     LOCALSTACK_ENDPOINT: str | None = None
@@ -66,8 +63,6 @@ def get_settings() -> Settings:
             s.SPOTIFY_CLIENT_ID = secrets["SPOTIFY_CLIENT_ID"]
         if secrets.get("SPOTIFY_CLIENT_SECRET"):
             s.SPOTIFY_CLIENT_SECRET = secrets["SPOTIFY_CLIENT_SECRET"]
-        if secrets.get("GEMINI_API_KEY"):
-            s.GEMINI_API_KEY = secrets["GEMINI_API_KEY"]
         missing = [k for k, v in {
             "DATABASE_URL": s.DATABASE_URL,
             "SPOTIFY_CLIENT_ID": s.SPOTIFY_CLIENT_ID,
