@@ -260,7 +260,7 @@ def generate_and_save_aliases(session_factory) -> None:
 
             rows = conn.execute(
                 text("""
-                    SELECT spotify_id, name
+                    SELECT spotify_id, name, genres
                     FROM artists
                     WHERE musicbrainz_id IS NULL
                     LIMIT 10
@@ -275,8 +275,10 @@ def generate_and_save_aliases(session_factory) -> None:
 
             update_data = []
             for row in rows:
-                sid, name = row[0], row[1]
-                mbid, aliases = fetch_artist_mbid_and_aliases(name)
+                sid, name, genres = row[0], row[1], row[2]
+                mbid, aliases = fetch_artist_mbid_and_aliases(
+                    name, spotify_genres=genres or []
+                )
                 update_data.append(dict(
                     sid=sid,
                     mbid=mbid,

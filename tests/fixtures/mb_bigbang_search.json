@@ -1,0 +1,44 @@
+{
+  "artist-list": [
+    {
+      "id": "fixture-uuid-big-country",
+      "type": "Group",
+      "ext:score": "100",
+      "name": "Big Country",
+      "sort-name": "Big Country",
+      "country": "GB",
+      "area": {
+        "id": "fixture-area-gb",
+        "name": "United Kingdom",
+        "sort-name": "United Kingdom",
+        "iso-3166-1-code-list": ["GB"]
+      },
+      "begin-area": {
+        "id": "fixture-begin-area",
+        "name": "Dunfermline",
+        "sort-name": "Dunfermline"
+      },
+      "life-span": {
+        "begin": "1981",
+        "end": "2000",
+        "ended": "true"
+      },
+      "alias-list": [],
+      "tag-list": [
+        {"count": "5", "name": "rock"},
+        {"count": "3", "name": "new wave"}
+      ]
+    },
+    {
+      "id": "fixture-uuid-bigfoot",
+      "type": "Group",
+      "ext:score": "92",
+      "name": "Bigfoot",
+      "sort-name": "Bigfoot",
+      "country": "GB",
+      "life-span": {"begin": "2014"},
+      "tag-list": [{"count": "1", "name": "hard rock"}]
+    }
+  ],
+  "artist-count": 2
+}
