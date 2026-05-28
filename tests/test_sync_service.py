@@ -207,7 +207,7 @@ def _build_session_mock(rows, collision_mbid):
     session = MagicMock()
     session.__enter__ = MagicMock(return_value=session)
     session.__exit__ = MagicMock(return_value=False)
-    session.connection.return_value.execute = MagicMock(side_effect=execute_side_effect)
+    session.execute = MagicMock(side_effect=execute_side_effect)
     session.commit = MagicMock(side_effect=lambda: commit_count.__setitem__(0, commit_count[0] + 1))
     session.rollback = MagicMock(
         side_effect=lambda: rollback_count.__setitem__(0, rollback_count[0] + 1)

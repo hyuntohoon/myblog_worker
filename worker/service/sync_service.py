@@ -258,9 +258,11 @@ def generate_and_save_aliases(session_factory) -> None:
     """
     try:
         with session_factory() as session:
-            conn = session.connection()
-
-            rows = conn.execute(
+            # Use session.execute (not a cached conn) so each statement
+            # acquires a live connection from the session — caching
+            # session.connection() across session.commit() returns it to
+            # the pool, leaving a stale handle (BUG-17 hotfix).
+            rows = session.execute(
                 text("""
                     SELECT spotify_id, name, genres
                     FROM artists
@@ -292,7 +294,7 @@ def generate_and_save_aliases(session_factory) -> None:
                     name, spotify_genres=genres or []
                 )
                 try:
-                    conn.execute(
+                    session.execute(
                         update_stmt,
                         dict(
                             sid=sid,
