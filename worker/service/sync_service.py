@@ -5,6 +5,7 @@ import json
 import logging
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import IntegrityError
 from worker.clients.spotify_client import spotify
 from worker.clients.musicbrainz_client import fetch_artist_mbid_and_aliases
 
@@ -250,9 +251,10 @@ def generate_and_save_aliases(session_factory) -> None:
     """Called by the EventBridge scheduled trigger after the SQS sync COMMIT.
 
     Fetches aliases from MusicBrainz for artists that have not yet been looked up
-    (musicbrainz_id IS NULL).  Writes musicbrainz_id + aliases in one UPDATE per
-    artist.  If no MB match is found, musicbrainz_id is set to MBID_NOT_FOUND so
-    the artist is skipped on the next scheduled run.
+    (musicbrainz_id IS NULL). Writes musicbrainz_id + aliases in one UPDATE per
+    artist, committed per row so a UNIQUE collision (BUG-17) on one MBID does not
+    roll back the rest of the batch. If no MB match is found, musicbrainz_id is
+    set to MBID_NOT_FOUND so the artist is skipped on the next scheduled run.
     """
     try:
         with session_factory() as session:
@@ -263,9 +265,11 @@ def generate_and_save_aliases(session_factory) -> None:
                     SELECT spotify_id, name, genres
                     FROM artists
                     WHERE musicbrainz_id IS NULL
+                    ORDER BY spotify_id
                     LIMIT 10
                 """)
             ).fetchall()
+            session.commit()
 
             if not rows:
                 logger.debug("No artists pending MB lookup")
@@ -273,29 +277,43 @@ def generate_and_save_aliases(session_factory) -> None:
 
             logger.info("Looking up %d artists on MusicBrainz", len(rows))
 
-            update_data = []
+            update_stmt = text("""
+                UPDATE artists
+                SET musicbrainz_id = :mbid,
+                    aliases        = CAST(:aliases AS jsonb)
+                WHERE spotify_id = :sid
+            """)
+
+            succeeded = 0
+            skipped_collision = 0
             for row in rows:
                 sid, name, genres = row[0], row[1], row[2]
                 mbid, aliases = fetch_artist_mbid_and_aliases(
                     name, spotify_genres=genres or []
                 )
-                update_data.append(dict(
-                    sid=sid,
-                    mbid=mbid,
-                    aliases=json.dumps(aliases, ensure_ascii=False),
-                ))
+                try:
+                    conn.execute(
+                        update_stmt,
+                        dict(
+                            sid=sid,
+                            mbid=mbid,
+                            aliases=json.dumps(aliases, ensure_ascii=False),
+                        ),
+                    )
+                    session.commit()
+                    succeeded += 1
+                except IntegrityError as exc:
+                    session.rollback()
+                    logger.warning(
+                        "alias_fill: skipped sid=%s name=%s mbid=%s — UNIQUE collision: %s",
+                        sid, name, mbid, exc.orig,
+                    )
+                    skipped_collision += 1
 
-            conn.execute(
-                text("""
-                    UPDATE artists
-                    SET musicbrainz_id = :mbid,
-                        aliases        = CAST(:aliases AS jsonb)
-                    WHERE spotify_id = :sid
-                """),
-                update_data,
+            logger.info(
+                "MB lookup done: %d ok, %d skipped (UNIQUE collision), of %d looked up",
+                succeeded, skipped_collision, len(rows),
             )
-            session.commit()
-            logger.info("MB lookup done for %d artists", len(update_data))
 
     except Exception as e:
         logger.error("Alias update failed: %s", e, exc_info=True)
