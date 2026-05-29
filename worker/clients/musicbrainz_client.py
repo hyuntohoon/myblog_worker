@@ -18,8 +18,15 @@ _MIN_SCORE = 90
 MBID_NOT_FOUND = "not_found"
 
 # Spotify-genre substring → ISO 3166-1 alpha-2 country code.
-# Initial mapping starts narrow on purpose (BUG-15 RFC §Open Q1) — widen by
-# inspecting prod cross-check reject logs first.
+# BUG-15 RFC Step 3 — 한국 origin 의 needle 을 추가. Spotify 가 ko-KR locale 로
+# 보내는 토큰 ([[project-prod-artists-genres-korean]]) 이 영문 needle 에 안 잡혀
+# BUG-18 pre-check 가 false-match 누적을 가속화한 부작용을 차단.
+#
+# prod 빈도 (2026-05-29 기준):
+#   "한국 랩" 253, "K-발라드" 91, "케이팝" 49, "한국 록" 35 — 총 428행.
+# 3 needle ("한국" / "케이팝" / "k-발라드") 로 위 4 토큰 모두 포괄.
+#
+# JP/CN/기타는 다음 라운드 (false-positive 위험 평가 후).
 _COUNTRY_HINTS: tuple[tuple[str, str], ...] = (
     ("k-pop", "KR"),
     ("korean", "KR"),
@@ -29,6 +36,10 @@ _COUNTRY_HINTS: tuple[tuple[str, str], ...] = (
     ("uk ", "GB"),
     ("american", "US"),
     ("us ", "US"),
+    # BUG-15 Step 3 — Korean hint widening
+    ("한국", "KR"),
+    ("케이팝", "KR"),
+    ("k-발라드", "KR"),
 )
 
 
