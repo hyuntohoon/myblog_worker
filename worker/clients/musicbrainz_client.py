@@ -83,6 +83,35 @@ def _aliases_have_hangul(raw_aliases: list[dict]) -> bool:
     return any(_has_hangul(a.get("alias", "")) for a in raw_aliases)
 
 
+# BUG-15 Step 5 — surname-token gate. Step 4 mini-reset 잔존 케이스
+# (Suh Young Eun → "Young Eun Lee") + prod 측정 표본 라벨링에서, country=KR
+# 또는 country=NULL hangul-pass 후보를 통과해도 사람이 다른 false-match 가
+# 30-40% 잔존. 신호: Spotify name 의 surname-token 이 candidate.name +
+# aliases 어디에도 substring 으로 등장 X.
+#
+# 관통 원칙: 1순위 방어 대상은 "정상 매치의 과잉 거절". 단순 surname-substring
+# (algorithm C) 단독은 한국 가수 영문 짧은 무대명 ↔ 한글 alias 패턴
+# (B.I/CL/GooseBumps/PEEJAY 류) 을 false-positive 로 잡음 → 1-토큰 stage
+# name 면제 분기 필수. 길이 캡 10 은 잠정 안전장치 (prod 표본 최댓값
+# GooseBumps=10) — 라벨셋 ≥ 30 시점에 재검토.
+def _spotify_name_matches_candidate(
+    spotify_name: str,
+    candidate_name: str,
+    raw_aliases: list[dict],
+) -> bool:
+    tokens = [t for t in (spotify_name or "").split() if t]
+    # 핵심 면제 신호 = 토큰 수 == 1 (= 본명 아님, 무대명). 길이 캡은 안전장치.
+    if len(tokens) == 1 and len(spotify_name or "") <= 10:
+        return True
+    surname = tokens[0].lower() if tokens else ""
+    if len(surname) < 2:
+        return True  # 1글자 라티나이즈 토큰은 substring 신호 약함
+    haystack = " ".join(
+        [candidate_name or ""] + [a.get("alias", "") for a in raw_aliases]
+    ).lower()
+    return surname in haystack
+
+
 def fetch_artist_mbid_and_aliases(
     name: str,
     spotify_genres: Optional[list[str]] = None,
@@ -162,6 +191,21 @@ def fetch_artist_mbid_and_aliases(
                         hint,
                     )
                     continue
+
+            # BUG-15 Step 5 — hint=KR 모든 후보에 surname-token gate.
+            # country=KR 인 후보도 사람이 다른 false-match 가 30-40% 잔존하므로
+            # Step 1/4 통과 후 추가 검사. _spotify_name_matches_candidate 내부의
+            # 1-토큰 무대명 면제 분기로 정상 매치 (B.I/CL/GooseBumps 류) 보호.
+            if hint == "KR" and not _spotify_name_matches_candidate(
+                name, candidate.get("name", ""), raw_aliases
+            ):
+                logger.info(
+                    "MB surname-gate reject: name=%s candidate=%s mbid=%s",
+                    name,
+                    candidate.get("name"),
+                    mbid,
+                )
+                continue
 
             aliases = [
                 a["alias"].strip()

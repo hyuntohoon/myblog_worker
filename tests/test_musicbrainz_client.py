@@ -13,6 +13,7 @@ from worker.clients.musicbrainz_client import (
     _country_hint_from_genres,
     _has_hangul,
     _is_plausible_match,
+    _spotify_name_matches_candidate,
     fetch_artist_mbid_and_aliases,
 )
 
@@ -386,4 +387,161 @@ def test_step4_empty_alias_list_rejected_under_kr_null(mock_search, mock_get):
 
     mbid, _ = fetch_artist_mbid_and_aliases("Some Name", spotify_genres=["한국 랩"])
 
+    assert mbid == MBID_NOT_FOUND
+
+
+# --- BUG-15 Step 5 — _spotify_name_matches_candidate ---------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("spotify_name, candidate_name, raw_aliases, expected", [
+    # 1-토큰 무대명 면제 (length ≤ 10) — 한글 alias 만 있어도 통과
+    ("B.I", "B.I", [{"alias": "비아이"}, {"alias": "김한빈"}], True),
+    ("CL", "CL", [{"alias": "씨엘"}, {"alias": "이채린"}], True),
+    ("BewhY", "BewhY", [{"alias": "비와이"}], True),
+    ("GooseBumps", "GooseBumps", [{"alias": "구스범스"}], True),  # length=10 경계
+    ("MILLHAM", "MI11HAM", [], True),
+    ("PEEJAY", "Pee Jay", [{"alias": "박정철"}, {"alias": "피제이"}], True),
+    # 다토큰 surname match — primary name 또는 alias 어느 한 쪽이라도 substring
+    ("Choi Jae Seong", "최재성", [{"alias": "Choi Jae Seong"}], True),  # alias 내
+    ("Choi Jae Seong", "Choi Jae Seong", [{"alias": "최재성"}], True),  # primary 내
+    # 다토큰 surname 미매치 — false-match 시나리오
+    ("Suh Young Eun", "Young Eun Lee", [{"alias": "이영은"}], False),
+    ("Lil Moshpit", "이휘민", [{"alias": "이휘민"}], False),
+    ("Dragon Pony", "Vylet Pony", [{"alias": "Pony!"}], False),
+    # 가드
+    ("", "Foo", [], True),                          # 빈 이름 — 차단 안 함
+    ("X Y", "Z", [], True),                          # 1글자 surname → substring 신호 약함, 통과
+    # 1-토큰 length > 10 — 면제 안 되고 surname-gate 적용
+    ("MicroSpoonsExtra", "MicroSpoonsExtra", [], True),  # primary 자체에 토큰 그대로 → True
+    ("MicroSpoonsExtra", "다른이름", [{"alias": "Other"}], False),  # 미매치 → reject
+])
+def test_spotify_name_matches_candidate(spotify_name, candidate_name, raw_aliases, expected):
+    assert (
+        _spotify_name_matches_candidate(spotify_name, candidate_name, raw_aliases)
+        is expected
+    )
+
+
+# --- BUG-15 Step 5 — fetch_artist_mbid_and_aliases 통합 ------------------------
+
+@pytest.mark.unit
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.get_artist_by_id")
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.search_artists")
+def test_step5_suh_young_eun_rejected(mock_search, mock_get):
+    """Suh Young Eun (Spotify) → MB Young Eun Lee (country=KR). surname-gate 가
+    'suh' 미매치 잡아 reject. 다음 후보 없음 → sentinel."""
+    mock_search.return_value = {
+        "artist-list": [_mb_candidate("yel-uuid", "Young Eun Lee", 100, "KR")]
+    }
+    mock_get.return_value = {
+        "artist": {"alias-list": [{"alias": "이영은"}, {"alias": "Lee Youngeun"}]}
+    }
+
+    mbid, aliases = fetch_artist_mbid_and_aliases(
+        "Suh Young Eun", spotify_genres=["한국 랩"]
+    )
+
+    assert mbid == MBID_NOT_FOUND
+    assert aliases == []
+
+
+@pytest.mark.unit
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.get_artist_by_id")
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.search_artists")
+def test_step5_single_token_stage_name_passes(mock_search, mock_get):
+    """B.I (1-token, length ≤ 10, KR genres) → surname-gate 면제 → 한글 alias
+    만 있어도 accept. 정상 매치 보호 검증."""
+    mock_search.return_value = {
+        "artist-list": [_mb_candidate("bi-uuid", "B.I", 100, "KR")]
+    }
+    mock_get.return_value = {
+        "artist": {"alias-list": [{"alias": "비아이"}, {"alias": "김한빈"}]}
+    }
+
+    mbid, aliases = fetch_artist_mbid_and_aliases("B.I", spotify_genres=["케이팝"])
+
+    assert mbid == "bi-uuid"
+    assert "비아이" in aliases
+
+
+@pytest.mark.unit
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.get_artist_by_id")
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.search_artists")
+def test_step5_multi_token_korean_surname_in_primary_name_passes(mock_search, mock_get):
+    """다토큰 한국식 라티나이즈 (Choi Jae Seong) + MB primary 가 한글 (최재성).
+    alias 에 라티나이즈 변형이 있어 surname='choi' substring 매치 → accept."""
+    mock_search.return_value = {
+        "artist-list": [_mb_candidate("choi-uuid", "최재성", 100, "KR")]
+    }
+    mock_get.return_value = {
+        "artist": {"alias-list": [{"alias": "Choi Jae Seong"}, {"alias": "Choi"}]}
+    }
+
+    mbid, _ = fetch_artist_mbid_and_aliases(
+        "Choi Jae Seong", spotify_genres=["한국 랩"]
+    )
+
+    assert mbid == "choi-uuid"
+
+
+@pytest.mark.unit
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.get_artist_by_id")
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.search_artists")
+def test_step5_falls_back_to_next_candidate(mock_search, mock_get):
+    """surname-gate 실패 후보 → 다음 후보로. 두 번째 후보가 surname match 시 accept."""
+    mock_search.return_value = {
+        "artist-list": [
+            _mb_candidate("bad-uuid", "Young Eun Lee", 100, "KR"),
+            _mb_candidate("good-uuid", "Suh Young Eun", 95, "KR"),
+        ]
+    }
+    mock_get.side_effect = [
+        {"artist": {"alias-list": [{"alias": "이영은"}]}},
+        {"artist": {"alias-list": [{"alias": "서영은"}]}},
+    ]
+
+    mbid, aliases = fetch_artist_mbid_and_aliases(
+        "Suh Young Eun", spotify_genres=["한국 랩"]
+    )
+
+    assert mbid == "good-uuid"
+    assert "서영은" in aliases
+    assert mock_get.call_count == 2
+
+
+@pytest.mark.unit
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.get_artist_by_id")
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.search_artists")
+def test_step5_no_hint_skips_surname_gate(mock_search, mock_get):
+    """hint=None 또는 hint≠KR (영어권/일본) → surname-gate 비활성, 현행 행동 보존."""
+    mock_search.return_value = {
+        "artist-list": [_mb_candidate("rh-uuid", "Some Other Band", 100, "GB")]
+    }
+    mock_get.return_value = {"artist": {"alias-list": [{"alias": "Other Name"}]}}
+
+    mbid, _ = fetch_artist_mbid_and_aliases(
+        "Radiohead Tribute", spotify_genres=["british rock"]
+    )
+    # hint=GB → surname-gate 비활성. country=GB 일치라 Step 1 통과 → accept.
+    assert mbid == "rh-uuid"
+
+
+@pytest.mark.unit
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.get_artist_by_id")
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.search_artists")
+def test_step5_country_null_path_also_gated(mock_search, mock_get):
+    """Step 4 hangul-tiebreak 통과 (country=NULL + 한글 alias) 후보도
+    surname-gate 적용. Suh Young Eun 류 country=NULL 변형 false-match 시나리오."""
+    mock_search.return_value = {
+        "artist-list": [_mb_candidate("null-uuid", "Young Eun Lee", 100)]
+    }
+    mock_get.return_value = {
+        "artist": {"alias-list": [{"alias": "이영은"}]}  # 한글 → Step 4 통과
+    }
+
+    mbid, _ = fetch_artist_mbid_and_aliases(
+        "Suh Young Eun", spotify_genres=["한국 랩"]
+    )
+
+    # Step 4 hangul-tiebreak 통과 후 Step 5 surname-gate 가 reject.
     assert mbid == MBID_NOT_FOUND
