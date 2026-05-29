@@ -180,19 +180,29 @@ def test_sync_albums_batch_track_duration(mock_spotify, db_connection, sample_sp
 # --- generate_and_save_aliases ---------------------------------------------
 # BUG-17: per-row tx so one UNIQUE collision doesn't roll back the rest.
 
-def _build_session_mock(rows, collision_mbid):
+def _build_session_mock(rows, collision_mbid, taken_mbids=()):
     """Build a session double for generate_and_save_aliases.
 
-    SELECT returns `rows`. UPDATE with mbid == collision_mbid raises
-    IntegrityError; other UPDATEs succeed. Returns (factory, persisted_sids,
-    rollback_count_holder, commit_count_holder).
+    SELECT artists IS NULL → returns `rows` (head batch).
+    SELECT artists WHERE musicbrainz_id = :mbid → returns 1-row iff in taken_mbids
+    (BUG-18 pre-check path).
+    UPDATE with mbid == collision_mbid → IntegrityError; otherwise succeed.
+
+    Returns (factory, persisted_sids, rollback_count_holder, commit_count_holder).
     """
     persisted_sids: list[str] = []
     rollback_count = [0]
     commit_count = [0]
+    taken_set = set(taken_mbids)
 
     def execute_side_effect(stmt, params=None):
         sql = str(stmt).upper()
+        if "SELECT" in sql and "FROM ARTISTS" in sql and "MUSICBRAINZ_ID = :MBID" in sql:
+            # BUG-18 pre-check: closure SELECT
+            result = MagicMock()
+            mbid = (params or {}).get("mbid")
+            result.first.return_value = (1,) if mbid in taken_set else None
+            return result
         if "SELECT" in sql and "FROM ARTISTS" in sql:
             result = MagicMock()
             result.fetchall.return_value = rows
@@ -224,7 +234,7 @@ def test_generate_and_save_aliases_isolates_unique_collision(mock_fetch):
     rows = [(f"sid{i}", f"name{i}", []) for i in range(10)]
     collision_mbid = "collide-mbid"
 
-    def fetch_side_effect(name, spotify_genres=None):
+    def fetch_side_effect(name, spotify_genres=None, is_mbid_taken=None):
         if name == "name5":
             return (collision_mbid, [])
         idx = name[4:]
@@ -251,7 +261,7 @@ def test_generate_and_save_aliases_isolates_unique_collision(mock_fetch):
 def test_generate_and_save_aliases_all_succeed(mock_fetch):
     """No collisions: all 10 rows persist with no rollbacks."""
     rows = [(f"sid{i}", f"name{i}", ["케이팝"]) for i in range(10)]
-    mock_fetch.side_effect = lambda name, spotify_genres=None: (
+    mock_fetch.side_effect = lambda name, spotify_genres=None, is_mbid_taken=None: (
         f"mbid-{name[4:]}",
         [f"alias-{name[4:]}"],
     )
@@ -281,3 +291,64 @@ def test_generate_and_save_aliases_empty_select(mock_fetch):
     assert persisted_sids == []
     assert rollback_count[0] == 0
     assert commit_count[0] == 1  # SELECT release only
+
+
+# --- BUG-18 pre-check accounting ---------------------------------------------
+# RFC §Steps Step 1 의 test_sync_service 시나리오: 1 정상 + 1 pre-check 거절 후
+# 2nd 후보 정상 + 1 모든 후보 pre-check 거절 → sentinel. 결과 succeeded=2,
+# skipped_precheck=1, skipped_collision=0. is_mbid_taken 호출은 client 내부에서
+# 일어나므로 mocked-out — closure SQL 의 실엔진 호출은 통합 테스트가 잡음.
+
+@pytest.mark.unit
+@patch("worker.service.sync_service.fetch_artist_mbid_and_aliases")
+def test_generate_and_save_aliases_pre_check_outcome_accounting(mock_fetch):
+    rows = [
+        ("sid-ok",       "Normal Artist",   ["pop"]),
+        ("sid-retry",    "Pre-check Retry", ["k-pop"]),
+        ("sid-evict",    "Pre-check Evict", ["k-pop"]),
+    ]
+
+    def fetch_side_effect(name, spotify_genres=None, is_mbid_taken=None):
+        # is_mbid_taken is provided by the service in this PR — assert that
+        # the plumbing actually wires it through (not silently dropped).
+        assert callable(is_mbid_taken)
+        if name == "Normal Artist":
+            return ("mbid-ok", ["alias-ok"])
+        if name == "Pre-check Retry":
+            # Client decided that one candidate was taken and adopted the next.
+            return ("mbid-retry-2nd", ["alias-retry"])
+        # All candidates taken → client returns sentinel.
+        return ("not_found", [])
+
+    mock_fetch.side_effect = fetch_side_effect
+
+    factory, persisted_sids, rollback_count, commit_count = _build_session_mock(
+        rows, collision_mbid="never-fires"
+    )
+
+    generate_and_save_aliases(factory)
+
+    # All 3 rows wrote (sentinel row also UPDATEs to 'not_found' so head pool
+    # shrinks next cycle — BUG-18 §Goal eviction).
+    assert sorted(persisted_sids) == ["sid-evict", "sid-ok", "sid-retry"]
+    assert rollback_count[0] == 0
+    assert commit_count[0] == 4  # 1 SELECT release + 3 UPDATEs
+
+
+@pytest.mark.unit
+@patch("worker.service.sync_service.fetch_artist_mbid_and_aliases")
+def test_generate_and_save_aliases_forwards_is_mbid_taken(mock_fetch):
+    """The service must pass is_mbid_taken to every fetch call (plumbing guard)."""
+    rows = [("sid0", "X", []), ("sid1", "Y", [])]
+    mock_fetch.return_value = ("mbid-x", ["a"])
+
+    factory, *_ = _build_session_mock(rows, collision_mbid="never-fires")
+
+    generate_and_save_aliases(factory)
+
+    for call in mock_fetch.call_args_list:
+        kwargs = call.kwargs
+        assert "is_mbid_taken" in kwargs and callable(kwargs["is_mbid_taken"]), (
+            "service must forward is_mbid_taken=<closure> to the client "
+            "(BUG-18 plumbing — silent drop = dead pre-check)"
+        )
