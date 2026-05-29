@@ -32,6 +32,15 @@ FIXTURE_DIR = Path(__file__).parent / "fixtures"
     ([], None),
     (None, None),
     (["jazz", "fusion"], None),
+    # BUG-15 Step 3 — Korean hint widening (prod ko-KR genres)
+    (["한국 랩"], "KR"),
+    (["한국 록"], "KR"),
+    (["케이팝"], "KR"),
+    (["K-발라드"], "KR"),
+    (["k-발라드"], "KR"),         # 소문자 매치도 통과 (lower() 패턴)
+    (["한국 록", "케이팝"], "KR"),  # 다중 토큰 first-hit
+    (["사운드트랙"], None),         # 한국어 토큰이지만 country hint 없음
+    (["일본 vgm"], None),           # JP needle 미추가 라운드 — None 유지
 ])
 def test_country_hint_from_genres(genres, expected):
     assert _country_hint_from_genres(genres) == expected
