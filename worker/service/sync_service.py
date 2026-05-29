@@ -286,13 +286,35 @@ def generate_and_save_aliases(session_factory) -> None:
                 WHERE spotify_id = :sid
             """)
 
+            # BUG-18 pre-check: reject MB candidates whose MBID already lives
+            # in another artists row. Uses session.execute (not a cached conn)
+            # so each SELECT acquires a live connection like the surrounding
+            # UPDATEs (BUG-17 lesson). UNIQUE (BUG-13) + IntegrityError catch
+            # remain the safety net; this is best-effort eviction.
+            def _is_mbid_taken(mbid: str) -> bool:
+                row = session.execute(
+                    text("SELECT 1 FROM artists WHERE musicbrainz_id = :mbid LIMIT 1"),
+                    {"mbid": mbid},
+                ).first()
+                return row is not None
+
             succeeded = 0
             skipped_collision = 0
+            skipped_precheck = 0
             for row in rows:
                 sid, name, genres = row[0], row[1], row[2]
                 mbid, aliases = fetch_artist_mbid_and_aliases(
-                    name, spotify_genres=genres or []
+                    name,
+                    spotify_genres=genres or [],
+                    is_mbid_taken=_is_mbid_taken,
                 )
+                # MBID_NOT_FOUND result (no MB hit, or all candidates evicted
+                # by pre-check) still gets written so the partial UNIQUE
+                # (BUG-13) lets the row leave the IS NULL pool on the next
+                # cycle (BUG-18 §Goal — NULL→NOT NULL eviction). The counter
+                # bucket is "sentinel"; we don't distinguish "no hit at all"
+                # from "all pre-check rejected" here because both have the
+                # same operational effect.
                 try:
                     session.execute(
                         update_stmt,
@@ -303,7 +325,10 @@ def generate_and_save_aliases(session_factory) -> None:
                         ),
                     )
                     session.commit()
-                    succeeded += 1
+                    if mbid == "not_found":
+                        skipped_precheck += 1
+                    else:
+                        succeeded += 1
                 except IntegrityError as exc:
                     session.rollback()
                     logger.warning(
@@ -313,8 +338,9 @@ def generate_and_save_aliases(session_factory) -> None:
                     skipped_collision += 1
 
             logger.info(
-                "MB lookup done: %d ok, %d skipped (UNIQUE collision), of %d looked up",
-                succeeded, skipped_collision, len(rows),
+                "MB lookup done: %d ok, %d sentinel (no MB match or pre-check evicted), "
+                "%d skipped (UNIQUE collision), of %d looked up",
+                succeeded, skipped_precheck, skipped_collision, len(rows),
             )
 
     except Exception as e:

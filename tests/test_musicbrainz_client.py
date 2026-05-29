@@ -166,3 +166,74 @@ def test_fetch_uses_real_mb_response_shape(mock_search):
     mbid, _ = fetch_artist_mbid_and_aliases("Big Bang", spotify_genres=["k-pop"])
 
     assert mbid == MBID_NOT_FOUND
+
+
+# --- BUG-18 pre-check callback -----------------------------------------------
+
+@pytest.mark.unit
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.get_artist_by_id")
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.search_artists")
+def test_fetch_is_mbid_taken_none_is_legacy_behaviour(mock_search, mock_get):
+    """Back-compat: is_mbid_taken=None → no pre-check, current candidate accepted."""
+    mock_search.return_value = {
+        "artist-list": [_mb_candidate("kr-uuid", "Big Bang", 100, "KR")]
+    }
+    mock_get.return_value = {"artist": {"alias-list": [{"alias": "빅뱅"}]}}
+
+    mbid, aliases = fetch_artist_mbid_and_aliases(
+        "Big Bang", spotify_genres=["k-pop"]
+    )
+
+    assert mbid == "kr-uuid"
+    assert aliases == ["빅뱅"]
+
+
+@pytest.mark.unit
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.get_artist_by_id")
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.search_artists")
+def test_fetch_is_mbid_taken_rejects_first_picks_next(mock_search, mock_get):
+    """1st candidate's MBID already in DB → reject, try 2nd."""
+    mock_search.return_value = {
+        "artist-list": [
+            _mb_candidate("taken-mbid", "Big Bang (orig)", 100, "KR"),
+            _mb_candidate("free-mbid", "Big Bang (alt)", 95, "KR"),
+        ]
+    }
+    mock_get.return_value = {"artist": {"alias-list": [{"alias": "빅뱅"}]}}
+
+    seen = []
+
+    def is_taken(mbid: str) -> bool:
+        seen.append(mbid)
+        return mbid == "taken-mbid"
+
+    mbid, aliases = fetch_artist_mbid_and_aliases(
+        "Big Bang", spotify_genres=["k-pop"], is_mbid_taken=is_taken,
+    )
+
+    assert mbid == "free-mbid"
+    assert aliases == ["빅뱅"]
+    assert seen == ["taken-mbid", "free-mbid"]
+    # Detail fetched only for the accepted candidate, not for the rejected one.
+    mock_get.assert_called_once_with("free-mbid", includes=["aliases"])
+
+
+@pytest.mark.unit
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.get_artist_by_id")
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.search_artists")
+def test_fetch_is_mbid_taken_rejects_all_returns_not_found(mock_search, mock_get):
+    """All candidates' MBIDs taken → sentinel + no get_artist_by_id call."""
+    mock_search.return_value = {
+        "artist-list": [
+            _mb_candidate("taken-1", "X", 100, "KR"),
+            _mb_candidate("taken-2", "Y", 95, "KR"),
+        ]
+    }
+
+    mbid, aliases = fetch_artist_mbid_and_aliases(
+        "X", spotify_genres=["k-pop"], is_mbid_taken=lambda _: True,
+    )
+
+    assert mbid == MBID_NOT_FOUND
+    assert aliases == []
+    mock_get.assert_not_called()

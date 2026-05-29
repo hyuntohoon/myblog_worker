@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 import musicbrainzngs
 
@@ -60,6 +60,7 @@ def _is_plausible_match(candidate: dict, spotify_genres: Optional[list[str]]) ->
 def fetch_artist_mbid_and_aliases(
     name: str,
     spotify_genres: Optional[list[str]] = None,
+    is_mbid_taken: Optional[Callable[[str], bool]] = None,
 ) -> tuple[Optional[str], list[str]]:
     """Search MusicBrainz for an artist by name and return (mbid, aliases).
 
@@ -67,6 +68,14 @@ def fetch_artist_mbid_and_aliases(
     the Spotify-genre cross-check. Returns MBID_NOT_FOUND when no confident +
     plausible match exists so the caller can write a sentinel to prevent
     re-querying. Aliases may be an empty list on success.
+
+    `is_mbid_taken` (BUG-18 pre-check): optional callable, queried with each
+    candidate's MBID after the cross-check passes. If it returns True the
+    candidate is rejected and iteration continues to the next one. Best-effort
+    optimization to evict the same false-match MBID from re-appearing across
+    cycles; safety net is the partial UNIQUE on artists.musicbrainz_id (BUG-13)
+    + per-row IntegrityError catch in the caller (BUG-17). Default `None`
+    preserves the pre-BUG-18 behavior (unit tests + back-compat).
     """
     try:
         result = musicbrainzngs.search_artists(artist=name, limit=10)
@@ -98,6 +107,16 @@ def fetch_artist_mbid_and_aliases(
                 continue
 
             mbid = candidate["id"]
+
+            if is_mbid_taken is not None and is_mbid_taken(mbid):
+                logger.info(
+                    "MB pre-check reject: name=%s candidate=%s mbid=%s already in DB",
+                    name,
+                    candidate.get("name"),
+                    mbid,
+                )
+                continue
+
             detail = musicbrainzngs.get_artist_by_id(mbid, includes=["aliases"])
             artist_data = detail.get("artist", {})
 
