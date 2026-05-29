@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Callable, Optional
 
 import musicbrainzngs
 
 logger = logging.getLogger(__name__)
+
+# BUG-15 Step 4 — hangul tiebreaker. Step 1 의 country=NULL pass-through 사각지대
+# (hint=KR + candidate.country 미정의 → permissive accept) 가 Step 2 reset 후 prod
+# 표본에서 V.I/JA$/SUGA 류 sticky false-match 6+ 행을 남김. 정상 매치 ~30 행은
+# 같은 경로지만 MB alias 에 한글 보유 — 후보 alias 의 한글 존재 여부가 결정적 신호.
+_HANGUL_RE = re.compile(r"[가-힣]")
 
 musicbrainzngs.set_useragent("myblog-music-review", "1.0", "zlxlgus123@gmail.com")
 musicbrainzngs.set_rate_limit(limit_or_interval=1.0)
@@ -66,6 +73,14 @@ def _is_plausible_match(candidate: dict, spotify_genres: Optional[list[str]]) ->
     if not candidate_country:
         return True
     return candidate_country == hint
+
+
+def _has_hangul(s: str) -> bool:
+    return bool(_HANGUL_RE.search(s or ""))
+
+
+def _aliases_have_hangul(raw_aliases: list[dict]) -> bool:
+    return any(_has_hangul(a.get("alias", "")) for a in raw_aliases)
 
 
 def fetch_artist_mbid_and_aliases(
@@ -130,8 +145,24 @@ def fetch_artist_mbid_and_aliases(
 
             detail = musicbrainzngs.get_artist_by_id(mbid, includes=["aliases"])
             artist_data = detail.get("artist", {})
-
             raw_aliases = artist_data.get("alias-list", [])
+
+            # BUG-15 Step 4 — hint=KR + candidate.country=NULL 으로 cross-check
+            # 가 pass-through 한 경우에만 추가 게이트. alias 한글 ≥1 이어야 accept,
+            # 아니면 다음 후보로. country 가 명시되면 Step 1 이 이미 통과/거절을
+            # 결정했으니 tiebreaker 비활성.
+            hint = _country_hint_from_genres(spotify_genres)
+            if hint == "KR" and not candidate.get("country"):
+                if not _aliases_have_hangul(raw_aliases):
+                    logger.info(
+                        "MB hangul-tiebreak reject: name=%s candidate=%s mbid=%s hint=%s",
+                        name,
+                        candidate.get("name"),
+                        mbid,
+                        hint,
+                    )
+                    continue
+
             aliases = [
                 a["alias"].strip()
                 for a in raw_aliases

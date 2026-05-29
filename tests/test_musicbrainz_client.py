@@ -9,7 +9,9 @@ import pytest
 
 from worker.clients.musicbrainz_client import (
     MBID_NOT_FOUND,
+    _aliases_have_hangul,
     _country_hint_from_genres,
+    _has_hangul,
     _is_plausible_match,
     fetch_artist_mbid_and_aliases,
 )
@@ -246,3 +248,142 @@ def test_fetch_is_mbid_taken_rejects_all_returns_not_found(mock_search, mock_get
     assert mbid == MBID_NOT_FOUND
     assert aliases == []
     mock_get.assert_not_called()
+
+
+# --- BUG-15 Step 4 hangul tiebreaker ------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("s, expected", [
+    ("빅뱅", True),
+    ("최재성", True),
+    ("Big Bang", False),
+    ("Shizzy Sixx", False),
+    ("ジェームス・ブラウン", False),  # 일문 only
+    ("T윤미래", True),  # mixed
+    ("", False),
+    ("123", False),
+])
+def test_has_hangul(s, expected):
+    assert _has_hangul(s) is expected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("raw_aliases, expected", [
+    ([{"alias": "빅뱅"}], True),
+    ([{"alias": "Big Bang"}, {"alias": "빅뱅"}], True),
+    ([{"alias": "Shizzy Sixx"}, {"alias": "Suicide Sixx"}], False),
+    ([], False),
+    ([{}], False),  # missing alias key
+    ([{"alias": ""}], False),
+])
+def test_aliases_have_hangul(raw_aliases, expected):
+    assert _aliases_have_hangul(raw_aliases) is expected
+
+
+@pytest.mark.unit
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.get_artist_by_id")
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.search_artists")
+def test_step4_kr_hint_country_null_no_hangul_rejected(mock_search, mock_get):
+    """V.I 시나리오: country=NULL + alias 한글 없음 → tiebreaker reject → sentinel."""
+    mock_search.return_value = {
+        "artist-list": [_mb_candidate("null-uuid", "Shizzy Sixx", 100)]
+    }
+    mock_get.return_value = {
+        "artist": {"alias-list": [{"alias": "Shizzy Sixx"}, {"alias": "Suicide Sixx"}]}
+    }
+
+    mbid, aliases = fetch_artist_mbid_and_aliases("V.I", spotify_genres=["케이팝"])
+
+    assert mbid == MBID_NOT_FOUND
+    assert aliases == []
+    mock_get.assert_called_once_with("null-uuid", includes=["aliases"])
+
+
+@pytest.mark.unit
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.get_artist_by_id")
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.search_artists")
+def test_step4_kr_hint_country_null_with_hangul_accepted(mock_search, mock_get):
+    """최엘비 시나리오: country=NULL 이지만 alias 한글 보유 → accept."""
+    mock_search.return_value = {
+        "artist-list": [_mb_candidate("null-uuid", "최엘비", 100)]
+    }
+    mock_get.return_value = {
+        "artist": {"alias-list": [{"alias": "Lazy Bones"}, {"alias": "최재성"}]}
+    }
+
+    mbid, aliases = fetch_artist_mbid_and_aliases("최엘비", spotify_genres=["한국 랩"])
+
+    assert mbid == "null-uuid"
+    assert "최재성" in aliases
+
+
+@pytest.mark.unit
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.get_artist_by_id")
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.search_artists")
+def test_step4_kr_hint_country_explicit_kr_skips_tiebreaker(mock_search, mock_get):
+    """country 가 KR 로 명시되면 Step 1 가 통과시키고 Step 4 는 비활성 (한글 없어도 accept)."""
+    mock_search.return_value = {
+        "artist-list": [_mb_candidate("kr-uuid", "Some Korean Artist", 100, "KR")]
+    }
+    mock_get.return_value = {
+        "artist": {"alias-list": [{"alias": "Romanized Name"}]}  # 한글 없음
+    }
+
+    mbid, _ = fetch_artist_mbid_and_aliases(
+        "Some Korean Artist", spotify_genres=["케이팝"]
+    )
+
+    assert mbid == "kr-uuid"
+
+
+@pytest.mark.unit
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.get_artist_by_id")
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.search_artists")
+def test_step4_no_hint_skips_tiebreaker(mock_search, mock_get):
+    """hint=None (영어 장르) → tiebreaker 비활성 — country=NULL + 한글 없음도 accept."""
+    mock_search.return_value = {
+        "artist-list": [_mb_candidate("null-uuid", "Radiohead", 100)]
+    }
+    mock_get.return_value = {"artist": {"alias-list": [{"alias": "Radio Head"}]}}
+
+    mbid, _ = fetch_artist_mbid_and_aliases("Radiohead", spotify_genres=["british rock"])
+    # british → hint=GB. country=NULL → Step 1 pass-through. Step 4 는 KR 만 tiebreak.
+    assert mbid == "null-uuid"
+
+
+@pytest.mark.unit
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.get_artist_by_id")
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.search_artists")
+def test_step4_falls_back_to_next_candidate_with_hangul(mock_search, mock_get):
+    """첫 후보 country=NULL + 한글 없음 → reject. 두 번째 country=NULL + 한글 → accept."""
+    mock_search.return_value = {
+        "artist-list": [
+            _mb_candidate("bad-uuid", "Shizzy Sixx", 100),
+            _mb_candidate("good-uuid", "승리", 95),
+        ]
+    }
+    mock_get.side_effect = [
+        {"artist": {"alias-list": [{"alias": "Shizzy Sixx"}]}},
+        {"artist": {"alias-list": [{"alias": "SEUNGRI"}, {"alias": "이승현"}]}},
+    ]
+
+    mbid, aliases = fetch_artist_mbid_and_aliases("V.I", spotify_genres=["케이팝"])
+
+    assert mbid == "good-uuid"
+    assert "이승현" in aliases
+    assert mock_get.call_count == 2
+
+
+@pytest.mark.unit
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.get_artist_by_id")
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.search_artists")
+def test_step4_empty_alias_list_rejected_under_kr_null(mock_search, mock_get):
+    """alias-list 키 자체가 없거나 빈 list → 한글 없음으로 간주 → reject (Open Q1: conservative)."""
+    mock_search.return_value = {
+        "artist-list": [_mb_candidate("null-uuid", "Some Name", 100)]
+    }
+    mock_get.return_value = {"artist": {}}  # alias-list 키 누락
+
+    mbid, _ = fetch_artist_mbid_and_aliases("Some Name", spotify_genres=["한국 랩"])
+
+    assert mbid == MBID_NOT_FOUND
