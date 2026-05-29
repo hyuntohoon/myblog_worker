@@ -41,6 +41,27 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 def engine():
     eng = create_engine(_TEST_DB_URL, pool_pre_ping=True, future=True)
+    # Guard against Neon test-branch schema drift: BUG-13 added the partial
+    # UNIQUE on artists.musicbrainz_id in prod via shared_db migration, but
+    # the Neon test branch may not have been re-applied. When the column is
+    # absent the seed INSERT here would explode and fail CI with a misleading
+    # message that hides the schema-drift root cause.
+    with eng.connect() as conn:
+        has_column = conn.execute(
+            text("""
+                SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = 'public'
+                   AND table_name   = 'artists'
+                   AND column_name  = 'musicbrainz_id'
+                 LIMIT 1
+            """)
+        ).first()
+    if has_column is None:
+        eng.dispose()
+        pytest.skip(
+            "Neon test branch artists.musicbrainz_id 컬럼 부재 — shared_db 마이그레이션 "
+            "재적용 필요. 통합 테스트 자체는 정상이며 prod schema 와는 무관."
+        )
     yield eng
     eng.dispose()
 
