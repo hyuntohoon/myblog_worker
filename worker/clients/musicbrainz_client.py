@@ -14,6 +14,18 @@ logger = logging.getLogger(__name__)
 # 같은 경로지만 MB alias 에 한글 보유 — 후보 alias 의 한글 존재 여부가 결정적 신호.
 _HANGUL_RE = re.compile(r"[가-힣]")
 
+# BUG-14 — Lucene 특수문자 escape. `search_artists(query=...)` 가 raw Lucene
+# 표현식을 받으므로 사용자/Spotify 가 준 raw name 을 그대로 넣으면 +/-/( 등
+# 이 토큰 연산자로 해석돼 0건 또는 의도치 않은 union 으로 빠짐.
+# AND/OR/NOT 같은 boolean keyword 는 대문자 단독 토큰일 때만 reserved 인데
+# prod artists.name 조회 시 0행 (2026-05-30 RFC Q1) 이라 처리 생략.
+_LUCENE_SPECIAL = set(r'+-&|!(){}[]^"~*?:\/')
+
+
+def _escape_lucene(s: str) -> str:
+    return "".join("\\" + c if c in _LUCENE_SPECIAL else c for c in s)
+
+
 musicbrainzngs.set_useragent("myblog-music-review", "1.0", "zlxlgus123@gmail.com")
 musicbrainzngs.set_rate_limit(limit_or_interval=1.0)
 
@@ -104,7 +116,10 @@ def fetch_artist_mbid_and_aliases(
     preserves the pre-BUG-18 behavior (unit tests + back-compat).
     """
     try:
-        result = musicbrainzngs.search_artists(artist=name, limit=10)
+        # BUG-14 — `query=` 자유형 Lucene 으로 전환해 default 필드 union
+        # (artist + sort name + alias 등) 을 모두 검색. 기존 `artist=name` 은
+        # 내부적으로 `artist:"X"` 로 좁혀 한글 alias index 를 못 잡았음.
+        result = musicbrainzngs.search_artists(query=_escape_lucene(name), limit=10)
         artist_list = result.get("artist-list", [])
 
         if not artist_list:
