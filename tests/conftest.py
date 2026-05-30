@@ -1,25 +1,29 @@
 # tests/conftest.py
 from __future__ import annotations
 import os
+import sys
+
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-import sys
-import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# 테스트용 DB URL (Neon test 브랜치)
-# 환경 변수로 주입하거나, 여기서 직접 설정
-TEST_DB_URL = os.environ.get(
-    "TEST_DB_URL",
-    "postgresql+psycopg://neondb_owner:npg_IOLjirGU52Bm@ep-fancy-butterfly-a1xolnxf-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
-)
+# Neon test branch URL is fetched from env. CI (GHA) injects via
+# `secrets.TEST_DB_URL`; local dev exports from AWS Secrets Manager:
+#   export TEST_DB_URL=$(aws secretsmanager get-secret-value \
+#     --secret-id myblog/test-db --query SecretString --output text \
+#     | python3 -c "import sys,json; print(json.load(sys.stdin)['TEST_DB_URL'])")
+# When unset, DB-bound fixtures skip rather than fall back to a hardcoded URL
+# (BUG-16 Step 1 — removed plaintext credential from source).
+TEST_DB_URL = os.environ.get("TEST_DB_URL")
 
 
 @pytest.fixture(scope="session")
 def db_engine():
     """전체 테스트에서 DB 엔진 하나만 생성."""
+    if not TEST_DB_URL:
+        pytest.skip("TEST_DB_URL not set — see conftest.py for Secrets Manager fetch command")
     engine = create_engine(TEST_DB_URL, pool_pre_ping=True, future=True)
     yield engine
     engine.dispose()

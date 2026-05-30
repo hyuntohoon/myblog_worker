@@ -65,6 +65,21 @@ Spotify API 호출: GET /albums?ids=id1,id2,...,id20
 
 ---
 
+## 로컬 테스트
+
+DB 의존 픽스처는 `TEST_DB_URL` 환경 변수가 있을 때만 동작합니다 (없으면 자동 skip). 로컬에서 실행하려면 AWS Secrets Manager 에서 받아옵니다:
+
+```bash
+export TEST_DB_URL=$(aws secretsmanager get-secret-value \
+  --secret-id myblog/test-db --query SecretString --output text \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['TEST_DB_URL'])")
+pytest tests/ -v
+```
+
+CI 는 GitHub Actions `secrets.TEST_DB_URL` 로 주입합니다 (`.github/workflows/deploy.yml`).
+
+---
+
 ## 왜 분리했는가
 
 "외부 API 호출 + DB 쓰기"는 **비용·지연·실패 가능성**이 큰 작업입니다. 리소스 할당·타임아웃·재시도 전략이 요청-응답 API와 완전히 다르기 때문에 배포 단위를 분리하는 것이 합리적이었습니다.
