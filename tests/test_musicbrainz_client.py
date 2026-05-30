@@ -11,12 +11,64 @@ from worker.clients.musicbrainz_client import (
     MBID_NOT_FOUND,
     _aliases_have_hangul,
     _country_hint_from_genres,
+    _escape_lucene,
     _has_hangul,
     _is_plausible_match,
     fetch_artist_mbid_and_aliases,
 )
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
+
+
+# --- BUG-14 _escape_lucene -----------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("raw, expected", [
+    ("아이유", "아이유"),                # 한글 그대로
+    ("Big Bang", "Big Bang"),           # 공백/영문 그대로
+    ("AC/DC", r"AC\/DC"),               # `/` escape
+    ("Sigur Rós", "Sigur Rós"),         # 비-ASCII 그대로
+    ("a+b", r"a\+b"),
+    ("a-b", r"a\-b"),
+    ("a&b", r"a\&b"),
+    ("a|b", r"a\|b"),
+    ("a!b", r"a\!b"),
+    ("a(b)c", r"a\(b\)c"),
+    ("a{b}c", r"a\{b\}c"),
+    ("a[b]c", r"a\[b\]c"),
+    ("a^b", r"a\^b"),
+    ('a"b', r"a\"b"),
+    ("a~b", r"a\~b"),
+    ("a*b", r"a\*b"),
+    ("a?b", r"a\?b"),
+    ("a:b", r"a\:b"),
+    ("a\\b", r"a\\b"),
+    ("", ""),
+])
+def test_escape_lucene(raw, expected):
+    assert _escape_lucene(raw) == expected
+
+
+@pytest.mark.unit
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.search_artists")
+def test_fetch_uses_query_with_escaped_name(mock_search):
+    """BUG-14 — search 호출이 query=<escaped name> 형태여야 한다."""
+    mock_search.return_value = {"artist-list": []}
+
+    fetch_artist_mbid_and_aliases("AC/DC")
+
+    mock_search.assert_called_once_with(query=r"AC\/DC", limit=10)
+
+
+@pytest.mark.unit
+@patch("worker.clients.musicbrainz_client.musicbrainzngs.search_artists")
+def test_fetch_uses_query_with_hangul_name(mock_search):
+    """BUG-14 — 한글 name 도 그대로 query= 로 전달 (escape 대상 아님)."""
+    mock_search.return_value = {"artist-list": []}
+
+    fetch_artist_mbid_and_aliases("아이유")
+
+    mock_search.assert_called_once_with(query="아이유", limit=10)
 
 
 # --- _country_hint_from_genres -------------------------------------------------
@@ -100,7 +152,8 @@ def test_fetch_rejects_country_mismatch_picks_next(mock_search, mock_get):
     assert mbid == "kr-uuid"
     assert aliases == ["빅뱅"]
     mock_get.assert_called_once_with("kr-uuid", includes=["aliases"])
-    mock_search.assert_called_once_with(artist="Big Bang", limit=10)
+    # BUG-14 — search 호출이 query= 자유형 Lucene 로 전환됨 (`artist=` 아님)
+    mock_search.assert_called_once_with(query="Big Bang", limit=10)
 
 
 @pytest.mark.unit
