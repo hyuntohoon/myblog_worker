@@ -64,7 +64,14 @@ class AlbumSyncService:
         track_artist_pairs: List[Dict] = []
 
         for alb in albums:
-            alb_sid = alb["id"]
+            # Spotify returns a null array element for any unknown/invalid id in
+            # a batch GET /v1/albums?ids=. Skip it so one bad id can't poison the
+            # whole SQS record (otherwise the entire batch fails → DLQ).
+            if not alb:
+                continue
+            alb_sid = alb.get("id")
+            if not alb_sid:
+                continue
 
             alb_artist_ids = []
             for a in (alb.get("artists") or []):
@@ -344,4 +351,13 @@ def generate_and_save_aliases(session_factory) -> None:
             )
 
     except Exception as e:
+        # Re-raise so the EventBridge invocation is marked failed and the Lambda
+        # Errors alarm fires. Per-artist MB misses are already absorbed inside
+        # fetch_artist_mbid_and_aliases (→ MBID_NOT_FOUND) and per-row UNIQUE
+        # collisions are caught above, so this only triggers on catastrophic
+        # failures (DB down, session_factory error) — which must be visible, not
+        # swallowed into a silent "success". This is the alias entry point only;
+        # SQS album sync is a separate invocation, so surfacing here cannot block
+        # album sync (service-boundary rule holds).
         logger.error("Alias update failed: %s", e, exc_info=True)
+        raise
