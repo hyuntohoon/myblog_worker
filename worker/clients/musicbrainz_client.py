@@ -2,11 +2,21 @@ from __future__ import annotations
 
 import logging
 import re
+import socket
 from typing import Callable, Optional
 
 import musicbrainzngs
 
 logger = logging.getLogger(__name__)
+
+# musicbrainzngs uses urllib under the hood and exposes no per-request timeout,
+# so a hung MB connection would otherwise block until the Lambda 120s ceiling.
+# Bound it with a process-default socket timeout. The other worker clients are
+# unaffected: httpx (Spotify) passes explicit timeout=20, and the DB engine's
+# batch upserts complete well under this. socket.timeout raised on a stall is
+# caught by fetch_artist_mbid_and_aliases' broad except → MBID_NOT_FOUND, so one
+# slow artist degrades gracefully instead of failing the whole alias run.
+socket.setdefaulttimeout(15)
 
 # BUG-15 Step 4 — hangul tiebreaker. Step 1 의 country=NULL pass-through 사각지대
 # (hint=KR + candidate.country 미정의 → permissive accept) 가 Step 2 reset 후 prod

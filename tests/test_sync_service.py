@@ -149,6 +149,23 @@ def test_sync_albums_batch_multiple_albums(mock_spotify, db_connection, sample_s
     assert track_count == 3
 
 
+@patch("worker.service.sync_service.spotify")
+def test_sync_albums_batch_skips_null_album(mock_spotify, db_connection, sample_spotify_album):
+    """Spotify가 배치 응답에 null 원소(알 수 없는 id)를 섞어 보내도 한 건이
+    전체 레코드를 죽이지 않고, 유효한 앨범은 정상 동기화된다 (B1)."""
+    # GET /v1/albums?ids= 는 알 수 없는 id 위치에 null 을 넣어 반환한다.
+    mock_spotify.get_albums.return_value = [None, sample_spotify_album]
+
+    svc = AlbumSyncService(db_connection)
+    # null 원소에서 TypeError 없이 완주해야 한다.
+    svc.sync_albums_batch(["bogus_id", "test_album_001"], "KR")
+
+    album_count = db_connection.execute(
+        text("SELECT COUNT(*) FROM albums WHERE spotify_id = 'test_album_001'"),
+    ).scalar()
+    assert album_count == 1
+
+
 @pytest.mark.integration
 @patch("worker.service.sync_service.spotify")
 def test_sync_albums_batch_empty_list(mock_spotify, db_connection):
@@ -291,6 +308,17 @@ def test_generate_and_save_aliases_empty_select(mock_fetch):
     assert persisted_sids == []
     assert rollback_count[0] == 0
     assert commit_count[0] == 1  # SELECT release only
+
+
+@pytest.mark.unit
+def test_generate_and_save_aliases_reraises_catastrophic_failure():
+    """A catastrophic failure (e.g. DB/session_factory down) must propagate so the
+    EventBridge invocation is marked failed and the Lambda Errors alarm fires —
+    not be swallowed into a silent success (B2)."""
+    factory = MagicMock(side_effect=RuntimeError("DB unreachable"))
+
+    with pytest.raises(RuntimeError, match="DB unreachable"):
+        generate_and_save_aliases(factory)
 
 
 # --- BUG-18 pre-check accounting ---------------------------------------------
