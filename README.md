@@ -14,6 +14,10 @@
 
 ## 처리 흐름
 
+두 개의 독립 트리거가 있습니다.
+
+### 1. SQS 메시지 (Spotify 앨범 동기화 — 본 경로)
+
 ```
 SQS 메시지 수신 (앨범 spotify_id 최대 20개)
   ↓
@@ -26,8 +30,22 @@ Spotify API 호출: GET /albums?ids=id1,id2,...,id20
   ├── album_artists 관계 링크
   └── track_artists 관계 링크
   ↓
-처리 완료 → SQS 메시지 삭제
+처리 완료 → SQS 메시지 삭제 (실패 시 ReportBatchItemFailures → DLQ)
 ```
+
+### 2. EventBridge `rate(15 minutes)` (MusicBrainz alias 채움 — 별경로)
+
+```
+EventBridge 호출 (event['source'] == 'aws.events')
+  ↓
+musicbrainz_id IS NULL 인 아티스트 10개/tick 조회
+  ↓
+MusicBrainz lookup
+  ├── 매칭 발견 → UPDATE artists.musicbrainz_id + aliases
+  └── 미발견   → MBID_NOT_FOUND sentinel (반복 조회 방지)
+```
+
+SQS 경로와 분리되어 있어 MusicBrainz 지연/장애가 앨범 동기화를 막지 않습니다. (BUG-14 ~ BUG-19 에서 alias 매칭/대조 알고리즘 보강 — `docs/archive/done/rfcs/` 의 BUG-14/15/17/18/19 참조.)
 
 ---
 
@@ -43,25 +61,27 @@ Spotify API 호출: GET /albums?ids=id1,id2,...,id20
 
 ## 기술 스택
 
-| 항목 | 기술 |
-|------|------|
-| 배포 | AWS Lambda (SQS 이벤트 소스 매핑) |
-| 큐 | Amazon SQS |
-| 데이터베이스 | Amazon RDS (PostgreSQL) |
-| 외부 API | Spotify Web API |
+| 항목         | 기술                                                       |
+|--------------|------------------------------------------------------------|
+| 배포         | AWS Lambda (SQS 이벤트 소스 매핑 + EventBridge rate(15 min)) |
+| 큐           | Amazon SQS (album-sync FIFO + DLQ + `ReportBatchItemFailures`) |
+| 데이터베이스 | Neon Serverless Postgres                                   |
+| 외부 API     | Spotify Web API, MusicBrainz API                           |
+| 도메인 모델  | `myblog-shared-db` (git-pinned, Core Table 사용)           |
 
 ---
 
 ## 환경 변수
 
-| 변수 | 설명 |
-|------|------|
-| `DATABASE_URL` | RDS 접속 URL |
-| `SPOTIFY_CLIENT_ID` | Spotify 앱 Client ID |
-| `SPOTIFY_CLIENT_SECRET` | Spotify 앱 Client Secret |
-| `SQS_QUEUE_URL` | SQS 큐 URL |
-| `SQS_QUEUE_NAME` | SQS 큐 이름 |
-| `AWS_REGION` | AWS 리전 |
+| 변수                    | 설명                                                                |
+|-------------------------|---------------------------------------------------------------------|
+| `SECRETS_ARN`           | AWS Secrets Manager `myblog/worker` 의 ARN (prod). cold-start 1회 fetch + `@lru_cache` |
+| `DATABASE_URL`          | Neon 접속 URL (`postgresql+psycopg://...`) — local dev 시 직접 주입 |
+| `SPOTIFY_CLIENT_ID`     | Spotify 앱 Client ID                                                |
+| `SPOTIFY_CLIENT_SECRET` | Spotify 앱 Client Secret                                            |
+| `SQS_QUEUE_URL`         | SQS 큐 URL                                                          |
+| `SQS_QUEUE_NAME`        | SQS 큐 이름                                                         |
+| `AWS_REGION`            | AWS 리전                                                            |
 
 ---
 
@@ -91,18 +111,20 @@ CI 는 GitHub Actions `secrets.TEST_DB_URL` 로 주입합니다 (`.github/workfl
 
 ## 향후 개선
 
-- SQS Dead Letter Queue(DLQ) 도입 + 실패 알림
-- Worker 멱등성·중복 처리 강화
-- CloudWatch 메트릭 기반 동기화 지연/실패 모니터링
+- 실패 알림 (DLQ depth alarm 은 IAC-1 으로 도입됨; 알림 채널 연결만 남음)
+- CloudWatch 메트릭 기반 동기화 지연 대시보드
+- MusicBrainz alias 비매칭(non-English 아티스트) 보강 — 후속 RFC 필요
 
 ---
 
 ## 관련 리포지토리
 
-| 리포 | 역할 |
-|------|------|
-| [`myblog_front`](https://github.com/hyuntohoon/myblog_front) | 정적 사이트 + 글쓰기 UI |
-| [`myblog_backend`](https://github.com/hyuntohoon/myblog_backend) | 글·카테고리 API + 인증 |
-| [`myblog_music`](https://github.com/hyuntohoon/myblog_music) | DB-first 검색 + Sync 트리거 |
-| **myblog_worker** (현재) | SQS Consumer + Spotify 동기화 |
-| [`myblog_publish`](https://github.com/hyuntohoon/myblog_publish) | 정적 사이트 발행 |
+| 리포                                                                   | 역할                                  |
+|------------------------------------------------------------------------|---------------------------------------|
+| [`myblog_front`](https://github.com/hyuntohoon/myblog_front)           | 정적 사이트 + 글쓰기 UI               |
+| [`myblog_backend`](https://github.com/hyuntohoon/myblog_backend)       | 글·카테고리 API + 인증 + 발행         |
+| [`myblog_music`](https://github.com/hyuntohoon/myblog_music)           | DB-first 검색 + Sync 트리거           |
+| **myblog_worker** (현재)                                               | SQS Consumer + Spotify 동기화 + alias generation |
+| [`myblog_shared_db`](https://github.com/hyuntohoon/myblog_shared_db)   | 공유 SQLAlchemy 모델 (git-pinned)     |
+
+> 옛 `myblog_publish` 서비스는 ARCH-11 으로 backend 에 흡수되었고 업스트림은 archived 됨.
