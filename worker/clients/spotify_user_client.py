@@ -15,6 +15,7 @@ import base64
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -52,6 +53,52 @@ def _load_spotify_creds() -> Dict[str, str]:
     return creds
 
 
+def _is_invalid_grant(resp: "httpx.Response") -> bool:
+    """True iff a token-endpoint 400 carries Spotify's invalid_grant error — i.e. the
+    refresh token was revoked/expired (re-auth needed), not a transient failure."""
+    try:
+        return resp.json().get("error") == "invalid_grant"
+    except Exception:
+        return False
+
+
+def _persist_token_state(
+    *, rotated_refresh_token: Optional[str] = None, needs_reauth: bool = False
+) -> None:
+    """Best-effort write-back of Spotify token state to Secrets Manager myblog/spotify (D30).
+
+    On a successful refresh: record ``last_successful_refresh_at`` (so the 연동 tab can
+    show when the token last worked), clear any ``needs_reauth`` marker, and persist a
+    rotated ``refresh_token`` when Spotify returned one. On an ``invalid_grant``: set
+    ``needs_reauth`` so the connection status reflects token *validity*, not presence.
+
+    Non-fatal: a write failure is logged (never the token value) and swallowed so a
+    transient Secrets Manager / IAM hiccup can't break listening sync. The caller has
+    already updated its in-memory creds, so a warm Lambda keeps using the live token.
+    Reads-then-writes (like the bootstrap script) to preserve unrelated keys.
+    """
+    arn = settings.SPOTIFY_SECRETS_ARN
+    if not arn:
+        return  # local/dev: token comes from env, nothing to write back
+    try:
+        import boto3
+
+        sm = boto3.client("secretsmanager", region_name=settings.AWS_DEFAULT_REGION)
+        payload = json.loads(sm.get_secret_value(SecretId=arn)["SecretString"])
+        if needs_reauth:
+            if payload.get("needs_reauth"):
+                return  # already flagged — don't churn a new secret version each tick
+            payload["needs_reauth"] = True
+        else:
+            payload.pop("needs_reauth", None)
+            if rotated_refresh_token and rotated_refresh_token != payload.get("refresh_token"):
+                payload["refresh_token"] = rotated_refresh_token
+            payload["last_successful_refresh_at"] = datetime.now(timezone.utc).isoformat()
+        sm.put_secret_value(SecretId=arn, SecretString=json.dumps(payload))
+    except Exception as e:  # pragma: no cover - network/IAM failure path
+        logger.error("Spotify token write-back failed (non-fatal): %s", e)
+
+
 class SpotifyUserClient:
     """User-scoped Spotify client backed by a refresh token."""
 
@@ -87,9 +134,29 @@ class SpotifyUserClient:
             "refresh_token": creds["refresh_token"],
         }
         r = httpx.post(settings.SPOTIFY_TOKEN_URL, headers=headers, data=data, timeout=20)
+
+        # A 400 invalid_grant means the refresh token was revoked/expired — the only
+        # authoritative "재인증 필요" signal (token validity, not staleness). Flag it in
+        # the secret so the 연동 tab surfaces it, then fail this tick loudly. Other
+        # statuses (5xx, rate-limit) are transient and must NOT trip re-auth.
+        if r.status_code == 400 and _is_invalid_grant(r):
+            _persist_token_state(needs_reauth=True)
+            raise RuntimeError(
+                "Spotify refresh token rejected (invalid_grant) — re-auth required "
+                "(re-run scripts/spotify_bootstrap_token.py --write)"
+            )
         r.raise_for_status()
+
         payload = r.json()
         token: str = payload["access_token"]
+        # Spotify may rotate the refresh token on a refresh exchange. Update the
+        # in-memory copy first (so a warm Lambda keeps working even if the write-back
+        # fails) then persist it + last_successful_refresh_at + clear needs_reauth.
+        rotated = payload.get("refresh_token")
+        if rotated:
+            creds["refresh_token"] = rotated
+        _persist_token_state(rotated_refresh_token=rotated)
+
         self._token = token
         # refresh slightly early (90% of lifetime)
         self._exp = now + float(payload.get("expires_in", 3600)) * 0.9
