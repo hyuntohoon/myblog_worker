@@ -225,8 +225,10 @@ def run_listening_sync(
     *,
     is_manual_refresh: bool = False,
 ) -> Dict[str, Any]:
-    """Run both syncs. now-playing failure must not lose the recent-albums write
-    (independent surfaces), so each is isolated.
+    """Run both syncs, isolated symmetrically (RFC): recent-albums and now-playing
+    are independent surfaces, so either can fail without aborting the other. recent
+    commits first; a recent failure no longer skips the now-playing read (it used to
+    abort the whole tick, losing a now-playing update that would have succeeded).
 
     Manual "지금 새로고침" refreshes are debounced (D31): if the cache was written
     less than DEBOUNCE_WINDOW_SECONDS ago, skip the Spotify reads entirely. This
@@ -242,10 +244,14 @@ def run_listening_sync(
             )
             return {"skipped": "debounced"}
     result: Dict[str, Any] = {}
-    result["recent"] = sync_recent_albums(session_factory, client, enqueue_unknown)
+    try:
+        result["recent"] = sync_recent_albums(session_factory, client, enqueue_unknown)
+    except Exception as e:
+        logger.error("recent-albums sync failed (now-playing still attempted): %s", e, exc_info=True)
+        result["recent"] = {"error": str(e)}
     try:
         result["now_playing"] = sync_now_playing(session_factory, client)
     except Exception as e:
-        logger.error("now-playing sync failed (recent sync already committed): %s", e, exc_info=True)
+        logger.error("now-playing sync failed (recent sync unaffected): %s", e, exc_info=True)
         result["now_playing"] = {"error": str(e)}
     return result

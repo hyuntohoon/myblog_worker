@@ -24,6 +24,72 @@ from worker.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# ---------- transient-failure retry (RFC: 3 tries, honour Retry-After on 429) ----------
+# All Spotify player/token reads go through one helper so a transient 429/5xx or a
+# dropped connection self-heals within a tick instead of aborting the sync. Only
+# transient statuses retry; any non-retryable response (2xx/3xx/4xx — including the
+# token 400 invalid_grant and a now-playing 403 missing-scope) is returned as-is for
+# the caller's existing status handling.
+RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+MAX_TRIES = 3
+BASE_BACKOFF_SECONDS = 0.5
+MAX_BACKOFF_SECONDS = 8.0
+
+
+def _parse_retry_after(resp: "httpx.Response") -> Optional[float]:
+    """Spotify sends Retry-After as integer seconds on a 429. Returns the delay, or
+    None when absent/unparseable (e.g. the HTTP-date form) so the caller falls back
+    to backoff."""
+    raw = resp.headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(int(raw)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _request_with_retry(
+    method: str, url: str, *, max_tries: int = MAX_TRIES, **kwargs: Any
+) -> "httpx.Response":
+    """Issue an httpx request, retrying transient failures up to ``max_tries``.
+
+    Retries on 429 (honouring Retry-After, capped at MAX_BACKOFF_SECONDS) and 5xx,
+    plus httpx transport errors (timeout / connection reset) with capped exponential
+    backoff. Any non-retryable response is returned immediately — the caller keeps
+    its existing handling (raise_for_status, 204 → None, 400 invalid_grant). On the
+    final attempt the last response is returned (so a still-5xx surfaces via the
+    caller's raise_for_status) or its transport exception re-raised."""
+    for attempt in range(max_tries):
+        is_last = attempt + 1 >= max_tries
+        try:
+            resp = httpx.request(method, url, **kwargs)
+        except httpx.HTTPError as exc:  # timeout / connection / transport
+            if is_last:
+                raise
+            delay = min(BASE_BACKOFF_SECONDS * (2 ** attempt), MAX_BACKOFF_SECONDS)
+            logger.warning(
+                "Spotify %s %s transport error (%s); retry %d/%d after %.1fs",
+                method, url.rsplit("/", 1)[-1], type(exc).__name__,
+                attempt + 1, max_tries, delay,
+            )
+            time.sleep(delay)
+            continue
+        if resp.status_code in RETRYABLE_STATUSES and not is_last:
+            delay = _parse_retry_after(resp) if resp.status_code == 429 else None
+            if delay is None:
+                delay = BASE_BACKOFF_SECONDS * (2 ** attempt)
+            delay = min(delay, MAX_BACKOFF_SECONDS)
+            logger.warning(
+                "Spotify %s %s → %d; retry %d/%d after %.1fs",
+                method, url.rsplit("/", 1)[-1], resp.status_code,
+                attempt + 1, max_tries, delay,
+            )
+            time.sleep(delay)
+            continue
+        return resp
+    raise RuntimeError("unreachable: max_tries must be >= 1")  # pragma: no cover
+
 
 def _load_spotify_creds() -> Dict[str, str]:
     """Resolve client_id/secret/refresh_token from Secrets Manager myblog/spotify,
@@ -133,7 +199,9 @@ class SpotifyUserClient:
             "grant_type": "refresh_token",
             "refresh_token": creds["refresh_token"],
         }
-        r = httpx.post(settings.SPOTIFY_TOKEN_URL, headers=headers, data=data, timeout=20)
+        r = _request_with_retry(
+            "POST", settings.SPOTIFY_TOKEN_URL, headers=headers, data=data, timeout=20
+        )
 
         # A 400 invalid_grant means the refresh token was revoked/expired — the only
         # authoritative "재인증 필요" signal (token validity, not staleness). Flag it in
@@ -174,7 +242,7 @@ class SpotifyUserClient:
         """
         url = f"{settings.SPOTIFY_API_BASE}/me/player/recently-played"
         params = {"limit": min(max(int(limit), 1), 50)}
-        r = httpx.get(url, headers=self._headers(), params=params, timeout=20)
+        r = _request_with_retry("GET", url, headers=self._headers(), params=params, timeout=20)
         r.raise_for_status()
         return r.json().get("items") or []
 
@@ -182,7 +250,7 @@ class SpotifyUserClient:
         """GET /me/player/currently-playing → playback object, or None when nothing
         is playing (Spotify returns 204 No Content)."""
         url = f"{settings.SPOTIFY_API_BASE}/me/player/currently-playing"
-        r = httpx.get(url, headers=self._headers(), timeout=20)
+        r = _request_with_retry("GET", url, headers=self._headers(), timeout=20)
         if r.status_code == 204:
             return None
         r.raise_for_status()
