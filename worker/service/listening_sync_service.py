@@ -35,6 +35,7 @@ def sync_recent_albums(
 
     # most-recent-first → first occurrence per album is its latest play
     latest_played: Dict[str, str] = {}
+    all_plays: List[tuple[str, str]] = []  # D29: every play (sid, played_at) for the events table
     for it in items:
         album = ((it or {}).get("track") or {}).get("album") or {}
         sid = album.get("id")
@@ -42,6 +43,7 @@ def sync_recent_albums(
         if not sid or not played_at:
             continue  # local files / podcasts have no album id
         latest_played.setdefault(sid, played_at)
+        all_plays.append((sid, played_at))
 
     spotify_ids = list(latest_played.keys())
     if not spotify_ids:
@@ -56,6 +58,26 @@ def sync_recent_albums(
             ).fetchall()
             sid_to_uuid = {r.spotify_id: r.id for r in rows}
             keep_uuids = list(sid_to_uuid.values())
+
+            # D29: append every individual play (catalog-known albums only) to the
+            # append-only events table, in the same tx as the snapshot upsert. The
+            # (album_id, played_at) dedup key makes the rolling-window re-read a
+            # no-op, so overlapping ticks / manual refreshes never double-count.
+            events_appended = 0
+            for sid, played_at in all_plays:
+                album_uuid = sid_to_uuid.get(sid)
+                if album_uuid is None:
+                    continue  # not in our catalog yet (enqueued below for a later tick)
+                events_appended += session.execute(
+                    text(
+                        """
+                        INSERT INTO spotify_play_events (album_id, played_at)
+                        VALUES (:album_id, CAST(:played_at AS timestamptz))
+                        ON CONFLICT (album_id, played_at) DO NOTHING
+                        """
+                    ),
+                    {"album_id": album_uuid, "played_at": played_at},
+                ).rowcount
 
             for sid, album_uuid in sid_to_uuid.items():
                 session.execute(
@@ -90,10 +112,15 @@ def sync_recent_albums(
             logger.warning("enqueue of unknown recently-played albums failed: %s", e)
 
     logger.info(
-        "recent sync: known=%d unknown=%d pruned=%d",
-        len(keep_uuids), len(unknown_ids), pruned,
+        "recent sync: known=%d unknown=%d pruned=%d events=%d",
+        len(keep_uuids), len(unknown_ids), pruned, events_appended,
     )
-    return {"known": len(keep_uuids), "unknown": len(unknown_ids), "pruned": pruned}
+    return {
+        "known": len(keep_uuids),
+        "unknown": len(unknown_ids),
+        "pruned": pruned,
+        "events": events_appended,
+    }
 
 
 def _upsert_now_playing(session, **fields: Any) -> None:

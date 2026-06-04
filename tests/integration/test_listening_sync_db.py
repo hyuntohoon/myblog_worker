@@ -183,3 +183,57 @@ def test_manual_refresh_allowed_when_caches_stale(factory):
             with s.begin():
                 s.execute(text("DELETE FROM spotify_recent_albums WHERE album_id = :a"), {"a": album_id})
                 s.execute(text("DELETE FROM albums WHERE id = :a"), {"a": album_id})
+
+
+def _table_exists(factory, name: str) -> bool:
+    with factory() as s:
+        return s.execute(
+            text(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_name = :n"
+            ),
+            {"n": name},
+        ).first() is not None
+
+
+def test_play_events_append_idempotent(factory):
+    """D29: every play appends to spotify_play_events; re-running the same window is
+    idempotent via ON CONFLICT (album_id, played_at) DO NOTHING. Unit mocks can't see
+    the real conflict semantics, so this exercises them on a live engine."""
+    if not _table_exists(factory, "spotify_play_events"):
+        pytest.skip("spotify_play_events not on test branch — apply migration V10 first")
+
+    sid = f"itest_events_{uuid.uuid4().hex[:8]}"
+    with factory() as s:
+        with s.begin():
+            album_id = _seed_album(s, sid)
+    try:
+        client = _Client(recent=[
+            {"track": {"album": {"id": sid}}, "played_at": "2026-06-04T10:00:00Z"},
+            {"track": {"album": {"id": sid}}, "played_at": "2026-06-04T08:00:00Z"},  # 2nd play, own event
+        ])
+        res1 = sync_recent_albums(factory, client)
+        assert res1["events"] == 2
+
+        with factory() as s:
+            n = s.execute(
+                text("SELECT count(*) AS c FROM spotify_play_events WHERE album_id = :a"),
+                {"a": album_id},
+            ).first().c
+        assert n == 2
+
+        # re-run the SAME window → ON CONFLICT DO NOTHING → no new rows
+        res2 = sync_recent_albums(factory, client)
+        assert res2["events"] == 0
+        with factory() as s:
+            n2 = s.execute(
+                text("SELECT count(*) AS c FROM spotify_play_events WHERE album_id = :a"),
+                {"a": album_id},
+            ).first().c
+        assert n2 == 2  # unchanged — idempotent
+    finally:
+        with factory() as s:
+            with s.begin():
+                s.execute(text("DELETE FROM spotify_play_events WHERE album_id = :a"), {"a": album_id})
+                s.execute(text("DELETE FROM spotify_recent_albums WHERE album_id = :a"), {"a": album_id})
+                s.execute(text("DELETE FROM albums WHERE id = :a"), {"a": album_id})
