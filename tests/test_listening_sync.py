@@ -52,6 +52,8 @@ class _FakeSession:
         self.executed.append((sql, params))
         if "age_s" in sql:  # _debounce_age_seconds() probe
             return _Result(rows=[_Row(age_s=self.debounce_age_s)])
+        if "INSERT INTO spotify_play_events" in sql:  # D29 append — pretend each lands
+            return _Result(rowcount=1)
         if "FROM albums WHERE spotify_id = ANY" in sql:
             sids = params["sids"]
             rows = [_Row(id=self.known_map[s], spotify_id=s) for s in sids if s in self.known_map]
@@ -117,7 +119,7 @@ def test_recent_distinct_known_unknown_split_and_prune():
 
     res = sync_recent_albums(lambda: session, client, enqueue_unknown=enqueue)
 
-    assert res == {"known": 2, "unknown": 1, "pruned": 1}
+    assert res == {"known": 2, "unknown": 1, "pruned": 1, "events": 3}
     # two upserts (A, B), one prune
     inserts = session.sql_of(lambda s: "INSERT INTO spotify_recent_albums" in s)
     assert len(inserts) == 2
@@ -147,6 +149,36 @@ def test_recent_all_unknown_prunes_whole_cache():
     # full-table delete branch
     assert any("DELETE FROM spotify_recent_albums" in s and "ANY" not in s for s, _ in session.executed)
     enqueue.assert_called_once_with(["X"])
+
+
+# ── append-only play events (D29) ────────────────────────────────────────────────
+
+@pytest.mark.unit
+def test_recent_appends_every_play_to_events():
+    """Every play of a catalog-known album is appended to spotify_play_events (one
+    row per play, not deduped to latest); unknown albums are skipped. Idempotency on
+    rolling-window re-read is covered by the integration test (real ON CONFLICT)."""
+    ua, ub = uuid.uuid4(), uuid.uuid4()
+    known = {"A": ua, "B": ub}  # C is unknown
+    session = _FakeSession(known)
+    client = _FakeClient(recent=[
+        _play("A", "2026-06-04T10:00:00Z"),
+        _play("C", "2026-06-04T09:30:00Z"),  # unknown → no event
+        _play("B", "2026-06-04T09:00:00Z"),
+        _play("A", "2026-06-04T08:00:00Z"),  # 2nd play of A → its own event (not collapsed)
+    ])
+    res = sync_recent_albums(lambda: session, client)
+
+    assert res["events"] == 3  # A@10, B@9, A@8 (C skipped)
+    inserts = session.sql_of(lambda s: "INSERT INTO spotify_play_events" in s)
+    assert len(inserts) == 3
+    # album A keeps BOTH plays as distinct events
+    a_events = sorted(p["played_at"] for _, p in inserts if p["album_id"] == ua)
+    assert a_events == ["2026-06-04T08:00:00Z", "2026-06-04T10:00:00Z"]
+    b_events = [p["played_at"] for _, p in inserts if p["album_id"] == ub]
+    assert b_events == ["2026-06-04T09:00:00Z"]
+    # unknown album C is never recorded as an event
+    assert all(p["album_id"] in (ua, ub) for _, p in inserts)
 
 
 # ── sync_now_playing ────────────────────────────────────────────────────────────
