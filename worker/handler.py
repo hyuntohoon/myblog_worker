@@ -9,8 +9,18 @@ from worker.clients.spotify_client import spotify
 
 from worker.infra.db import SessionLocal
 from worker.service.sync_service import AlbumSyncService, generate_and_save_aliases
+from worker.service.listening_sync_service import run_listening_sync
 
 logger = logging.getLogger(__name__)
+
+
+def _run_listening_sync() -> None:
+    """Spotify listening cache sync (recently-played + now-playing). Triggered by
+    the EventBridge 1h cron and the manual '지금 새로고침' SQS message."""
+    from worker.clients.spotify_user_client import spotify_user
+    from worker.clients.sqs_producer import enqueue_album_sync
+
+    run_listening_sync(SessionLocal, spotify_user, enqueue_unknown=enqueue_album_sync)
 
 
 def _process_single(album_id: str, market: str) -> None:
@@ -54,13 +64,20 @@ def _run_alias_generation() -> None:
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    # EventBridge scheduled rule — run alias generation and return
+    # EventBridge 1h cron — Spotify listening cache sync. This rule's target sends a
+    # constant input {"job": "spotify_listening"} (no "source"), so check job first.
+    if event.get("job") == "spotify_listening":
+        logger.info("EventBridge trigger: running Spotify listening sync")
+        _run_listening_sync()
+        return {}
+
+    # EventBridge scheduled rule (alias cron) — full event carries source=aws.events
     if event.get("source") == "aws.events":
         logger.info("EventBridge trigger: running alias generation")
         _run_alias_generation()
         return {}
 
-    # SQS trigger — album sync
+    # SQS trigger — album sync / manual listening refresh
     records = event.get("Records") or []
     logger.info("Received %d records", len(records))
 
@@ -70,6 +87,11 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         try:
             body = json.loads(record["body"])
             logger.info("[%d/%d] Processing record body=%s", i, len(records), body)
+
+            # Manual "지금 새로고침" button → async listening sync (rule #9)
+            if body.get("job") == "spotify_refresh":
+                _run_listening_sync()
+                continue
 
             market = body.get("market", settings.SPOTIFY_DEFAULT_MARKET)
 

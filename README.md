@@ -47,6 +47,23 @@ MusicBrainz lookup
 
 SQS 경로와 분리되어 있어 MusicBrainz 지연/장애가 앨범 동기화를 막지 않습니다. (BUG-14 ~ BUG-19 에서 alias 매칭/대조 알고리즘 보강 — `docs/archive/done/rfcs/` 의 BUG-14/15/17/18/19 참조.)
 
+### 3. EventBridge `rate(1 hour)` + 수동 SQS (Spotify 청취 캐시 — FEAT-member-dashboard Step 3)
+
+```
+EventBridge 1h 호출 (constant input {"job": "spotify_listening"})
+  또는  수동 "지금 새로고침" SQS 메시지 ({"job": "spotify_refresh"})
+  ↓
+SpotifyUserClient (refresh token → access token, myblog/spotify 시크릿)
+  ├── GET /me/player/recently-played (50개 롤링윈도우)
+  │     → distinct 앨범 set 을 spotify_recent_albums 에 upsert + 윈도우 밖 prune (D25)
+  │     → 카탈로그에 없는 앨범은 best-effort 로 album-sync SQS 재투입
+  └── GET /me/player/currently-playing
+        → spotify_now_playing 싱글톤 행 upsert (없으면 is_playing=false)
+```
+
+두 EventBridge 크론은 `event['job']` 으로 구분합니다(1h rule 은 constant input, alias rule 은
+`source=aws.events`). user-facing 엔드포인트에서 동기 Spotify 호출은 절대 하지 않습니다(hard rule #9).
+
 ---
 
 ## 핵심 설계
