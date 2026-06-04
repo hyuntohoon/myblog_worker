@@ -14,13 +14,19 @@ from worker.service.listening_sync_service import run_listening_sync
 logger = logging.getLogger(__name__)
 
 
-def _run_listening_sync() -> None:
+def _run_listening_sync(is_manual_refresh: bool = False) -> None:
     """Spotify listening cache sync (recently-played + now-playing). Triggered by
-    the EventBridge 1h cron and the manual '지금 새로고침' SQS message."""
+    the EventBridge 1h cron and the manual '지금 새로고침' SQS message. Manual
+    refreshes are debounced server-side (D31); the cron never is."""
     from worker.clients.spotify_user_client import spotify_user
     from worker.clients.sqs_producer import enqueue_album_sync
 
-    run_listening_sync(SessionLocal, spotify_user, enqueue_unknown=enqueue_album_sync)
+    run_listening_sync(
+        SessionLocal,
+        spotify_user,
+        enqueue_unknown=enqueue_album_sync,
+        is_manual_refresh=is_manual_refresh,
+    )
 
 
 def _process_single(album_id: str, market: str) -> None:
@@ -88,9 +94,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             body = json.loads(record["body"])
             logger.info("[%d/%d] Processing record body=%s", i, len(records), body)
 
-            # Manual "지금 새로고침" button → async listening sync (rule #9)
+            # Manual "지금 새로고침" button → async listening sync (rule #9).
+            # Debounced server-side (D31) so button spam can't burst Spotify.
             if body.get("job") == "spotify_refresh":
-                _run_listening_sync()
+                _run_listening_sync(is_manual_refresh=True)
                 continue
 
             market = body.get("market", settings.SPOTIFY_DEFAULT_MARKET)

@@ -168,13 +168,52 @@ def sync_now_playing(session_factory, client) -> Dict[str, Any]:
     return {"is_playing": bool(data.get("is_playing"))}
 
 
+DEBOUNCE_WINDOW_SECONDS = 60
+
+
+def _debounce_age_seconds(session_factory) -> Optional[float]:
+    """Seconds since the most recent listening-cache write, measured DB-side so
+    Lambda↔DB clock skew can't move the window. None when neither cache has a row
+    yet (bootstrap) — the manual-refresh debounce treats that as 'run'. GREATEST
+    ignores NULLs, so it returns whichever cache has the newer write."""
+    with session_factory() as session:
+        row = session.execute(
+            text(
+                """
+                SELECT EXTRACT(EPOCH FROM (now() - GREATEST(
+                    (SELECT max(synced_at) FROM spotify_recent_albums),
+                    (SELECT max(updated_at) FROM spotify_now_playing)
+                ))) AS age_s
+                """
+            )
+        ).first()
+    age = row.age_s if row else None
+    return float(age) if age is not None else None
+
+
 def run_listening_sync(
     session_factory,
     client,
     enqueue_unknown: Optional[Callable[[List[str]], None]] = None,
+    *,
+    is_manual_refresh: bool = False,
 ) -> Dict[str, Any]:
     """Run both syncs. now-playing failure must not lose the recent-albums write
-    (independent surfaces), so each is isolated."""
+    (independent surfaces), so each is isolated.
+
+    Manual "지금 새로고침" refreshes are debounced (D31): if the cache was written
+    less than DEBOUNCE_WINDOW_SECONDS ago, skip the Spotify reads entirely. This
+    dedups manual-refresh spam so it can't burst Spotify into 429/DLQ, and keeps the
+    non-commutative recent-albums prune serialised. The 1h cron is never debounced
+    (is_manual_refresh=False; its gap dwarfs the window anyway)."""
+    if is_manual_refresh:
+        age = _debounce_age_seconds(session_factory)
+        if age is not None and age < DEBOUNCE_WINDOW_SECONDS:
+            logger.info(
+                "manual refresh debounced: cache written %.1fs ago (< %ds)",
+                age, DEBOUNCE_WINDOW_SECONDS,
+            )
+            return {"skipped": "debounced"}
     result: Dict[str, Any] = {}
     result["recent"] = sync_recent_albums(session_factory, client, enqueue_unknown)
     try:

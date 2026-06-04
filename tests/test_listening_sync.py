@@ -39,14 +39,19 @@ class _Result:
 class _FakeSession:
     """Records execute() calls; answers album lookups from `known_map`."""
 
-    def __init__(self, known_map):
+    def __init__(self, known_map, debounce_age_s=None):
         self.known_map = known_map  # spotify_id -> uuid
         self.executed = []  # list[(sql, params)]
+        # what the DB-side debounce age query returns: None = bootstrap (no cache
+        # row yet), a float = seconds since last write.
+        self.debounce_age_s = debounce_age_s
 
     def execute(self, stmt, params=None):
         sql = str(stmt)
         params = params or {}
         self.executed.append((sql, params))
+        if "age_s" in sql:  # _debounce_age_seconds() probe
+            return _Result(rows=[_Row(age_s=self.debounce_age_s)])
         if "FROM albums WHERE spotify_id = ANY" in sql:
             sids = params["sids"]
             rows = [_Row(id=self.known_map[s], spotify_id=s) for s in sids if s in self.known_map]
@@ -196,3 +201,57 @@ def test_run_listening_sync_isolates_now_playing_failure():
     res = run_listening_sync(lambda: session, client)
     assert res["recent"]["known"] == 1
     assert "error" in res["now_playing"]
+
+
+# ── manual-refresh debounce (D31) ────────────────────────────────────────────────
+
+class _BoomClient:
+    """Any Spotify read is a failure — proves the debounce returned before syncing."""
+
+    def get_recently_played(self, limit=50):
+        raise AssertionError("Spotify read despite debounce")
+
+    def get_currently_playing(self):
+        raise AssertionError("Spotify read despite debounce")
+
+
+@pytest.mark.unit
+def test_manual_refresh_debounced_when_cache_fresh():
+    # cache written 10s ago (< 60s) → manual refresh skips Spotify entirely.
+    session = _FakeSession({}, debounce_age_s=10.0)
+    res = run_listening_sync(lambda: session, _BoomClient(), is_manual_refresh=True)
+    assert res == {"skipped": "debounced"}
+    assert not session.sql_of(lambda s: "INSERT INTO" in s)
+
+
+@pytest.mark.unit
+def test_manual_refresh_runs_when_cache_stale():
+    # cache written 120s ago (> 60s) → manual refresh proceeds normally.
+    ua = uuid.uuid4()
+    session = _FakeSession({"A": ua}, debounce_age_s=120.0)
+    client = _FakeClient(recent=[_play("A", "2026-06-04T10:00:00Z")], now=None)
+    res = run_listening_sync(lambda: session, client, is_manual_refresh=True)
+    assert res["recent"]["known"] == 1
+    assert session.sql_of(lambda s: "INSERT INTO spotify_recent_albums" in s)
+
+
+@pytest.mark.unit
+def test_manual_refresh_runs_on_bootstrap_empty_cache():
+    # no cache row yet (age None) → run (don't debounce the first ever sync).
+    ua = uuid.uuid4()
+    session = _FakeSession({"A": ua}, debounce_age_s=None)
+    client = _FakeClient(recent=[_play("A", "2026-06-04T10:00:00Z")], now=None)
+    res = run_listening_sync(lambda: session, client, is_manual_refresh=True)
+    assert res["recent"]["known"] == 1
+
+
+@pytest.mark.unit
+def test_cron_never_debounced_even_when_cache_fresh():
+    # cron path (is_manual_refresh=False) ignores a fresh cache and always syncs.
+    ua = uuid.uuid4()
+    session = _FakeSession({"A": ua}, debounce_age_s=5.0)
+    client = _FakeClient(recent=[_play("A", "2026-06-04T10:00:00Z")], now=None)
+    res = run_listening_sync(lambda: session, client)  # is_manual_refresh defaults False
+    assert res["recent"]["known"] == 1
+    # the debounce age probe must not even run for the cron path
+    assert not session.sql_of(lambda s: "age_s" in s)
