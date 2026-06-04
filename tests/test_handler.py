@@ -112,3 +112,27 @@ def test_handler_sqs_does_not_call_alias_generation(mock_session_local, mock_svc
     lambda_handler(event, None)
 
     mock_alias.assert_not_called()
+
+
+# ── FEAT-member-dashboard Step 3: Spotify listening sync routing ────────────────
+
+@pytest.mark.unit
+@patch("worker.handler._run_listening_sync")
+@patch("worker.handler.generate_and_save_aliases")
+def test_handler_eventbridge_listening_job(mock_alias, mock_listening):
+    """EventBridge 1h rule sends {"job": "spotify_listening"} → listening sync, and
+    must NOT hit the alias path even though both are EventBridge crons."""
+    result = lambda_handler({"job": "spotify_listening"}, None)
+    mock_listening.assert_called_once()
+    mock_alias.assert_not_called()
+    assert result == {}
+
+
+@pytest.mark.unit
+@patch("worker.handler._run_listening_sync")
+def test_handler_sqs_manual_refresh_job(mock_listening):
+    """Manual '지금 새로고침' SQS message → async listening sync (rule #9)."""
+    event = {"Records": [{"body": json.dumps({"job": "spotify_refresh"})}]}
+    result = lambda_handler(event, None)
+    mock_listening.assert_called_once()
+    assert result == {"batchItemFailures": []}

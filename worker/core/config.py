@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     SPOTIFY_API_BASE: str = "https://api.spotify.com/v1"
     SPOTIFY_DEFAULT_MARKET: str = "KR"
 
+    # Spotify user-scoped player reads (FEAT-member-dashboard Step 3).
+    # Refresh token + client creds live in Secrets Manager myblog/spotify (Q17);
+    # SPOTIFY_REFRESH_TOKEN is an env fallback for local dev / tests only.
+    SPOTIFY_SECRETS_ARN: str = ""
+    SPOTIFY_REFRESH_TOKEN: str = ""
+
     # AWS / SQS (for local testing convenience)
     AWS_DEFAULT_REGION: str = "ap-northeast-2"
     LOCALSTACK_ENDPOINT: str | None = None
