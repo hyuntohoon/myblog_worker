@@ -85,7 +85,7 @@ def test_is_invalid_grant_only_for_spotify_invalid_grant():
 @pytest.mark.unit
 def test_refresh_success_stamps_timestamp_and_clears_reauth(sm, monkeypatch):
     sm.stored["needs_reauth"] = True  # a prior invalid_grant had flagged it
-    monkeypatch.setattr(suc.httpx, "post", _post({"access_token": "AT", "expires_in": 3600}))
+    monkeypatch.setattr(suc.httpx, "request", _post({"access_token": "AT", "expires_in": 3600}))
 
     client = SpotifyUserClient(creds=dict(_CREDS))
     assert client._get_access_token() == "AT"
@@ -99,7 +99,7 @@ def test_refresh_success_stamps_timestamp_and_clears_reauth(sm, monkeypatch):
 @pytest.mark.unit
 def test_refresh_rotated_token_persisted_and_cached_in_memory(sm, monkeypatch):
     monkeypatch.setattr(
-        suc.httpx, "post",
+        suc.httpx, "request",
         _post({"access_token": "AT", "expires_in": 3600, "refresh_token": "NEW"}),
     )
     creds = dict(_CREDS)
@@ -115,7 +115,7 @@ def test_refresh_rotated_token_persisted_and_cached_in_memory(sm, monkeypatch):
 
 @pytest.mark.unit
 def test_invalid_grant_flags_needs_reauth_and_raises(sm, monkeypatch):
-    monkeypatch.setattr(suc.httpx, "post", _post({"error": "invalid_grant"}, status=400))
+    monkeypatch.setattr(suc.httpx, "request", _post({"error": "invalid_grant"}, status=400))
 
     client = SpotifyUserClient(creds=dict(_CREDS))
     with pytest.raises(RuntimeError, match="invalid_grant"):
@@ -129,7 +129,8 @@ def test_invalid_grant_flags_needs_reauth_and_raises(sm, monkeypatch):
 
 @pytest.mark.unit
 def test_transient_5xx_does_not_flip_reauth(sm, monkeypatch):
-    monkeypatch.setattr(suc.httpx, "post", _post({"error": "server_error"}, status=503))
+    monkeypatch.setattr(suc.httpx, "request", _post({"error": "server_error"}, status=503))
+    monkeypatch.setattr(suc.time, "sleep", lambda s: None)  # retry helper backs off 3×
 
     client = SpotifyUserClient(creds=dict(_CREDS))
     with pytest.raises(httpx.HTTPStatusError):
@@ -163,7 +164,7 @@ def test_write_back_failure_is_non_fatal(sm, monkeypatch):
         raise RuntimeError("secretsmanager throttled")
 
     sm.put_secret_value = _boom
-    monkeypatch.setattr(suc.httpx, "post", _post({"access_token": "AT", "expires_in": 3600}))
+    monkeypatch.setattr(suc.httpx, "request", _post({"access_token": "AT", "expires_in": 3600}))
 
     client = SpotifyUserClient(creds=dict(_CREDS))
     # the access token is already in hand; a failed write-back must not break sync
