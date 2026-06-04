@@ -19,7 +19,11 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-from worker.service.listening_sync_service import sync_now_playing, sync_recent_albums
+from worker.service.listening_sync_service import (
+    run_listening_sync,
+    sync_now_playing,
+    sync_recent_albums,
+)
 
 _TEST_DB_URL = os.environ.get("TEST_DB_URL")
 
@@ -111,3 +115,71 @@ def test_now_playing_singleton_upsert(factory):
         rows = s.execute(text("SELECT id, is_playing FROM spotify_now_playing")).fetchall()
     assert len(rows) == 1
     assert rows[0].id == 1
+
+
+class _BoomClient:
+    """Any Spotify read is a failure — proves the debounce returned before syncing."""
+
+    def get_recently_played(self, limit=50):
+        raise AssertionError("Spotify read despite debounce")
+
+    def get_currently_playing(self):
+        raise AssertionError("Spotify read despite debounce")
+
+
+def test_manual_refresh_debounced_when_cache_fresh(factory):
+    """D31: the debounce age query (GREATEST + EXTRACT EPOCH over both cache tables)
+    runs on real Postgres, and a fresh cache short-circuits a manual refresh before
+    any Spotify read."""
+    sid = f"itest_debounce_{uuid.uuid4().hex[:8]}"
+    with factory() as s:
+        with s.begin():
+            album_id = _seed_album(s, sid)
+            s.execute(
+                text(
+                    "INSERT INTO spotify_recent_albums (album_id, last_played_at, source, synced_at) "
+                    "VALUES (:a, now(), 'spotify', now())"  # fresh
+                ),
+                {"a": album_id},
+            )
+    try:
+        res = run_listening_sync(factory, _BoomClient(), is_manual_refresh=True)
+        assert res == {"skipped": "debounced"}
+    finally:
+        with factory() as s:
+            with s.begin():
+                s.execute(text("DELETE FROM spotify_recent_albums WHERE album_id = :a"), {"a": album_id})
+                s.execute(text("DELETE FROM albums WHERE id = :a"), {"a": album_id})
+
+
+def test_manual_refresh_allowed_when_caches_stale(factory):
+    """D31: when every cache write is older than the window, a manual refresh runs.
+    Both tables are forced stale because the debounce spans GREATEST(recent, now-playing).
+    Empty window → the sync is a no-op that still returns a normal (non-skipped) result."""
+    sid = f"itest_stale_{uuid.uuid4().hex[:8]}"
+    with factory() as s:
+        with s.begin():
+            album_id = _seed_album(s, sid)
+            s.execute(
+                text(
+                    "INSERT INTO spotify_recent_albums (album_id, last_played_at, source, synced_at) "
+                    "VALUES (:a, now(), 'spotify', now() - interval '5 minutes')"
+                ),
+                {"a": album_id},
+            )
+            s.execute(
+                text(
+                    "INSERT INTO spotify_now_playing (id, is_playing, updated_at) "
+                    "VALUES (1, false, now() - interval '5 minutes') "
+                    "ON CONFLICT (id) DO UPDATE SET updated_at = now() - interval '5 minutes'"
+                )
+            )
+    try:
+        res = run_listening_sync(factory, _Client(recent=[], now=None), is_manual_refresh=True)
+        assert "skipped" not in res
+        assert res["recent"] == {"known": 0, "unknown": 0, "pruned": 0}
+    finally:
+        with factory() as s:
+            with s.begin():
+                s.execute(text("DELETE FROM spotify_recent_albums WHERE album_id = :a"), {"a": album_id})
+                s.execute(text("DELETE FROM albums WHERE id = :a"), {"a": album_id})
