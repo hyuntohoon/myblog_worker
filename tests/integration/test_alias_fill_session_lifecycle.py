@@ -79,13 +79,26 @@ def session_factory(engine):
 def seed_rows(engine):
     """Seed 3 NULL-MBID artists + 1 pre-existing artist whose MBID collides
     with the canned MB top-1 candidate. Cleaned up at the end of the test.
+
+    Spotify IDs use a '#' prefix so they sort BEFORE every real base62
+    Spotify ID ('0'–'9' / 'A'–'Z' / 'a'–'z') under C.UTF-8 collation
+    ('#' = 0x23, '0' = 0x30). This guarantees the seeds land inside the
+    ``WHERE musicbrainz_id IS NULL ORDER BY spotify_id LIMIT 10`` window
+    even when the shared Neon test branch already contains hundreds of
+    real NULL-mbid rows.
+
+    Verified empirically on the Neon test branch with a BEGIN/ROLLBACK
+    probe (230 pre-existing NULL rows as of 2026-06-05): all 3 NULL-mbid
+    seeds appeared as rows 1-3 of the LIMIT 10 result.
     """
     pre_existing_mbid = "bug18-test-occupied-mbid-0001"
+    # '#' prefix sorts before '0' in C.UTF-8 (byte 0x23 < 0x30), ensuring
+    # these rows are always first in ORDER BY spotify_id LIMIT 10.
     sids = [
-        "bug18-test-sid-001",  # row 1: 1st candidate taken → adopt 2nd
-        "bug18-test-sid-002",  # row 2: all candidates taken → sentinel
-        "bug18-test-sid-003",  # row 3: clean lookup
-        "bug18-test-sid-pre",  # pre-existing holder of pre_existing_mbid
+        "#bug18-test-sid-001",  # row 1: 1st candidate taken → adopt 2nd
+        "#bug18-test-sid-002",  # row 2: all candidates taken → sentinel
+        "#bug18-test-sid-003",  # row 3: clean lookup
+        "#bug18-test-sid-pre",  # pre-existing holder of pre_existing_mbid
     ]
     with engine.connect() as conn:
         # Clean any stale leftover from prior failed runs first.
@@ -103,6 +116,33 @@ def seed_rows(engine):
         """), {"s1": sids[0], "s2": sids[1], "s3": sids[2], "sp": sids[3],
                "mbid": pre_existing_mbid})
         conn.commit()
+
+    # Precondition guard: assert the 3 NULL-mbid seeds actually landed in
+    # the LIMIT 10 window.  If a collation change or new bulk-import pushes
+    # them out, this fires with a clear message instead of a later
+    # misleading "None == …" assertion failure.
+    with engine.connect() as conn:
+        window = conn.execute(
+            text("""
+                SELECT spotify_id
+                  FROM artists
+                 WHERE musicbrainz_id IS NULL
+                 ORDER BY spotify_id
+                 LIMIT 10
+            """)
+        ).fetchall()
+    window_sids = {r[0] for r in window}
+    null_seeds = sids[:3]  # the 4th has a real mbid, won't appear here
+    missing = [s for s in null_seeds if s not in window_sids]
+    if missing:
+        pre_existing_count = len(window_sids - set(null_seeds))
+        pytest.fail(
+            f"seed rows pushed out of LIMIT 10 window by "
+            f"{pre_existing_count} pre-existing NULL rows — "
+            f"test isolation broken. Missing: {missing}. "
+            f"Fix: use a spotify_id prefix that sorts before all real IDs "
+            f"under C.UTF-8 collation."
+        )
 
     yield {"sids": sids, "occupied_mbid": pre_existing_mbid}
 
@@ -128,12 +168,12 @@ def _patched_fetch(*, occupied_mbid: str):
         if name == "BUG18 Stuck One":
             assert is_mbid_taken(occupied_mbid) is True, \
                 "pre-check SELECT must see the seeded existing row"
-            return ("bug18-test-row1-resolved", ["alias-row1"])
+            return ("#bug18-test-row1-resolved", ["alias-row1"])
         if name == "BUG18 Stuck Two":
             assert is_mbid_taken(occupied_mbid) is True
             return ("not_found", [])
         if name == "BUG18 Clean":
-            unused = "bug18-test-row3-clean"
+            unused = "#bug18-test-row3-clean"
             assert is_mbid_taken(unused) is False, \
                 "clean lookup must see a free MBID after row1/row2 commits " \
                 "— if the SELECT throws on stale connection here, BUG-17 regressed"
@@ -168,9 +208,9 @@ def test_alias_fill_pre_check_three_outcomes_real_engine(seed_rows, session_fact
 
     assert len(rows) == 3, "all 3 seeded NULL rows should now be NOT NULL"
     by_sid = {r[0]: r[1] for r in rows}
-    assert by_sid[sids[0]] == "bug18-test-row1-resolved", \
+    assert by_sid[sids[0]] == "#bug18-test-row1-resolved", \
         "row 1 should have adopted the 2nd candidate (pre-check evicted 1st)"
     assert by_sid[sids[1]] == "not_found", \
         "row 2 should have sentinel ('not_found') — all candidates taken"
-    assert by_sid[sids[2]] == "bug18-test-row3-clean", \
+    assert by_sid[sids[2]] == "#bug18-test-row3-clean", \
         "row 3 should hold the clean lookup result"
