@@ -1,6 +1,3 @@
-cd ~/Dow/worker_lambda
-
-cat > .gitignore << 'EOF'
 # Python
 __pycache__/
 *.py[cod]
@@ -37,7 +34,7 @@ dist/
 
 # Logs
 *.log
-EOF
+
 # Allure
 allure-results/
 allure-report/
