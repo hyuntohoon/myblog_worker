@@ -237,3 +237,134 @@ def test_play_events_append_idempotent(factory):
                 s.execute(text("DELETE FROM spotify_play_events WHERE album_id = :a"), {"a": album_id})
                 s.execute(text("DELETE FROM spotify_recent_albums WHERE album_id = :a"), {"a": album_id})
                 s.execute(text("DELETE FROM albums WHERE id = :a"), {"a": album_id})
+
+
+def _track_play(track_id, played_at, album_sid=None, name="ITEST song", artist="ITEST artist"):
+    return {
+        "track": {
+            "id": track_id,
+            "name": name,
+            "artists": [{"name": artist}],
+            "album": {"id": album_sid, "name": "ITEST album"} if album_sid else {},
+        },
+        "played_at": played_at,
+    }
+
+
+def test_recent_tracks_resolve_and_idempotent(factory):
+    """D-B: each played track is cached at track granularity; album_id resolves from
+    the catalog when known and is NULL otherwise. Re-running the same window is a
+    no-op via ON CONFLICT (spotify_track_id, played_at) DO NOTHING — unit mocks can't
+    see the real conflict semantics, so this exercises them on a live engine."""
+    if not _table_exists(factory, "spotify_recent_tracks"):
+        pytest.skip("spotify_recent_tracks not on test branch — apply migration V14 first")
+
+    sid = f"itest_rt_alb_{uuid.uuid4().hex[:8]}"
+    tid_known = f"itest_rt_k_{uuid.uuid4().hex[:8]}"
+    tid_unknown = f"itest_rt_u_{uuid.uuid4().hex[:8]}"
+    with factory() as s:
+        with s.begin():
+            album_id = _seed_album(s, sid)
+    try:
+        client = _Client(recent=[
+            _track_play(tid_known, "2026-06-04T10:00:00Z", album_sid=sid),
+            _track_play(tid_unknown, "2026-06-04T09:00:00Z", album_sid="itest_rt_noncatalog"),
+        ])
+        res1 = sync_recent_albums(factory, client)
+        assert res1["tracks"] == 2
+
+        with factory() as s:
+            rows = s.execute(
+                text(
+                    "SELECT spotify_track_id, album_id, track_name, artist_name "
+                    "FROM spotify_recent_tracks WHERE spotify_track_id = ANY(:ids)"
+                ),
+                {"ids": [tid_known, tid_unknown]},
+            ).fetchall()
+        by_tid = {r.spotify_track_id: r for r in rows}
+        assert by_tid[tid_known].album_id == album_id   # catalog album → resolved
+        assert by_tid[tid_unknown].album_id is None      # non-catalog album → NULL, still cached
+        assert by_tid[tid_known].track_name == "ITEST song"
+
+        # re-run the SAME window → ON CONFLICT DO NOTHING → no new rows appended
+        res2 = sync_recent_albums(factory, client)
+        assert res2["tracks"] == 0
+        with factory() as s:
+            n = s.execute(
+                text(
+                    "SELECT count(*) AS c FROM spotify_recent_tracks "
+                    "WHERE spotify_track_id = ANY(:ids)"
+                ),
+                {"ids": [tid_known, tid_unknown]},
+            ).first().c
+        assert n == 2  # unchanged — idempotent
+    finally:
+        with factory() as s:
+            with s.begin():
+                s.execute(
+                    text("DELETE FROM spotify_recent_tracks WHERE spotify_track_id = ANY(:ids)"),
+                    {"ids": [tid_known, tid_unknown]},
+                )
+                s.execute(text("DELETE FROM spotify_recent_albums WHERE album_id = :a"), {"a": album_id})
+                s.execute(text("DELETE FROM spotify_play_events WHERE album_id = :a"), {"a": album_id})
+                s.execute(text("DELETE FROM albums WHERE id = :a"), {"a": album_id})
+
+
+def test_recent_tracks_pruned_to_window(factory):
+    """D-B: spotify_recent_tracks is a CACHE — after each tick it is pruned to the
+    most recent RECENT_TRACKS_WINDOW rows by played_at. Feed more than the window
+    (all with the newest timestamps) and assert the oldest of ours is pruned while
+    the newest survives."""
+    if not _table_exists(factory, "spotify_recent_tracks"):
+        pytest.skip("spotify_recent_tracks not on test branch — apply migration V14 first")
+    from worker.service.listening_sync_service import RECENT_TRACKS_WINDOW
+
+    run = uuid.uuid4().hex[:8]
+    n = RECENT_TRACKS_WINDOW + 2
+    # Seed a catalog album and attach every track to it — track caching runs inside
+    # the album-gated session block, so the window must contain ≥1 album-backed play
+    # (real Spotify tracks always carry an album; only local files don't).
+    alb_sid = f"itest_pr_alb_{run}"
+    with factory() as s:
+        with s.begin():
+            album_id = _seed_album(s, alb_sid)
+    # distinct ascending played_at so index order is unambiguous; idx 0 = oldest,
+    # idx n-1 = newest. n > window forces the prune to drop our two oldest.
+    recent = [
+        _track_play(f"itest_pr_{run}_{i:03d}", f"2026-06-04T12:{i // 60:02d}:{i % 60:02d}Z",
+                    album_sid=alb_sid)
+        for i in range(n)
+    ]
+    oldest_tid = f"itest_pr_{run}_000"
+    newest_tid = f"itest_pr_{run}_{n - 1:03d}"
+    try:
+        sync_recent_albums(factory, _Client(recent=recent))
+        with factory() as s:
+            survived = s.execute(
+                text(
+                    "SELECT count(*) AS c FROM spotify_recent_tracks "
+                    "WHERE spotify_track_id LIKE :p"
+                ),
+                {"p": f"itest_pr_{run}_%"},
+            ).first().c
+            has_newest = s.execute(
+                text("SELECT 1 FROM spotify_recent_tracks WHERE spotify_track_id = :t"),
+                {"t": newest_tid},
+            ).first()
+            has_oldest = s.execute(
+                text("SELECT 1 FROM spotify_recent_tracks WHERE spotify_track_id = :t"),
+                {"t": oldest_tid},
+            ).first()
+        assert survived <= RECENT_TRACKS_WINDOW
+        assert has_newest is not None      # newest play kept
+        assert has_oldest is None          # oldest play pruned out of the window
+    finally:
+        with factory() as s:
+            with s.begin():
+                s.execute(
+                    text("DELETE FROM spotify_recent_tracks WHERE spotify_track_id LIKE :p"),
+                    {"p": f"itest_pr_{run}_%"},
+                )
+                s.execute(text("DELETE FROM spotify_recent_tracks WHERE album_id = :a"), {"a": album_id})
+                s.execute(text("DELETE FROM spotify_recent_albums WHERE album_id = :a"), {"a": album_id})
+                s.execute(text("DELETE FROM albums WHERE id = :a"), {"a": album_id})

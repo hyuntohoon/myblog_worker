@@ -56,6 +56,8 @@ class _FakeSession:
             return _Result(rows=[_Row(age_s=self.debounce_age_s)])
         if "INSERT INTO spotify_play_events" in sql:  # D29 append — pretend each lands
             return _Result(rowcount=1)
+        if "INSERT INTO spotify_recent_tracks" in sql:  # D-B cache append — pretend each lands
+            return _Result(rowcount=1)
         if "FROM albums WHERE spotify_id = ANY" in sql:
             sids = params["sids"]
             rows = [_Row(id=self.known_map[s], spotify_id=s) for s in sids if s in self.known_map]
@@ -121,7 +123,10 @@ def test_recent_distinct_known_unknown_split_and_prune():
 
     res = sync_recent_albums(lambda: session, client, enqueue_unknown=enqueue)
 
-    assert res == {"known": 2, "unknown": 1, "pruned": 1, "events": 3}
+    # _play() carries no track id, so the recent-tracks cache stays empty here
+    # (track-level caching is covered by test_recent_caches_track_window + the
+    # real-engine integration test).
+    assert res == {"known": 2, "unknown": 1, "pruned": 1, "events": 3, "tracks": 0}
     # two upserts (A, B), one prune
     inserts = session.sql_of(lambda s: "INSERT INTO spotify_recent_albums" in s)
     assert len(inserts) == 2
@@ -181,6 +186,67 @@ def test_recent_appends_every_play_to_events():
     assert b_events == ["2026-06-04T09:00:00Z"]
     # unknown album C is never recorded as an event
     assert all(p["album_id"] in (ua, ub) for _, p in inserts)
+
+
+# ── recent-tracks cache (D-B) ─────────────────────────────────────────────────────
+
+def _play_track(track_id, album_id, played_at, name="Song", artist="Artist"):
+    """A recently-played item carrying full track metadata (id/name/artists/album)."""
+    return {
+        "track": {
+            "id": track_id,
+            "name": name,
+            "artists": [{"name": artist}],
+            "album": {"id": album_id, "name": "An Album"} if album_id else {},
+        },
+        "played_at": played_at,
+    }
+
+
+@pytest.mark.unit
+def test_recent_caches_track_window():
+    """Each played track is cached at track granularity; album_id resolves from the
+    catalog when known and is NULL otherwise (denormalized so non-catalog tracks
+    still display). The window is then pruned. Real ON CONFLICT / LIMIT semantics
+    are covered by the integration test."""
+    ua = uuid.uuid4()
+    known = {"A": ua}  # album "Z" is NOT in the catalog
+    session = _FakeSession(known)
+    client = _FakeClient(recent=[
+        _play_track("t1", "A", "2026-06-04T10:00:00Z"),
+        _play_track("t2", "Z", "2026-06-04T09:00:00Z"),  # non-catalog album → album_id NULL
+        _play_track("t3", None, "2026-06-04T08:00:00Z"),  # no album at all → album_id NULL
+    ])
+
+    res = sync_recent_albums(lambda: session, client)
+
+    assert res["tracks"] == 3
+    track_ins = session.sql_of(lambda s: "INSERT INTO spotify_recent_tracks" in s)
+    assert len(track_ins) == 3
+    by_tid = {p["track_id"]: p for _, p in track_ins}
+    assert by_tid["t1"]["album_id"] == ua            # catalog album → resolved uuid
+    assert by_tid["t2"]["album_id"] is None          # non-catalog album → NULL
+    assert by_tid["t3"]["album_id"] is None          # no album → NULL
+    assert by_tid["t1"]["track_name"] == "Song"
+    assert by_tid["t1"]["artist_name"] == "Artist"
+    # the cache is pruned to a rolling window every tick (it is not a durable log)
+    assert session.sql_of(lambda s: "DELETE FROM spotify_recent_tracks" in s)
+
+
+@pytest.mark.unit
+def test_recent_skips_trackless_items_for_cache():
+    """Items without a stable track id (some local files / unplayable) are not cached,
+    but album-backed plays in the same window still flow to recent_albums/events."""
+    ua = uuid.uuid4()
+    session = _FakeSession({"A": ua})
+    client = _FakeClient(recent=[
+        _play("A", "2026-06-04T10:00:00Z"),           # album play, no track id → no track row
+        _play_track("t1", "A", "2026-06-04T09:00:00Z"),  # has track id → cached
+    ])
+    res = sync_recent_albums(lambda: session, client)
+    assert res["tracks"] == 1
+    track_ins = session.sql_of(lambda s: "INSERT INTO spotify_recent_tracks" in s)
+    assert [p["track_id"] for _, p in track_ins] == ["t1"]
 
 
 # ── sync_now_playing ────────────────────────────────────────────────────────────
