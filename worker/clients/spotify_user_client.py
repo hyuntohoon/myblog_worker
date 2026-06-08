@@ -7,8 +7,9 @@
 # Secrets Manager myblog/spotify (RFC Q17). This client exchanges that refresh token
 # for short-lived access tokens on demand.
 #
-# Scopes: user-read-recently-played, user-read-currently-playing (read-only; write
-# scopes deferred per D11).
+# Scopes: user-read-recently-played, user-read-currently-playing (listening reads),
+# user-library-read + user-library-modify (Spotify Library two-way sync,
+# FEAT-spotify-library-sync — the only write scopes, per D11 follow-up).
 from __future__ import annotations
 
 import base64
@@ -34,6 +35,19 @@ RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 MAX_TRIES = 3
 BASE_BACKOFF_SECONDS = 0.5
 MAX_BACKOFF_SECONDS = 8.0
+
+# Spotify /me/albums* (GET contains, PUT, DELETE) cap at 20 ids per call. The
+# saved-albums LIST endpoint (GET /me/albums) is a separate paginated read capped
+# at 50 per page (LIBRARY_PAGE_LIMIT below).
+LIBRARY_IDS_CHUNK = 20
+LIBRARY_PAGE_LIMIT = 50
+
+
+class SpotifyScopeError(RuntimeError):
+    """Raised when a /me/albums* call returns 403 missing-scope — distinct from a
+    transient failure or an invalid_grant. The caller maps this to needs_attention /
+    needs_reauth (the owner must re-run the bootstrap with the user-library-* scopes)
+    rather than retrying or marking the album 'failed'."""
 
 
 def _parse_retry_after(resp: "httpx.Response") -> Optional[float]:
@@ -257,6 +271,103 @@ class SpotifyUserClient:
         if not r.content:
             return None
         return r.json()
+
+    # ---------- library reads/writes (FEAT-spotify-library-sync) ----------
+    @staticmethod
+    def _raise_for_scope(resp: "httpx.Response", op: str) -> None:
+        """A 403 on a /me/albums* call means the stored token lacks the
+        user-library-* scope (the listening-only bootstrap predates this feature).
+        Surface it as SpotifyScopeError so the reconcile flips rows to
+        needs_attention instead of silently retrying or marking 'failed'."""
+        if resp.status_code == 403:
+            raise SpotifyScopeError(
+                f"Spotify {op} returned 403 (missing user-library-* scope) — "
+                "re-run scripts/spotify_bootstrap_token.py --write to re-consent"
+            )
+
+    def get_saved_albums(self) -> List[Dict[str, Any]]:
+        """GET /me/albums?limit=50&offset=… — paginate the owner's saved-albums
+        Library, following total/next, and return the raw album objects (each item
+        is {"added_at": …, "album": {"id": …, "name": …, …}} → we unwrap to the
+        inner album object so callers read album.id / album.name directly)."""
+        url = f"{settings.SPOTIFY_API_BASE}/me/albums"
+        albums: List[Dict[str, Any]] = []
+        offset = 0
+        while True:
+            params = {"limit": LIBRARY_PAGE_LIMIT, "offset": offset}
+            r = _request_with_retry(
+                "GET", url, headers=self._headers(), params=params, timeout=20
+            )
+            self._raise_for_scope(r, "GET /me/albums")
+            r.raise_for_status()
+            payload = r.json() or {}
+            items = payload.get("items") or []
+            for it in items:
+                album = (it or {}).get("album")
+                if album and album.get("id"):
+                    albums.append(album)
+            total = payload.get("total")
+            offset += len(items)
+            # Stop on an empty page (next=null / past the end) or once we've read
+            # `total` items. `next` is the authoritative paginator; total guards a
+            # never-null next.
+            if not items or not payload.get("next"):
+                break
+            if isinstance(total, int) and offset >= total:
+                break
+        return albums
+
+    def check_saved_albums(self, spotify_ids: List[str]) -> Dict[str, bool]:
+        """GET /me/albums/contains?ids= (chunked ≤ 20) → {spotify_id: is_saved}.
+        Order-preserving zip of the chunk against Spotify's bool array."""
+        ids = [s for s in (spotify_ids or []) if s]
+        result: Dict[str, bool] = {}
+        if not ids:
+            return result
+        url = f"{settings.SPOTIFY_API_BASE}/me/albums/contains"
+        for i in range(0, len(ids), LIBRARY_IDS_CHUNK):
+            chunk = ids[i : i + LIBRARY_IDS_CHUNK]
+            r = _request_with_retry(
+                "GET", url, headers=self._headers(),
+                params={"ids": ",".join(chunk)}, timeout=20,
+            )
+            self._raise_for_scope(r, "GET /me/albums/contains")
+            r.raise_for_status()
+            flags = r.json() or []
+            for sid, saved in zip(chunk, flags):
+                result[sid] = bool(saved)
+        return result
+
+    def save_albums(self, spotify_ids: List[str]) -> None:
+        """PUT /me/albums?ids= (chunked ≤ 20). Adds albums to the owner's Library."""
+        ids = [s for s in (spotify_ids or []) if s]
+        if not ids:
+            return
+        url = f"{settings.SPOTIFY_API_BASE}/me/albums"
+        for i in range(0, len(ids), LIBRARY_IDS_CHUNK):
+            chunk = ids[i : i + LIBRARY_IDS_CHUNK]
+            r = _request_with_retry(
+                "PUT", url, headers=self._headers(),
+                params={"ids": ",".join(chunk)}, timeout=20,
+            )
+            self._raise_for_scope(r, "PUT /me/albums")
+            r.raise_for_status()
+
+    def remove_albums(self, spotify_ids: List[str]) -> None:
+        """DELETE /me/albums?ids= (chunked ≤ 20). Removes albums from the Library.
+        The reconcile must NEVER pass a pre-existing album here (req 5)."""
+        ids = [s for s in (spotify_ids or []) if s]
+        if not ids:
+            return
+        url = f"{settings.SPOTIFY_API_BASE}/me/albums"
+        for i in range(0, len(ids), LIBRARY_IDS_CHUNK):
+            chunk = ids[i : i + LIBRARY_IDS_CHUNK]
+            r = _request_with_retry(
+                "DELETE", url, headers=self._headers(),
+                params={"ids": ",".join(chunk)}, timeout=20,
+            )
+            self._raise_for_scope(r, "DELETE /me/albums")
+            r.raise_for_status()
 
 
 spotify_user = SpotifyUserClient()

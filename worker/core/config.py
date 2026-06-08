@@ -37,6 +37,15 @@ class Settings(BaseSettings):
     # Control flags
     DRY_RUN: bool = False
 
+    # Spotify Library two-way sync (FEAT-spotify-library-sync Step 2).
+    # PLAN-ONLY by default: the reconcile reads /me/albums, computes diffs, PULLs
+    # pre-existing saved albums into the special bucket, stamps source, and updates
+    # our DB state + logs the intended PUT/DELETE sets — but issues NO real
+    # PUT/DELETE /me/albums. Flip True to execute real Spotify writes. (DB writes
+    # always happen; only the Spotify mutations are gated.) The worker reads THIS
+    # flag, never the SQS message, so a stray/replayed message can't force a write.
+    SPOTIFY_LIBRARY_WRITES_ENABLED: bool = False
+
     # Secrets Manager
     SECRETS_ARN: str = ""
 
