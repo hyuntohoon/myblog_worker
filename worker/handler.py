@@ -29,6 +29,24 @@ def _run_listening_sync(is_manual_refresh: bool = False) -> None:
     )
 
 
+def _run_library_sync() -> None:
+    """Spotify saved-albums two-way reconcile (FEAT-spotify-library-sync). Triggered
+    by the {"job": "spotify_library_sync"} SQS message the backend enqueues. Whether
+    real Spotify PUT/DELETE writes execute is read from the worker's OWN setting
+    (SPOTIFY_LIBRARY_WRITES_ENABLED) — NOT the message — so a stray/replayed message
+    can never force a write. Plan-only by default."""
+    from worker.clients.spotify_user_client import spotify_user
+    from worker.clients.sqs_producer import enqueue_album_sync
+    from worker.service.library_sync_service import run_library_sync
+
+    run_library_sync(
+        SessionLocal,
+        spotify_user,
+        enqueue_unknown=enqueue_album_sync,
+        writes_enabled=settings.SPOTIFY_LIBRARY_WRITES_ENABLED,
+    )
+
+
 def _process_single(album_id: str, market: str) -> None:
     logger.info("Processing single album_id=%s market=%s DRY_RUN=%s", album_id, market, settings.DRY_RUN)
     if settings.DRY_RUN:
@@ -98,6 +116,14 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             # Debounced server-side (D31) so button spam can't burst Spotify.
             if body.get("job") == "spotify_refresh":
                 _run_listening_sync(is_manual_refresh=True)
+                continue
+
+            # Spotify saved-albums two-way reconcile (FEAT-spotify-library-sync).
+            # Enqueued by the backend POST /api/buckets/spotify-library/sync (rule #9:
+            # the endpoint only enqueues). Real writes gated on the worker's own
+            # setting, not this message.
+            if body.get("job") == "spotify_library_sync":
+                _run_library_sync()
                 continue
 
             market = body.get("market", settings.SPOTIFY_DEFAULT_MARKET)

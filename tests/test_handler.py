@@ -136,3 +136,28 @@ def test_handler_sqs_manual_refresh_job(mock_listening):
     result = lambda_handler(event, None)
     mock_listening.assert_called_once()
     assert result == {"batchItemFailures": []}
+
+
+# ── FEAT-spotify-library-sync Step 2: Spotify Library reconcile routing ──────────
+
+@pytest.mark.unit
+@patch("worker.handler._run_library_sync")
+def test_handler_sqs_library_sync_job(mock_library):
+    """{"job": "spotify_library_sync"} SQS message → library reconcile (rule #9: the
+    backend endpoint only enqueues)."""
+    event = {"Records": [{"body": json.dumps({"job": "spotify_library_sync"})}]}
+    result = lambda_handler(event, None)
+    mock_library.assert_called_once()
+    assert result == {"batchItemFailures": []}
+
+
+@pytest.mark.unit
+@patch("worker.handler._run_library_sync")
+@patch("worker.handler._run_listening_sync")
+def test_handler_library_sync_does_not_call_listening(mock_listening, mock_library):
+    """The library job must route ONLY to the library reconcile, not the listening
+    sync (both are 'job'-tagged SQS messages)."""
+    event = {"Records": [{"body": json.dumps({"job": "spotify_library_sync"})}]}
+    lambda_handler(event, None)
+    mock_library.assert_called_once()
+    mock_listening.assert_not_called()
