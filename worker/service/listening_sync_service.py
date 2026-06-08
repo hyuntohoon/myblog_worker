@@ -16,6 +16,11 @@ from sqlalchemy.sql import text
 
 logger = logging.getLogger(__name__)
 
+# D-B: spotify_recent_tracks is a rolling CACHE of the most recent plays (track
+# granularity), pruned to this many rows each tick. Mirrors the Spotify
+# recently-played 50-item window; durable history lives in spotify_play_events.
+RECENT_TRACKS_WINDOW = 50
+
 
 def sync_recent_albums(
     session_factory,
@@ -36,10 +41,26 @@ def sync_recent_albums(
     # most-recent-first → first occurrence per album is its latest play
     latest_played: Dict[str, str] = {}
     all_plays: List[tuple[str, str]] = []  # D29: every play (sid, played_at) for the events table
+    track_rows: List[Dict[str, Any]] = []  # D-B: every play at TRACK granularity for the recent-tracks cache
     for it in items:
-        album = ((it or {}).get("track") or {}).get("album") or {}
-        sid = album.get("id")
+        track = (it or {}).get("track") or {}
         played_at = (it or {}).get("played_at")
+        # D-B: a track is cacheable as long as it has a stable id + timestamp, even
+        # when its album isn't in our catalog (denormalized text + nullable album_id).
+        tid = track.get("id")
+        if tid and played_at:
+            track_album = track.get("album") or {}
+            artists = track.get("artists") or []
+            track_rows.append({
+                "track_id": tid,
+                "track_name": track.get("name") or "",
+                "artist_name": ", ".join(a.get("name", "") for a in artists if a.get("name")) or None,
+                "album_name": track_album.get("name"),
+                "album_sid": track_album.get("id"),
+                "played_at": played_at,
+            })
+        album = track.get("album") or {}
+        sid = album.get("id")
         if not sid or not played_at:
             continue  # local files / podcasts have no album id
         latest_played.setdefault(sid, played_at)
@@ -104,6 +125,51 @@ def sync_recent_albums(
                 # current window has no catalog albums → cache reflects that honestly
                 pruned = session.execute(text("DELETE FROM spotify_recent_albums")).rowcount
 
+            # D-B: cache the track-level window so /profile can show "최근 재생 트랙"
+            # and a "최근 재생" (latest-played) now-playing fallback. Denormalized
+            # text + nullable album_id (resolved from the catalog when known) so
+            # tracks whose album isn't in our catalog still display. Same dedup
+            # pattern as play_events on (spotify_track_id, played_at); but this is a
+            # CACHE — pruned to the most recent window, not kept as durable history.
+            tracks_cached = 0
+            for tr in track_rows:
+                album_uuid = sid_to_uuid.get(tr["album_sid"]) if tr["album_sid"] else None
+                tracks_cached += session.execute(
+                    text(
+                        """
+                        INSERT INTO spotify_recent_tracks
+                            (spotify_track_id, track_name, artist_name, album_name,
+                             album_id, played_at, source, synced_at)
+                        VALUES
+                            (:track_id, :track_name, :artist_name, :album_name,
+                             :album_id, CAST(:played_at AS timestamptz), 'spotify', now())
+                        ON CONFLICT (spotify_track_id, played_at) DO NOTHING
+                        """
+                    ),
+                    {
+                        "track_id": tr["track_id"],
+                        "track_name": tr["track_name"],
+                        "artist_name": tr["artist_name"],
+                        "album_name": tr["album_name"],
+                        "album_id": album_uuid,
+                        "played_at": tr["played_at"],
+                    },
+                ).rowcount
+
+            session.execute(
+                text(
+                    """
+                    DELETE FROM spotify_recent_tracks
+                    WHERE id NOT IN (
+                        SELECT id FROM spotify_recent_tracks
+                        ORDER BY played_at DESC
+                        LIMIT :keep
+                    )
+                    """
+                ),
+                {"keep": RECENT_TRACKS_WINDOW},
+            )
+
     unknown_ids = [sid for sid in spotify_ids if sid not in sid_to_uuid]
     if unknown_ids and enqueue_unknown is not None:
         try:
@@ -112,14 +178,15 @@ def sync_recent_albums(
             logger.warning("enqueue of unknown recently-played albums failed: %s", e)
 
     logger.info(
-        "recent sync: known=%d unknown=%d pruned=%d events=%d",
-        len(keep_uuids), len(unknown_ids), pruned, events_appended,
+        "recent sync: known=%d unknown=%d pruned=%d events=%d tracks=%d",
+        len(keep_uuids), len(unknown_ids), pruned, events_appended, tracks_cached,
     )
     return {
         "known": len(keep_uuids),
         "unknown": len(unknown_ids),
         "pruned": pruned,
         "events": events_appended,
+        "tracks": tracks_cached,
     }
 
 
