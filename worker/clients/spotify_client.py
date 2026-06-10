@@ -1,8 +1,14 @@
 # Parallel implementation: myblog_music/app/clients/spotify_client.py
 # Auth logic (_get_token/_headers) must stay in sync. See docs/decisions/ADR-0004.
-import base64, logging, time, httpx
+import base64, logging, time
 from typing import Optional, Dict, Any, List
 from worker.core.config import settings
+
+# Shared transient-retry helper (429 Retry-After + 5xx/transport backoff). Lives in
+# spotify_user_client so its existing tests keep their patch targets; this catalog
+# client is the second consumer (FEAT-album-catalog-ingest Step 1 — without it a
+# single 429 during batch sync propagated straight to the SQS DLQ).
+from worker.clients.spotify_user_client import _request_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +35,9 @@ class SpotifyClient:
             "Content-Type": "application/x-www-form-urlencoded",
         }
         data = {"grant_type": "client_credentials"}
-        r = httpx.post(settings.SPOTIFY_TOKEN_URL, headers=headers, data=data, timeout=20)
+        r = _request_with_retry(
+            "POST", settings.SPOTIFY_TOKEN_URL, headers=headers, data=data, timeout=20
+        )
         r.raise_for_status()
         payload = r.json()
         self._token = payload["access_token"]
@@ -68,7 +76,9 @@ class SpotifyClient:
 
             logger.debug("GET /albums chunk=%d size=%d", i // _MAX_ALBUMS + 1, len(chunk))
 
-            r = httpx.get(base_url, headers=self._headers(), params=params, timeout=20)
+            r = _request_with_retry(
+                "GET", base_url, headers=self._headers(), params=params, timeout=20
+            )
             r.raise_for_status()
 
             albums = r.json().get("albums") or []
@@ -97,7 +107,9 @@ class SpotifyClient:
 
             logger.debug("GET /artists chunk=%d size=%d", i // _MAX_ARTISTS + 1, len(chunk))
 
-            r = httpx.get(base_url, headers=self._headers(), params=params, timeout=20)
+            r = _request_with_retry(
+                "GET", base_url, headers=self._headers(), params=params, timeout=20
+            )
             r.raise_for_status()
 
             artists = r.json().get("artists") or []
