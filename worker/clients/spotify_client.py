@@ -123,4 +123,32 @@ class SpotifyClient:
         """호환용 thin wrapper."""
         return self.get_artists(ids)
 
+    def get_artist_albums(
+        self,
+        artist_id: str,
+        include_groups: str = "album",
+        market: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """GET /v1/artists/{id}/albums — one page, most-recent-first.
+
+        Single page only: 50 items covers years of any artist's full-length output,
+        and the album-ingest sweep (FEAT-album-catalog-ingest) only wants releases
+        newer than INGEST_SINCE — deeper back-catalog stays on the reactive
+        candidates path."""
+        params: Dict[str, Any] = {"include_groups": include_groups, "limit": limit}
+        mkt = self._default_market(market)
+        if mkt:
+            params["market"] = mkt
+
+        r = _request_with_retry(
+            "GET",
+            f"{settings.SPOTIFY_API_BASE}/artists/{artist_id}/albums",
+            headers=self._headers(),
+            params=params,
+            timeout=20,
+        )
+        r.raise_for_status()
+        return r.json().get("items") or []
+
 spotify = SpotifyClient()
