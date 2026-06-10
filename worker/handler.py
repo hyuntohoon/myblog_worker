@@ -50,8 +50,10 @@ def _run_library_sync() -> None:
 def _process_single(album_id: str, market: str) -> None:
     logger.info("Processing single album_id=%s market=%s DRY_RUN=%s", album_id, market, settings.DRY_RUN)
     if settings.DRY_RUN:
-        alb = spotify.get_album(album_id, market=market)
-        logger.info("[DRY_RUN] album='%s'", alb.get("name"))
+        # SpotifyClient has no single-get; the batch call with one id is equivalent
+        # (spotify.get_album never existed — this path raised AttributeError).
+        albums = spotify.get_albums([album_id], market=market)
+        logger.info("[DRY_RUN] album='%s'", albums[0].get("name") if albums else None)
         return
 
     with SessionLocal() as session, session.begin():
@@ -87,12 +89,29 @@ def _run_alias_generation() -> None:
         raise
 
 
+def _run_album_ingest() -> None:
+    """Scheduled album-catalog ingest (FEAT-album-catalog-ingest). Discovers
+    gate-passing new releases by catalog artists and enqueues them onto the same
+    SQS album-sync pipeline this handler consumes (the consumer never re-enqueues,
+    so there is no feedback loop)."""
+    from worker.clients.sqs_producer import enqueue_album_sync
+    from worker.service.album_ingest_service import run_album_ingest
+
+    run_album_ingest(SessionLocal, spotify, enqueue_album_sync)
+
+
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # EventBridge 1h cron — Spotify listening cache sync. This rule's target sends a
     # constant input {"job": "spotify_listening"} (no "source"), so check job first.
     if event.get("job") == "spotify_listening":
         logger.info("EventBridge trigger: running Spotify listening sync")
         _run_listening_sync()
+        return {}
+
+    # EventBridge daily cron — album-catalog ingest (constant input, no "source").
+    if event.get("job") == "album_ingest":
+        logger.info("EventBridge trigger: running album-catalog ingest")
+        _run_album_ingest()
         return {}
 
     # EventBridge scheduled rule (alias cron) — full event carries source=aws.events

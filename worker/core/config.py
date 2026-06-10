@@ -46,6 +46,19 @@ class Settings(BaseSettings):
     # flag, never the SQS message, so a stray/replayed message can't force a write.
     SPOTIFY_LIBRARY_WRITES_ENABLED: bool = False
 
+    # Scheduled album-catalog ingest (FEAT-album-catalog-ingest Step 2).
+    # New-releases-only sweep of catalog artists: gates + bounds are curation
+    # policy (owner-accepted 2026-06-10), NOT storage limits. INGEST_SINCE is the
+    # mode switch — albums released before it are never batch-ingested (the
+    # reactive candidates path covers back-catalog on demand); relax it to
+    # enable backfill.
+    ARTIST_POP_MIN: int = 60
+    ALBUM_POP_MIN: int = 20
+    SWEEP_ARTISTS_PER_TICK: int = 30
+    MAX_ENQUEUE_PER_TICK: int = 60
+    MAX_CATALOG_ALBUMS: int = 5000
+    INGEST_SINCE: str = "2026-06-10"
+
     # Secrets Manager
     SECRETS_ARN: str = ""
 
