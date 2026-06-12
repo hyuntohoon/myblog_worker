@@ -194,6 +194,174 @@ def test_sync_albums_batch_track_duration(mock_spotify, db_connection, sample_sp
     assert result == 284
 
 
+# --- FEAT-genre-system Step 2: ext_refs UPC capture + S1 inline mapping ------
+# Real-engine tests (Neon test branch carries V17 genres seed; per-test rollback).
+# Dedicated spotify ids — legacy committed rows under the shared fixture ids
+# could have photo_url set, which would skip the enrich path these tests drive.
+
+def _genre_album(alb_sid: str, art_sid: str, *, with_upc: bool = True) -> dict:
+    alb = {
+        "id": alb_sid,
+        "name": "Genre Test Album",
+        "artists": [{"id": art_sid, "name": "Genre Test Artist"}],
+        "images": [{"url": "https://example.com/genre-cover.jpg"}],
+        "release_date": "2026-01-01",
+        "album_type": "album",
+        "total_tracks": 1,
+        "label": "Test Label",
+        "popularity": 1,
+        "external_urls": {"spotify": f"https://open.spotify.com/album/{alb_sid}"},
+        "tracks": {"items": [{
+            "id": f"{alb_sid}_t1", "name": "T1", "track_number": 1,
+            "duration_ms": 1000, "artists": [{"id": art_sid, "name": "Genre Test Artist"}],
+        }]},
+    }
+    if with_upc:
+        alb["external_ids"] = {"upc": "1986198619861"}
+    return alb
+
+
+def _artist_detail(art_sid: str, genres: list[str]) -> dict:
+    return {
+        "id": art_sid,
+        "images": [{"url": "https://example.com/genre-artist.jpg"}],
+        "genres": genres,
+        "followers": {"total": 10},
+        "popularity": 10,
+    }
+
+
+@pytest.mark.integration
+@patch("worker.service.sync_service.spotify")
+def test_sync_albums_batch_stores_upc_in_ext_refs(mock_spotify, db_connection, sample_spotify_album):
+    """GET /albums 응답의 external_ids.upc 가 albums.ext_refs.upc 로 저장된다."""
+    mock_spotify.get_albums.return_value = [sample_spotify_album]
+
+    svc = AlbumSyncService(db_connection)
+    svc.sync_albums_batch(["test_album_001"], "KR")
+
+    row = db_connection.execute(
+        text("""
+            SELECT ext_refs->>'upc', ext_refs->>'spotify_url'
+            FROM albums WHERE spotify_id = 'test_album_001'
+        """),
+    ).fetchone()
+
+    assert row[0] == "0724385522925"
+    assert row[1] == "https://open.spotify.com/album/test_album_001"
+
+
+@pytest.mark.integration
+@patch("worker.service.sync_service.spotify")
+def test_sync_albums_batch_ext_refs_merge_preserves_existing_keys(mock_spotify, db_connection):
+    """external_ids 없는 재동기화가 백필된 upc 나 다른 키를 지우면 안 된다 (|| merge)."""
+    alb_sid, art_sid = "genre_test_album_merge", "genre_test_artist_merge"
+    svc = AlbumSyncService(db_connection)
+
+    mock_spotify.get_albums.return_value = [_genre_album(alb_sid, art_sid, with_upc=True)]
+    svc.sync_albums_batch([alb_sid], "KR")
+
+    # 백필 스크립트가 쓴 키를 흉내낸다
+    db_connection.execute(
+        text("""UPDATE albums SET ext_refs = ext_refs || '{"backfill_key": "kept"}'
+                WHERE spotify_id = :sid"""),
+        dict(sid=alb_sid),
+    )
+
+    # 두 번째 동기화: 응답에 external_ids 없음 → upc NULL 은 strip 되어 병합에 안 들어감
+    mock_spotify.get_albums.return_value = [_genre_album(alb_sid, art_sid, with_upc=False)]
+    svc.sync_albums_batch([alb_sid], "KR")
+
+    row = db_connection.execute(
+        text("""SELECT ext_refs->>'upc', ext_refs->>'backfill_key', ext_refs->>'spotify_url'
+                FROM albums WHERE spotify_id = :sid"""),
+        dict(sid=alb_sid),
+    ).fetchone()
+
+    assert row[0] == "1986198619861"   # 첫 동기화의 upc 보존
+    assert row[1] == "kept"            # 외부 writer 의 키 보존
+    assert row[2] is not None
+
+
+@pytest.mark.integration
+@patch("worker.service.sync_service.spotify")
+def test_sync_albums_batch_attaches_mapped_genres(mock_spotify, db_connection):
+    """아티스트 genre 문자열의 S1 매핑이 album_genres(source='mapping', confidence='low')
+    로 붙고, 케이팝(arbitration-only)은 직접 attach 되지 않는다."""
+    alb_sid, art_sid = "genre_test_album_s1", "genre_test_artist_s1"
+    mock_spotify.get_albums.return_value = [_genre_album(alb_sid, art_sid)]
+    mock_spotify.get_artists_batch.return_value = [
+        _artist_detail(art_sid, ["한국 랩", "케이팝"])
+    ]
+
+    svc = AlbumSyncService(db_connection)
+    svc.sync_albums_batch([alb_sid], "KR")
+
+    rows = db_connection.execute(
+        text("""
+            SELECT g.slug, ag.source, ag.confidence
+            FROM album_genres ag
+            JOIN genres g ON g.id = ag.genre_id
+            JOIN albums a ON a.id = ag.album_id
+            WHERE a.spotify_id = :sid
+            ORDER BY g.slug
+        """),
+        dict(sid=alb_sid),
+    ).fetchall()
+
+    assert [(r[0], r[1], r[2]) for r in rows] == [("hip-hop", "mapping", "low")]
+
+
+@pytest.mark.integration
+@patch("worker.service.sync_service.spotify")
+def test_sync_albums_batch_genre_mapping_idempotent(mock_spotify, db_connection):
+    """같은 앨범을 두 번 동기화해도 album_genres 가 중복되지 않는다."""
+    alb_sid, art_sid = "genre_test_album_idem", "genre_test_artist_idem"
+    mock_spotify.get_albums.return_value = [_genre_album(alb_sid, art_sid)]
+    mock_spotify.get_artists_batch.return_value = [
+        _artist_detail(art_sid, ["한국 록"])
+    ]
+
+    svc = AlbumSyncService(db_connection)
+    svc.sync_albums_batch([alb_sid], "KR")
+    svc.sync_albums_batch([alb_sid], "KR")
+
+    count = db_connection.execute(
+        text("""
+            SELECT COUNT(*) FROM album_genres ag
+            JOIN albums a ON a.id = ag.album_id
+            WHERE a.spotify_id = :sid
+        """),
+        dict(sid=alb_sid),
+    ).scalar()
+
+    assert count == 1
+
+
+@pytest.mark.integration
+@patch("worker.service.sync_service.spotify")
+def test_sync_albums_batch_no_genre_strings_no_rows(mock_spotify, db_connection):
+    """genre 문자열이 없는 아티스트만 있으면 album_genres 행을 만들지 않는다
+    (zero-signal 앨범은 Step 3 iTunes/LLM 패스 몫 — S1 이 World-Other 를 강제하지 않음)."""
+    alb_sid, art_sid = "genre_test_album_zero", "genre_test_artist_zero"
+    mock_spotify.get_albums.return_value = [_genre_album(alb_sid, art_sid)]
+    mock_spotify.get_artists_batch.return_value = [_artist_detail(art_sid, [])]
+
+    svc = AlbumSyncService(db_connection)
+    svc.sync_albums_batch([alb_sid], "KR")
+
+    count = db_connection.execute(
+        text("""
+            SELECT COUNT(*) FROM album_genres ag
+            JOIN albums a ON a.id = ag.album_id
+            WHERE a.spotify_id = :sid
+        """),
+        dict(sid=alb_sid),
+    ).scalar()
+
+    assert count == 0
+
+
 # --- generate_and_save_aliases ---------------------------------------------
 # BUG-17: per-row tx so one UNIQUE collision doesn't roll back the rest.
 

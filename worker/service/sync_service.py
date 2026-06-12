@@ -6,6 +6,7 @@ import logging
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
+from myblog_shared_db.genre_mapping import attachable_slugs
 from worker.clients.spotify_client import spotify
 from worker.clients.musicbrainz_client import fetch_artist_mbid_and_aliases
 
@@ -93,6 +94,12 @@ class AlbumSyncService:
                 label=alb.get("label"),
                 popularity=alb.get("popularity"),
                 url=(alb.get("external_urls") or {}).get("spotify"),
+                # UPC rides the same GET /albums response (zero extra calls) —
+                # the iTunes anchor key for genre labeling (FEAT-genre-system).
+                # ISRC does NOT: album-nested tracks are SimplifiedTrackObject
+                # without external_ids; track ISRCs come from the backfill
+                # script's --keys mode instead (Step 3).
+                upc=(alb.get("external_ids") or {}).get("upc"),
             ))
 
             for art_sid in alb_artist_ids:
@@ -140,7 +147,10 @@ class AlbumSyncService:
                     VALUES (
                         :sid, :title, :rdate, :cover,
                         :atype, :total_tracks, :label, :popularity,
-                        jsonb_build_object('spotify_url', CAST(:url AS text))
+                        jsonb_strip_nulls(jsonb_build_object(
+                            'spotify_url', CAST(:url AS text),
+                            'upc',         CAST(:upc AS text)
+                        ))
                     )
                     ON CONFLICT (spotify_id) DO UPDATE
                        SET title        = EXCLUDED.title,
@@ -150,7 +160,10 @@ class AlbumSyncService:
                            total_tracks = EXCLUDED.total_tracks,
                            label        = EXCLUDED.label,
                            popularity   = EXCLUDED.popularity,
-                           ext_refs     = EXCLUDED.ext_refs
+                           -- merge, don't replace: a response missing
+                           -- external_ids must not clobber a backfilled upc,
+                           -- and keys written by other writers must survive
+                           ext_refs     = albums.ext_refs || EXCLUDED.ext_refs
                 """),
                 album_data,
             )
@@ -252,6 +265,48 @@ class AlbumSyncService:
                             enrich_data,
                         )
                         logger.info("artists enriched: %d", len(enrich_data))
+
+        # 5) S1 genre mapping (FEAT-genre-system Step 2): deterministic
+        #    artists.genres → tier-0 attach for the batch's albums. Runs after
+        #    the enrich step so first-seen artists already carry genre strings.
+        #    K-Pop is arbitration-only — attachable_slugs strips it; the
+        #    incremental enrichment pass (Step 3 poller) re-derives the flag
+        #    from artists.genres, so it is not persisted here. ON CONFLICT
+        #    DO NOTHING keeps re-syncs and backfill overlap idempotent.
+        if album_data:
+            rows = self.conn.execute(
+                text("""
+                    SELECT al.spotify_id, ar.genres
+                    FROM albums al
+                    JOIN album_artists aa ON aa.album_id = al.id
+                    JOIN artists ar ON ar.id = aa.artist_id
+                    WHERE al.spotify_id = ANY(:sids)
+                """),
+                dict(sids=[a["sid"] for a in album_data]),
+            ).fetchall()
+
+            strings_by_album: Dict[str, Set[str]] = {}
+            for alb_sid, genres in rows:
+                strings_by_album.setdefault(alb_sid, set()).update(genres or [])
+
+            genre_rows = []
+            for alb_sid, strings in strings_by_album.items():
+                slugs, _needs_arbitration = attachable_slugs(strings)
+                genre_rows.extend(dict(alb_sid=alb_sid, slug=slug) for slug in slugs)
+
+            if genre_rows:
+                self.conn.execute(
+                    text("""
+                        INSERT INTO album_genres (album_id, genre_id, source, confidence)
+                        SELECT al.id, g.id, 'mapping', 'low'
+                        FROM albums al
+                        JOIN genres g ON g.slug = :slug
+                        WHERE al.spotify_id = :alb_sid
+                        ON CONFLICT DO NOTHING
+                    """),
+                    genre_rows,
+                )
+                logger.info("album_genres mapped (S1): %d", len(genre_rows))
 
 
 def generate_and_save_aliases(session_factory) -> None:

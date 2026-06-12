@@ -66,6 +66,7 @@ def sample_spotify_album():
         "label": "Parlophone",
         "popularity": 85,
         "external_urls": {"spotify": "https://open.spotify.com/album/test_album_001"},
+        "external_ids": {"upc": "0724385522925"},
         "tracks": {
             "items": [
                 {
