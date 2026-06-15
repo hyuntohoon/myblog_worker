@@ -41,8 +41,9 @@ class _Result:
 class _FakeSession:
     """Records execute() calls; answers album lookups from `known_map`."""
 
-    def __init__(self, known_map, debounce_age_s=None):
-        self.known_map = known_map  # spotify_id -> uuid
+    def __init__(self, known_map, debounce_age_s=None, known_tracks=None):
+        self.known_map = known_map  # album spotify_id -> uuid
+        self.known_tracks = known_tracks or {}  # track spotify_id -> uuid (catalog tracks)
         self.executed = []  # list[(sql, params)]
         # what the DB-side debounce age query returns: None = bootstrap (no cache
         # row yet), a float = seconds since last write.
@@ -58,6 +59,12 @@ class _FakeSession:
             return _Result(rowcount=1)
         if "INSERT INTO spotify_recent_tracks" in sql:  # D-B cache append — pretend each lands
             return _Result(rowcount=1)
+        if "INSERT INTO spotify_track_play_events" in sql:  # durable track log — pretend each lands
+            return _Result(rowcount=1)
+        if "FROM tracks WHERE spotify_id = ANY" in sql:  # track-id resolution for the log
+            tids = params["tids"]
+            rows = [_Row(id=self.known_tracks[t], spotify_id=t) for t in tids if t in self.known_tracks]
+            return _Result(rows=rows)
         if "FROM albums WHERE spotify_id = ANY" in sql:
             sids = params["sids"]
             rows = [_Row(id=self.known_map[s], spotify_id=s) for s in sids if s in self.known_map]
@@ -77,6 +84,9 @@ class _FakeSession:
         return False
 
     def begin(self):
+        return _FakeSession._Ctx()
+
+    def begin_nested(self):  # SAVEPOINT shim for the durable track-log block
         return _FakeSession._Ctx()
 
     class _Ctx:
@@ -126,7 +136,7 @@ def test_recent_distinct_known_unknown_split_and_prune():
     # _play() carries no track id, so the recent-tracks cache stays empty here
     # (track-level caching is covered by test_recent_caches_track_window + the
     # real-engine integration test).
-    assert res == {"known": 2, "unknown": 1, "pruned": 1, "events": 3, "tracks": 0}
+    assert res == {"known": 2, "unknown": 1, "pruned": 1, "events": 3, "tracks": 0, "track_events": 0}
     # two upserts (A, B), one prune
     inserts = session.sql_of(lambda s: "INSERT INTO spotify_recent_albums" in s)
     assert len(inserts) == 2
@@ -231,6 +241,38 @@ def test_recent_caches_track_window():
     assert by_tid["t1"]["artist_name"] == "Artist"
     # the cache is pruned to a rolling window every tick (it is not a durable log)
     assert session.sql_of(lambda s: "DELETE FROM spotify_recent_tracks" in s)
+
+
+@pytest.mark.unit
+def test_recent_appends_durable_track_events():
+    """Every played track is also appended to the durable spotify_track_play_events
+    log (never pruned). spotify_track_id is always recorded; track_id/album_id resolve
+    from the catalog when known and are NULL otherwise. Idempotency on rolling-window
+    re-read (real ON CONFLICT) is covered by the integration test."""
+    ua, ut1 = uuid.uuid4(), uuid.uuid4()
+    known = {"A": ua}                 # album Z not in catalog
+    known_tracks = {"t1": ut1}        # only t1 is a catalog track
+    session = _FakeSession(known, known_tracks=known_tracks)
+    client = _FakeClient(recent=[
+        _play_track("t1", "A", "2026-06-04T10:00:00Z"),  # catalog track + catalog album
+        _play_track("t2", "Z", "2026-06-04T09:00:00Z"),  # non-catalog track, non-catalog album
+        _play_track("t3", None, "2026-06-04T08:00:00Z"),  # non-catalog track, no album
+    ])
+
+    res = sync_recent_albums(lambda: session, client)
+
+    assert res["track_events"] == 3
+    log_ins = session.sql_of(lambda s: "INSERT INTO spotify_track_play_events" in s)
+    assert len(log_ins) == 3
+    by_sid = {p["spotify_track_id"]: p for _, p in log_ins}
+    # every play logs its spotify_track_id (the dedup anchor, always present)
+    assert set(by_sid) == {"t1", "t2", "t3"}
+    # t1 resolves to catalog track_id + album_id; the others stay NULL (fail-soft)
+    assert by_sid["t1"]["track_id"] == ut1 and by_sid["t1"]["album_id"] == ua
+    assert by_sid["t2"]["track_id"] is None and by_sid["t2"]["album_id"] is None
+    assert by_sid["t3"]["track_id"] is None and by_sid["t3"]["album_id"] is None
+    # durable log is NEVER pruned (unlike the recent_tracks cache)
+    assert not session.sql_of(lambda s: "DELETE FROM spotify_track_play_events" in s)
 
 
 @pytest.mark.unit

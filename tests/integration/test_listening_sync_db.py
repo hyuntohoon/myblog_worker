@@ -74,6 +74,16 @@ def _seed_album(session, spotify_id) -> uuid.UUID:
     return row.id
 
 
+def _seed_track(session, spotify_id, album_id) -> uuid.UUID:
+    row = session.execute(
+        text(
+            "INSERT INTO tracks (album_id, title, spotify_id) VALUES (:a, :t, :s) RETURNING id"
+        ),
+        {"a": album_id, "t": "ITEST listening track", "s": spotify_id},
+    ).first()
+    return row.id
+
+
 def test_recent_upsert_then_prune_to_window(factory):
     sid = f"itest_recent_{uuid.uuid4().hex[:8]}"
     # seed one catalog album in its own committed tx
@@ -305,6 +315,10 @@ def test_recent_tracks_resolve_and_idempotent(factory):
                     text("DELETE FROM spotify_recent_tracks WHERE spotify_track_id = ANY(:ids)"),
                     {"ids": [tid_known, tid_unknown]},
                 )
+                s.execute(
+                    text("DELETE FROM spotify_track_play_events WHERE spotify_track_id = ANY(:ids)"),
+                    {"ids": [tid_known, tid_unknown]},
+                )
                 s.execute(text("DELETE FROM spotify_recent_albums WHERE album_id = :a"), {"a": album_id})
                 s.execute(text("DELETE FROM spotify_play_events WHERE album_id = :a"), {"a": album_id})
                 s.execute(text("DELETE FROM albums WHERE id = :a"), {"a": album_id})
@@ -365,6 +379,77 @@ def test_recent_tracks_pruned_to_window(factory):
                     text("DELETE FROM spotify_recent_tracks WHERE spotify_track_id LIKE :p"),
                     {"p": f"itest_pr_{run}_%"},
                 )
+                s.execute(
+                    text("DELETE FROM spotify_track_play_events WHERE spotify_track_id LIKE :p"),
+                    {"p": f"itest_pr_{run}_%"},
+                )
                 s.execute(text("DELETE FROM spotify_recent_tracks WHERE album_id = :a"), {"a": album_id})
                 s.execute(text("DELETE FROM spotify_recent_albums WHERE album_id = :a"), {"a": album_id})
+                s.execute(text("DELETE FROM albums WHERE id = :a"), {"a": album_id})
+
+
+def test_track_play_events_append_idempotent(factory):
+    """FEAT-track-play-history: every played track appends to the durable
+    spotify_track_play_events log; re-running the same window is idempotent via
+    ON CONFLICT (spotify_track_id, played_at) DO NOTHING. track_id/album_id resolve
+    from the catalog when known and are NULL otherwise. The durable log is NEVER
+    pruned (unlike the recent_tracks cache). Mock units can't see the real conflict
+    semantics or the tracks.spotify_id resolution, so this exercises them on a live
+    engine ([[feedback-sa-session-lifecycle-mock-blind]])."""
+    if not _table_exists(factory, "spotify_track_play_events"):
+        pytest.skip("spotify_track_play_events not on test branch — apply migration V19 first")
+
+    sid = f"itest_tpe_alb_{uuid.uuid4().hex[:8]}"
+    tid_known = f"itest_tpe_k_{uuid.uuid4().hex[:8]}"     # catalog track → track_id resolves
+    tid_unknown = f"itest_tpe_u_{uuid.uuid4().hex[:8]}"   # not in catalog → track_id NULL
+    with factory() as s:
+        with s.begin():
+            album_id = _seed_album(s, sid)
+            track_id = _seed_track(s, tid_known, album_id)
+    try:
+        client = _Client(recent=[
+            _track_play(tid_known, "2026-06-04T10:00:00Z", album_sid=sid),                    # both resolve
+            _track_play(tid_unknown, "2026-06-04T09:00:00Z", album_sid="itest_tpe_noncatalog"),  # both NULL
+        ])
+        res1 = sync_recent_albums(factory, client)
+        assert res1["track_events"] == 2
+
+        with factory() as s:
+            rows = s.execute(
+                text(
+                    "SELECT spotify_track_id, track_id, album_id FROM spotify_track_play_events "
+                    "WHERE spotify_track_id = ANY(:ids)"
+                ),
+                {"ids": [tid_known, tid_unknown]},
+            ).fetchall()
+        by_sid = {r.spotify_track_id: r for r in rows}
+        assert by_sid[tid_known].track_id == track_id and by_sid[tid_known].album_id == album_id
+        assert by_sid[tid_unknown].track_id is None and by_sid[tid_unknown].album_id is None
+
+        # re-run the SAME window → ON CONFLICT DO NOTHING → no new rows (idempotent)
+        res2 = sync_recent_albums(factory, client)
+        assert res2["track_events"] == 0
+        with factory() as s:
+            n = s.execute(
+                text(
+                    "SELECT count(*) AS c FROM spotify_track_play_events "
+                    "WHERE spotify_track_id = ANY(:ids)"
+                ),
+                {"ids": [tid_known, tid_unknown]},
+            ).first().c
+        assert n == 2  # durable log unchanged — never pruned, no double-append
+    finally:
+        with factory() as s:
+            with s.begin():
+                s.execute(
+                    text("DELETE FROM spotify_track_play_events WHERE spotify_track_id = ANY(:ids)"),
+                    {"ids": [tid_known, tid_unknown]},
+                )
+                s.execute(
+                    text("DELETE FROM spotify_recent_tracks WHERE spotify_track_id = ANY(:ids)"),
+                    {"ids": [tid_known, tid_unknown]},
+                )
+                s.execute(text("DELETE FROM spotify_recent_albums WHERE album_id = :a"), {"a": album_id})
+                s.execute(text("DELETE FROM spotify_play_events WHERE album_id = :a"), {"a": album_id})
+                s.execute(text("DELETE FROM tracks WHERE id = :t"), {"t": track_id})
                 s.execute(text("DELETE FROM albums WHERE id = :a"), {"a": album_id})

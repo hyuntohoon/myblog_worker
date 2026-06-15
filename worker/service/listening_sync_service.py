@@ -170,6 +170,58 @@ def sync_recent_albums(
                 {"keep": RECENT_TRACKS_WINDOW},
             )
 
+            # FEAT-track-play-history: durable, append-only TRACK-level play log —
+            # mirrors spotify_play_events at track grain but is NEVER pruned. Same
+            # (spotify_track_id, played_at) dedup → window-overlap re-read is a no-op,
+            # so overlapping ticks / manual refreshes never double-count. spotify_track_id
+            # is always present; track_id/album_id resolve from the catalog when known.
+            #
+            # Isolated in a SAVEPOINT (begin_nested) + try/except: this is best-effort
+            # analytics, NOT critical path. A failure here — table absent before V19 is
+            # applied, or any future constraint issue — rolls back ONLY this savepoint, so
+            # the album play_events / now-playing / recent caches that /profile depends on
+            # still commit. (Also de-risks deploy ordering: the worker degrades gracefully
+            # to "no track log yet" if it ships before the migration, instead of failing
+            # the whole sync.) Next tick re-reads the overlapping window and re-appends.
+            track_events_appended = 0
+            track_sids = [tr["track_id"] for tr in track_rows]
+            if track_sids:
+                try:
+                    with session.begin_nested():
+                        track_db_rows = session.execute(
+                            text("SELECT id, spotify_id FROM tracks WHERE spotify_id = ANY(:tids)"),
+                            {"tids": track_sids},
+                        ).fetchall()
+                        track_sid_to_uuid = {r.spotify_id: r.id for r in track_db_rows}
+                        for tr in track_rows:
+                            album_uuid = (
+                                sid_to_uuid.get(tr["album_sid"]) if tr["album_sid"] else None
+                            )
+                            track_events_appended += session.execute(
+                                text(
+                                    """
+                                    INSERT INTO spotify_track_play_events
+                                        (spotify_track_id, track_id, album_id, played_at)
+                                    VALUES
+                                        (:spotify_track_id, :track_id, :album_id,
+                                         CAST(:played_at AS timestamptz))
+                                    ON CONFLICT (spotify_track_id, played_at) DO NOTHING
+                                    """
+                                ),
+                                {
+                                    "spotify_track_id": tr["track_id"],
+                                    "track_id": track_sid_to_uuid.get(tr["track_id"]),
+                                    "album_id": album_uuid,
+                                    "played_at": tr["played_at"],
+                                },
+                            ).rowcount
+                except Exception as e:
+                    # savepoint rolled back → nothing appended this tick; album log unaffected
+                    track_events_appended = 0
+                    logger.warning(
+                        "durable track-play-events append skipped (album log unaffected): %s", e
+                    )
+
     unknown_ids = [sid for sid in spotify_ids if sid not in sid_to_uuid]
     if unknown_ids and enqueue_unknown is not None:
         try:
@@ -178,8 +230,9 @@ def sync_recent_albums(
             logger.warning("enqueue of unknown recently-played albums failed: %s", e)
 
     logger.info(
-        "recent sync: known=%d unknown=%d pruned=%d events=%d tracks=%d",
+        "recent sync: known=%d unknown=%d pruned=%d events=%d tracks=%d track_events=%d",
         len(keep_uuids), len(unknown_ids), pruned, events_appended, tracks_cached,
+        track_events_appended,
     )
     return {
         "known": len(keep_uuids),
@@ -187,6 +240,7 @@ def sync_recent_albums(
         "pruned": pruned,
         "events": events_appended,
         "tracks": tracks_cached,
+        "track_events": track_events_appended,
     }
 
 
