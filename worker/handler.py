@@ -47,6 +47,19 @@ def _run_library_sync() -> None:
     )
 
 
+def _run_saved_tracks_sync(mode: str = "incremental") -> None:
+    """Spotify saved-tracks (좋아요) cache sync for the /profile 분석 버킷
+    (FEAT-genre-artist-distribution). Triggered by EventBridge (daily incremental +
+    weekly full) and the manual {"job": "spotify_saved_tracks_sync", "mode": …} SQS
+    message. mode ∈ {incremental, full}; full reconciles + prunes un-likes. Cache
+    only — no Spotify write-back — so a message-sourced mode is safe (rule #9: the
+    cron/endpoint only triggers; the worker does the Spotify read)."""
+    from worker.clients.spotify_user_client import spotify_user
+    from worker.service.saved_tracks_sync_service import run_saved_tracks_sync
+
+    run_saved_tracks_sync(SessionLocal, spotify_user, mode=mode)
+
+
 def _process_single(album_id: str, market: str) -> None:
     logger.info("Processing single album_id=%s market=%s DRY_RUN=%s", album_id, market, settings.DRY_RUN)
     if settings.DRY_RUN:
@@ -114,6 +127,14 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         _run_album_ingest()
         return {}
 
+    # EventBridge crons — Spotify saved-tracks (좋아요) sync (constant input, no
+    # "source"). The daily rule sends mode=incremental, the weekly rule mode=full.
+    if event.get("job") == "spotify_saved_tracks_sync":
+        mode = event.get("mode", "incremental")
+        logger.info("EventBridge trigger: running saved-tracks sync (mode=%s)", mode)
+        _run_saved_tracks_sync(mode)
+        return {}
+
     # EventBridge scheduled rule (alias cron) — full event carries source=aws.events
     if event.get("source") == "aws.events":
         logger.info("EventBridge trigger: running alias generation")
@@ -143,6 +164,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             # setting, not this message.
             if body.get("job") == "spotify_library_sync":
                 _run_library_sync()
+                continue
+
+            # Spotify saved-tracks (좋아요) cache sync — manual refresh / backfill.
+            # mode ∈ {incremental, full}; full reconciles + prunes un-likes.
+            if body.get("job") == "spotify_saved_tracks_sync":
+                _run_saved_tracks_sync(body.get("mode", "incremental"))
                 continue
 
             market = body.get("market", settings.SPOTIFY_DEFAULT_MARKET)

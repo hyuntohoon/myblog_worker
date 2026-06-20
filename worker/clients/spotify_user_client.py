@@ -43,6 +43,13 @@ LIBRARY_IDS_CHUNK = 20
 LIBRARY_PAGE_LIMIT = 50
 
 
+def _parse_added_at(value: str) -> datetime:
+    """Parse a Spotify ``added_at`` ISO-8601 string (…Z) to a tz-aware datetime, for
+    the incremental saved-tracks early-stop comparison against the cache's
+    ``max(added_at)`` (itself tz-aware via timestamptz)."""
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
 class SpotifyScopeError(RuntimeError):
     """Raised when a /me/albums* call returns 403 missing-scope — distinct from a
     transient failure or an invalid_grant. The caller maps this to needs_attention /
@@ -316,6 +323,72 @@ class SpotifyUserClient:
             if isinstance(total, int) and offset >= total:
                 break
         return albums
+
+    def get_saved_tracks(
+        self, since: Optional[datetime] = None
+    ) -> List[Dict[str, Any]]:
+        """GET /me/tracks?limit=50&offset=… — paginate the owner's saved (좋아요)
+        tracks and return flattened, denormalized dicts (exactly the columns the
+        spotify_saved_tracks cache stores, so the sync renders genre/artist without a
+        second catalog read).
+
+        Each Spotify item is ``{"added_at": ISO8601, "track": {"id", "name",
+        "artists": [...], "album": {...}}}``; items arrive ``added_at``-descending.
+
+        ``since`` (a tz-aware datetime, e.g. ``max(added_at)`` from the cache) makes
+        this an INCREMENTAL read: paging stops as soon as an item's ``added_at`` is
+        ``<=`` ``since`` (that already-cached item is excluded). ``since=None`` pages
+        the entire library (full reconcile). Reuses the ``user-library-read`` scope
+        already granted for saved albums — /me/tracks needs no new consent."""
+        if since is not None and since.tzinfo is None:
+            # DB max(added_at) is UTC; guard a naive value so the <= compare below
+            # never raises aware-vs-naive TypeError on the first real incremental.
+            since = since.replace(tzinfo=timezone.utc)
+        url = f"{settings.SPOTIFY_API_BASE}/me/tracks"
+        tracks: List[Dict[str, Any]] = []
+        offset = 0
+        reached_known = False
+        while not reached_known:
+            params = {"limit": LIBRARY_PAGE_LIMIT, "offset": offset}
+            r = _request_with_retry(
+                "GET", url, headers=self._headers(), params=params, timeout=20
+            )
+            self._raise_for_scope(r, "GET /me/tracks")
+            r.raise_for_status()
+            payload = r.json() or {}
+            items = payload.get("items") or []
+            for it in items:
+                added_at = (it or {}).get("added_at")
+                if since is not None and added_at and _parse_added_at(added_at) <= since:
+                    # items are added_at-desc → everything from here on is already cached
+                    reached_known = True
+                    break
+                track = (it or {}).get("track") or {}
+                tid = track.get("id")
+                if not tid:
+                    continue  # local files / unavailable tracks have no stable id
+                artists = track.get("artists") or []
+                album = track.get("album") or {}
+                tracks.append(
+                    {
+                        "spotify_track_id": tid,
+                        "track_name": track.get("name") or "",
+                        "artist_name": ", ".join(
+                            a.get("name", "") for a in artists if a.get("name")
+                        )
+                        or None,
+                        "album_name": album.get("name"),
+                        "album_sid": album.get("id"),
+                        "added_at": added_at,
+                    }
+                )
+            total = payload.get("total")
+            offset += len(items)
+            if not items or not payload.get("next"):
+                break
+            if isinstance(total, int) and offset >= total:
+                break
+        return tracks
 
     def check_saved_albums(self, spotify_ids: List[str]) -> Dict[str, bool]:
         """GET /me/albums/contains?ids= (chunked ≤ 20) → {spotify_id: is_saved}.
