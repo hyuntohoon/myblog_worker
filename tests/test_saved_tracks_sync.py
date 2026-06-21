@@ -27,7 +27,7 @@ class _Resp:
         return self._payload
 
 
-def _item(tid, added_at, name="Song", artist="Artist", album_sid="alb", album_name="Album"):
+def _item(tid, added_at, name="Song", artist="Artist", album_sid="alb", album_name="Album", duration_ms=211000):
     return {
         "added_at": added_at,
         "track": {
@@ -35,6 +35,7 @@ def _item(tid, added_at, name="Song", artist="Artist", album_sid="alb", album_na
             "name": name,
             "artists": [{"name": artist}],
             "album": {"id": album_sid, "name": album_name},
+            "duration_ms": duration_ms,
         },
     }
 
@@ -96,6 +97,7 @@ def test_get_saved_tracks_normalizes_and_joins_artists(monkeypatch):
             "name": "Song",
             "artists": [{"name": "A"}, {"name": "B"}],
             "album": {"id": "alb1", "name": "Alb"},
+            "duration_ms": 180000,
         },
     }
     client, _ = _client(monkeypatch, [{"items": [item], "next": None}])
@@ -108,8 +110,22 @@ def test_get_saved_tracks_normalizes_and_joins_artists(monkeypatch):
         "artist_name": "A, B",
         "album_name": "Alb",
         "album_sid": "alb1",
+        "duration_ms": 180000,
         "added_at": "2024-03-01T00:00:00Z",
     }
+
+
+def test_get_saved_tracks_surfaces_duration_ms_and_defaults_null(monkeypatch):
+    # duration_ms flows through from track.duration_ms; a track missing it → None.
+    with_dur = _item("t1", "2024-03-01T00:00:00Z", duration_ms=242000)
+    without_dur = {"added_at": "2024-02-01T00:00:00Z", "track": {"id": "t2", "name": "X"}}
+    client, _ = _client(monkeypatch, [{"items": [with_dur, without_dur], "next": None}])
+
+    rows = client.get_saved_tracks()
+
+    by_id = {r["spotify_track_id"]: r for r in rows}
+    assert by_id["t1"]["duration_ms"] == 242000
+    assert by_id["t2"]["duration_ms"] is None
 
 
 def test_get_saved_tracks_skips_items_without_track_id(monkeypatch):

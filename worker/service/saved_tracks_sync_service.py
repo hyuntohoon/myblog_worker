@@ -25,10 +25,10 @@ _UPSERT_SQL = text(
     """
     INSERT INTO spotify_saved_tracks
         (spotify_track_id, track_name, artist_name, album_name, album_sid,
-         track_id, album_id, added_at, synced_at)
+         track_id, album_id, added_at, duration_ms, synced_at)
     VALUES
         (:spotify_track_id, :track_name, :artist_name, :album_name, :album_sid,
-         :track_id, :album_id, CAST(:added_at AS timestamptz), now())
+         :track_id, :album_id, CAST(:added_at AS timestamptz), :duration_ms, now())
     ON CONFLICT (spotify_track_id) DO UPDATE
        SET track_name  = EXCLUDED.track_name,
            artist_name = EXCLUDED.artist_name,
@@ -37,6 +37,7 @@ _UPSERT_SQL = text(
            track_id    = EXCLUDED.track_id,
            album_id    = EXCLUDED.album_id,
            added_at    = EXCLUDED.added_at,
+           duration_ms = EXCLUDED.duration_ms,
            synced_at   = now()
     """
 )
@@ -125,6 +126,7 @@ def _upsert_rows(session, rows: List[Dict[str, Any]]) -> int:
             "track_id": track_map.get(r["spotify_track_id"]),
             "album_id": album_map.get(r.get("album_sid")),
             "added_at": r["added_at"],
+            "duration_ms": r.get("duration_ms"),
         }
         for r in rows
     ]
