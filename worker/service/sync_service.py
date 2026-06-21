@@ -126,7 +126,12 @@ class AlbumSyncService:
         # 3) Bulk upsert
 
         if all_artists:
-            artists_list = [dict(sid=sid, name=name) for sid, name in all_artists.items()]
+            # Sort by spotify_id so concurrent invocations (e.g. a 분석 버킷 분류하기 burst
+            # that fans out many album-sync messages) lock the SHARED artist rows in a
+            # consistent order. Without this, two batches that share artists in different
+            # insertion orders deadlock on the artists index (ON CONFLICT DO UPDATE takes
+            # a row lock) → SQS retry livelock under the account's 10-way concurrency.
+            artists_list = [dict(sid=sid, name=name) for sid, name in sorted(all_artists.items())]
             self.conn.execute(
                 text("""
                     INSERT INTO artists (spotify_id, name)
