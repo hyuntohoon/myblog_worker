@@ -45,9 +45,20 @@ def factory():
                 """
             )
         ).first()
+        has_duration = present and conn.execute(
+            text(
+                """
+                SELECT 1 FROM information_schema.columns
+                 WHERE table_name = 'spotify_saved_tracks' AND column_name = 'duration_ms'
+                """
+            )
+        ).first()
     if not present:
         eng.dispose()
         pytest.skip("spotify_saved_tracks not on test branch — apply migration V24 first")
+    if not has_duration:
+        eng.dispose()
+        pytest.skip("spotify_saved_tracks.duration_ms missing — apply V26 to the test branch first")
     yield sessionmaker(bind=eng, autoflush=False, autocommit=False, future=True)
     eng.dispose()
 
@@ -63,13 +74,14 @@ class _Client:
         return list(self._rows)
 
 
-def _row(tid, added_at, album_sid=None, name="ITEST saved song", artist="ITEST artist", album_name="ITEST album"):
+def _row(tid, added_at, album_sid=None, name="ITEST saved song", artist="ITEST artist", album_name="ITEST album", duration_ms=None):
     return {
         "spotify_track_id": tid,
         "track_name": name,
         "artist_name": artist,
         "album_name": album_name,
         "album_sid": album_sid,
+        "duration_ms": duration_ms,
         "added_at": added_at,
     }
 
@@ -123,7 +135,7 @@ def test_full_sync_upserts_and_resolves_catalog(factory):
             track_id = _seed_track(s, tid_known, album_id)
     try:
         client = _Client([
-            _row(tid_known, "2026-06-01T10:00:00Z", album_sid=alb_sid),
+            _row(tid_known, "2026-06-01T10:00:00Z", album_sid=alb_sid, duration_ms=234000),
             _row(tid_unknown, "2026-06-01T09:00:00Z", album_sid="itest_st_noncatalog"),
         ])
         res = run_saved_tracks_sync(factory, client, mode="full")
@@ -132,7 +144,7 @@ def test_full_sync_upserts_and_resolves_catalog(factory):
         with factory() as s:
             rows = s.execute(
                 text(
-                    "SELECT spotify_track_id, track_id, album_id, artist_name, added_at "
+                    "SELECT spotify_track_id, track_id, album_id, artist_name, added_at, duration_ms "
                     "FROM spotify_saved_tracks WHERE spotify_track_id = ANY(:ids)"
                 ),
                 {"ids": [tid_known, tid_unknown]},
@@ -140,8 +152,10 @@ def test_full_sync_upserts_and_resolves_catalog(factory):
         by = {r.spotify_track_id: r for r in rows}
         assert by[tid_known].track_id == track_id   # catalog track → resolved
         assert by[tid_known].album_id == album_id    # catalog album → resolved
+        assert by[tid_known].duration_ms == 234000   # length written from /me/tracks
         assert by[tid_unknown].track_id is None       # not in catalog → NULL, still cached
         assert by[tid_unknown].album_id is None
+        assert by[tid_unknown].duration_ms is None    # row without duration → NULL
         assert by[tid_known].added_at is not None     # CAST(... AS timestamptz) succeeded
     finally:
         _cleanup(factory, [tid_known, tid_unknown], track_id, album_id)

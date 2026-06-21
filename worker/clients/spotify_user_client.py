@@ -379,6 +379,7 @@ class SpotifyUserClient:
                         or None,
                         "album_name": album.get("name"),
                         "album_sid": album.get("id"),
+                        "duration_ms": track.get("duration_ms"),
                         "added_at": added_at,
                     }
                 )
