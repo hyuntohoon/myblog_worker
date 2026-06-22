@@ -112,21 +112,37 @@ def _request_with_retry(
     raise RuntimeError("unreachable: max_tries must be >= 1")  # pragma: no cover
 
 
+def _read_spotify_secret() -> Dict:
+    """Read the raw myblog/spotify JSON, preferring SSM Parameter Store
+    (SPOTIFY_SECRETS_PARAM) and falling back to Secrets Manager (SPOTIFY_SECRETS_ARN)
+    on unset-or-error (CHORE-secrets-ssm-migration). Caller handles the no-source case."""
+    import boto3
+
+    param = settings.SPOTIFY_SECRETS_PARAM
+    arn = settings.SPOTIFY_SECRETS_ARN
+    if param:
+        try:
+            ssm = boto3.client("ssm", region_name=settings.AWS_DEFAULT_REGION)
+            return json.loads(ssm.get_parameter(Name=param, WithDecryption=True)["Parameter"]["Value"])
+        except Exception as e:
+            if not arn:
+                raise
+            logger.error("SSM spotify read failed for %s, falling back to Secrets Manager: %s", param, e)
+    sm = boto3.client("secretsmanager", region_name=settings.AWS_DEFAULT_REGION)
+    return json.loads(sm.get_secret_value(SecretId=arn)["SecretString"])
+
+
 def _load_spotify_creds() -> Dict[str, str]:
-    """Resolve client_id/secret/refresh_token from Secrets Manager myblog/spotify,
+    """Resolve client_id/secret/refresh_token from myblog/spotify (SSM-preferred),
     falling back to settings (env) for local dev / tests. Never logs the values."""
     creds: Dict[str, str] = {
         "client_id": settings.SPOTIFY_CLIENT_ID,
         "client_secret": settings.SPOTIFY_CLIENT_SECRET,
         "refresh_token": settings.SPOTIFY_REFRESH_TOKEN,
     }
-    arn = settings.SPOTIFY_SECRETS_ARN
-    if arn:
+    if settings.SPOTIFY_SECRETS_PARAM or settings.SPOTIFY_SECRETS_ARN:
         try:
-            import boto3
-
-            sm = boto3.client("secretsmanager", region_name=settings.AWS_DEFAULT_REGION)
-            payload = json.loads(sm.get_secret_value(SecretId=arn)["SecretString"])
+            payload = _read_spotify_secret()
             for k in ("client_id", "client_secret", "refresh_token"):
                 # accept both lowercase and SPOTIFY_-prefixed upper keys
                 v = payload.get(k) or payload.get(f"SPOTIFY_{k.upper()}")
@@ -135,7 +151,7 @@ def _load_spotify_creds() -> Dict[str, str]:
         except Exception as e:  # pragma: no cover - network/IAM failure path
             # Don't mask a credential-availability problem as "not configured" —
             # let the EventBridge tick fail loudly and retry rather than no-op.
-            logger.error("Failed to load Spotify user creds from %s: %s", arn, e)
+            logger.error("Failed to load Spotify user creds: %s", e)
             raise
     return creds
 
@@ -164,24 +180,30 @@ def _persist_token_state(
     already updated its in-memory creds, so a warm Lambda keeps using the live token.
     Reads-then-writes (like the bootstrap script) to preserve unrelated keys.
     """
+    param = settings.SPOTIFY_SECRETS_PARAM
     arn = settings.SPOTIFY_SECRETS_ARN
-    if not arn:
+    if not param and not arn:
         return  # local/dev: token comes from env, nothing to write back
     try:
         import boto3
 
-        sm = boto3.client("secretsmanager", region_name=settings.AWS_DEFAULT_REGION)
-        payload = json.loads(sm.get_secret_value(SecretId=arn)["SecretString"])
+        payload = _read_spotify_secret()
         if needs_reauth:
             if payload.get("needs_reauth"):
-                return  # already flagged — don't churn a new secret version each tick
+                return  # already flagged — don't churn a new version each tick
             payload["needs_reauth"] = True
         else:
             payload.pop("needs_reauth", None)
             if rotated_refresh_token and rotated_refresh_token != payload.get("refresh_token"):
                 payload["refresh_token"] = rotated_refresh_token
             payload["last_successful_refresh_at"] = datetime.now(timezone.utc).isoformat()
-        sm.put_secret_value(SecretId=arn, SecretString=json.dumps(payload))
+        # Write back to whichever store is the active source (SSM-preferred).
+        if param:
+            ssm = boto3.client("ssm", region_name=settings.AWS_DEFAULT_REGION)
+            ssm.put_parameter(Name=param, Value=json.dumps(payload), Type="SecureString", Overwrite=True)
+        else:
+            sm = boto3.client("secretsmanager", region_name=settings.AWS_DEFAULT_REGION)
+            sm.put_secret_value(SecretId=arn, SecretString=json.dumps(payload))
     except Exception as e:  # pragma: no cover - network/IAM failure path
         logger.error("Spotify token write-back failed (non-fatal): %s", e)
 

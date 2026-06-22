@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     # Refresh token + client creds live in Secrets Manager myblog/spotify (Q17);
     # SPOTIFY_REFRESH_TOKEN is an env fallback for local dev / tests only.
     SPOTIFY_SECRETS_ARN: str = ""
+    # SSM SecureString name (e.g. /myblog/spotify) — takes priority over the ARN
+    # for both the creds read and the token write-back (CHORE-secrets-ssm-migration).
+    SPOTIFY_SECRETS_PARAM: str = ""
     SPOTIFY_REFRESH_TOKEN: str = ""
 
     # AWS / SQS (for local testing convenience)
@@ -59,8 +62,11 @@ class Settings(BaseSettings):
     MAX_CATALOG_ALBUMS: int = 5000
     INGEST_SINCE: str = "2026-06-10"
 
-    # Secrets Manager
+    # Secrets Manager (legacy) + SSM Parameter Store (CHORE-secrets-ssm-migration).
+    # SECRETS_PARAM (SSM SecureString name, e.g. /myblog/worker) takes priority;
+    # SECRETS_ARN is the fallback. Setting SECRETS_PARAM is the cutover switch.
     SECRETS_ARN: str = ""
+    SECRETS_PARAM: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -69,22 +75,31 @@ class Settings(BaseSettings):
     SQS_RETRY_DELAY_SECONDS: int = 5
 
 
-def _load_secrets(arn: str) -> dict:
-    try:
-        import boto3
-        sm = boto3.client("secretsmanager", region_name="ap-northeast-2")
-        val = sm.get_secret_value(SecretId=arn)
-        return json.loads(val["SecretString"])
-    except Exception as e:
-        logger.error("Failed to load secrets from %s: %s", arn, e)
-        return {}
+def _load_secrets(param: str, arn: str) -> dict:
+    """Prefer SSM Parameter Store (``param``), fall back to Secrets Manager
+    (``arn``) on unset-or-error (CHORE-secrets-ssm-migration)."""
+    if param:
+        try:
+            import boto3
+            ssm = boto3.client("ssm", region_name="ap-northeast-2")
+            return json.loads(ssm.get_parameter(Name=param, WithDecryption=True)["Parameter"]["Value"])
+        except Exception as e:
+            logger.error("SSM load failed for %s, falling back to Secrets Manager: %s", param, e)
+    if arn:
+        try:
+            import boto3
+            sm = boto3.client("secretsmanager", region_name="ap-northeast-2")
+            return json.loads(sm.get_secret_value(SecretId=arn)["SecretString"])
+        except Exception as e:
+            logger.error("Failed to load secrets from %s: %s", arn, e)
+    return {}
 
 
 @lru_cache
 def get_settings() -> Settings:
     s = Settings()
-    if s.SECRETS_ARN:
-        secrets = _load_secrets(s.SECRETS_ARN)
+    if s.SECRETS_ARN or s.SECRETS_PARAM:
+        secrets = _load_secrets(s.SECRETS_PARAM, s.SECRETS_ARN)
         if secrets.get("DATABASE_URL"):
             s.DATABASE_URL = secrets["DATABASE_URL"]
         if secrets.get("SPOTIFY_CLIENT_ID"):
