@@ -21,17 +21,44 @@ def _make_settings(**overrides) -> Settings:
 
 
 class TestLoadSecrets:
+    # CHORE-secrets-ssm-migration: _load_secrets(param, arn) — SSM-preferred, SM fallback.
+    def test_ssm_preferred_when_param_set(self):
+        payload = {"DATABASE_URL": "postgresql://host/db"}
+        ssm_mock = MagicMock()
+        ssm_mock.get_parameter.return_value = {"Parameter": {"Value": json.dumps(payload)}}
+
+        def client(name, **kw):
+            return ssm_mock if name == "ssm" else MagicMock()
+
+        with patch("boto3.client", side_effect=client):
+            assert _load_secrets("/myblog/worker", "arn:fake") == payload
+
+    def test_falls_back_to_secrets_manager_on_ssm_error(self):
+        payload = {"DATABASE_URL": "sm-db"}
+        sm_mock = MagicMock()
+        sm_mock.get_secret_value.return_value = {"SecretString": json.dumps(payload)}
+
+        def client(name, **kw):
+            if name == "ssm":
+                m = MagicMock()
+                m.get_parameter.side_effect = Exception("AccessDenied")
+                return m
+            return sm_mock
+
+        with patch("boto3.client", side_effect=client):
+            assert _load_secrets("/myblog/worker", "arn:fake") == payload
+
     def test_returns_parsed_json_on_success(self):
         payload = {"DATABASE_URL": "postgresql://host/db", "SPOTIFY_CLIENT_ID": "cid"}
         sm_mock = MagicMock()
         sm_mock.get_secret_value.return_value = {"SecretString": json.dumps(payload)}
         with patch("boto3.client", return_value=sm_mock):
-            result = _load_secrets("arn:fake")
+            result = _load_secrets("", "arn:fake")
         assert result == payload
 
     def test_returns_empty_dict_on_boto_error(self):
         with patch("boto3.client", side_effect=Exception("no network")):
-            result = _load_secrets("arn:fake")
+            result = _load_secrets("", "arn:fake")
         assert result == {}
 
 
