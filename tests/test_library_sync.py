@@ -4,8 +4,9 @@
 # spotify_library_albums) closely enough to exercise ADD / REMOVE / PULL diffs, the
 # never-delete-preexisting rule, plan-only gating, and idempotent re-runs. The
 # Spotify client is fully MOCKED (no network). Real SQL/upsert semantics against
-# Postgres are out of scope here (feedback-sa-session-lifecycle-mock-blind — a
-# real-engine integration test would cover ON CONFLICT / CAST correctness).
+# Postgres are out of scope here (feedback-sa-session-lifecycle-mock-blind); the
+# _insert_bucket_item ON CONFLICT/partial-index path is covered on a real engine by
+# tests/integration/test_library_sync_db.py.
 from __future__ import annotations
 
 import copy

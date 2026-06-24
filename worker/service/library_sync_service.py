@@ -157,14 +157,25 @@ def _next_bucket_position(session, bucket_id) -> int:
 
 
 def _insert_bucket_item(session, bucket_id, album_id, position: int) -> None:
-    """Append an album to the special bucket. Idempotent: the
-    uq_review_bucket_items_bucket_album constraint makes a re-PULL a no-op."""
+    """Append an album to the special bucket. Idempotent via a NOT-EXISTS guard scoped to
+    item_type='album' (a re-PULL is a no-op).
+
+    Schema-agnostic on purpose: FEAT-pocket-buckit V30 replaces the table-wide
+    UNIQUE(bucket_id, album_id) with a PARTIAL album index (WHERE item_type='album'). A bare
+    ``ON CONFLICT (bucket_id, album_id)`` cannot infer a partial index and raises "no unique
+    or exclusion constraint matching the ON CONFLICT specification", so we dedup with an
+    explicit guard instead. This guard works BOTH before and after V30; the album partial
+    unique (post-V30) backstops any concurrent-writer race. The inserted row's item_type
+    defaults to 'album' (the column default), matching the guard predicate."""
     session.execute(
         text(
             """
             INSERT INTO review_bucket_items (bucket_id, album_id, position, status)
-            VALUES (:bid, :album_id, :position, 'candidate')
-            ON CONFLICT (bucket_id, album_id) DO NOTHING
+            SELECT :bid, :album_id, :position, 'candidate'
+            WHERE NOT EXISTS (
+                SELECT 1 FROM review_bucket_items
+                 WHERE bucket_id = :bid AND item_type = 'album' AND album_id = :album_id
+            )
             """
         ),
         {"bid": bucket_id, "album_id": album_id, "position": position},
