@@ -93,6 +93,19 @@ def _process_batch(album_ids: List[str], market: str) -> None:
         logger.info("Batch synced to DB: %d albums", len(album_ids))
 
 
+def _run_isrc_backfill(limit: int = 1000) -> None:
+    """Bounded ISRC backfill for FEAT-lyrics-corpus Step 1b. Fetches up to `limit`
+    tracks lacking ISRC from the DB, enriches from Spotify GET /v1/tracks, writes
+    ISRC or sentinel. Follows alias-fill failure-isolation pattern (one batch failure
+    doesn't block the job)."""
+    from worker.service.isrc_backfill_service import IsrcBackfillService
+
+    with SessionLocal() as session, session.begin():
+        svc = IsrcBackfillService(session.connection())
+        metrics = svc.backfill_isrc(limit=limit)
+        logger.info("ISRC backfill metrics: %s", metrics)
+
+
 def _run_alias_generation() -> None:
     """Called by the EventBridge scheduled trigger (not the SQS sync path)."""
     try:
@@ -133,6 +146,14 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         mode = event.get("mode", "incremental")
         logger.info("EventBridge trigger: running saved-tracks sync (mode=%s)", mode)
         _run_saved_tracks_sync(mode)
+        return {}
+
+    # EventBridge/SQS trigger — ISRC backfill (FEAT-lyrics-corpus Step 1b).
+    # Bounded backfill: fetch tracks without ISRC, enrich from Spotify, write ISRC or sentinel.
+    if event.get("job") == "isrc_backfill":
+        limit = event.get("limit", 1000)
+        logger.info("EventBridge/SQS trigger: running ISRC backfill (limit=%s)", limit)
+        _run_isrc_backfill(limit=limit)
         return {}
 
     # EventBridge scheduled rule (alias cron) — full event carries source=aws.events

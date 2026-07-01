@@ -151,4 +151,40 @@ class SpotifyClient:
         r.raise_for_status()
         return r.json().get("items") or []
 
+    def get_tracks(self, ids: list[str], market: Optional[str] = None) -> list[dict[str, Any]]:
+        """GET /v1/tracks?ids=... (<=50 per call).
+
+        Retrieves full track objects including external_ids (contains ISRC).
+        Used for ISRC population (FEAT-lyrics-corpus Step 1b) — tracks obtained
+        from album sync are SimplifiedTrackObjects without external_ids, so a
+        separate fetch is needed for identity/version anchors."""
+        ids = [i for i in ids if i]
+        if not ids:
+            return []
+
+        out: list[dict[str, Any]] = []
+        mkt = self._default_market(market)
+        base_url = f"{settings.SPOTIFY_API_BASE}/tracks"
+
+        for i in range(0, len(ids), _MAX_TRACKS):
+            chunk = ids[i : i + _MAX_TRACKS]
+            params: Dict[str, Any] = {"ids": ",".join(chunk)}
+
+            if mkt:
+                params["market"] = mkt
+
+            logger.debug("GET /tracks chunk=%d size=%d", i // _MAX_TRACKS + 1, len(chunk))
+
+            r = _request_with_retry(
+                "GET", base_url, headers=self._headers(), params=params, timeout=20
+            )
+            r.raise_for_status()
+
+            tracks = r.json().get("tracks") or []
+            logger.debug("Retrieved %d tracks", len(tracks))
+
+            out.extend(tracks)
+
+        return out
+
 spotify = SpotifyClient()
