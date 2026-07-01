@@ -161,3 +161,26 @@ def test_handler_library_sync_does_not_call_listening(mock_listening, mock_libra
     lambda_handler(event, None)
     mock_library.assert_called_once()
     mock_listening.assert_not_called()
+
+
+# ── FEAT-lyrics-corpus Step 3: incremental lyrics collection routing ─────────────
+
+@pytest.mark.unit
+@patch("worker.handler._run_lyrics_incremental")
+@patch("worker.handler.generate_and_save_aliases")
+def test_handler_eventbridge_lyrics_incremental_job(mock_alias, mock_lyrics):
+    """EventBridge rule sends {"job": "lyrics_incremental"} → incremental collection,
+    and must NOT hit the alias path (both are EventBridge crons; job is routed first)."""
+    result = lambda_handler({"job": "lyrics_incremental"}, None)
+    mock_lyrics.assert_called_once_with(limit=None)
+    mock_alias.assert_not_called()
+    assert result == {}
+
+
+@pytest.mark.unit
+@patch("worker.handler._run_lyrics_incremental")
+def test_handler_lyrics_incremental_honors_limit_override(mock_lyrics):
+    """An explicit "limit" (manual SQS/EventBridge trigger) is passed through."""
+    result = lambda_handler({"job": "lyrics_incremental", "limit": 25}, None)
+    mock_lyrics.assert_called_once_with(limit=25)
+    assert result == {}

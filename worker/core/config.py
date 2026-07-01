@@ -68,6 +68,17 @@ class Settings(BaseSettings):
     SECRETS_ARN: str = ""
     SECRETS_PARAM: str = ""
 
+    # Incremental lyrics collection (FEAT-lyrics-corpus Step 3, worker EventBridge job).
+    # LRCLIB /api/search freshness path for newly-ingested tracks lacking a corpus row.
+    # Bounded per invocation so the job always finishes inside the 120s Lambda timeout;
+    # per-row commits make an over-budget batch resumable (leftovers picked up next run).
+    # Concurrency mirrors the Phase 2 finding (~2.5 req/s effective LRCLIB cap around 20-30
+    # workers; higher only adds throttle-skips). URL is the same endpoint the batch used.
+    LYRICS_LRCLIB_SEARCH_URL: str = "https://lrclib.net/api/search"
+    LYRICS_INCR_BATCH_LIMIT: int = 150
+    LYRICS_INCR_CONCURRENCY: int = 20
+    LYRICS_INCR_TIME_BUDGET_SEC: float = 90.0
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     SQS_MAX_MESSAGES: int = 1

@@ -106,6 +106,20 @@ def _run_isrc_backfill(limit: int = 1000) -> None:
         logger.info("ISRC backfill metrics: %s", metrics)
 
 
+def _run_lyrics_incremental(limit: int | None = None) -> None:
+    """Periodic incremental lyrics collection (FEAT-lyrics-corpus Step 3). Alias-fill
+    pattern: select recently-added tracks lacking a track_lyrics row, evaluate each via
+    the LRCLIB /api/search API with the Step 2 canonical matcher, write the match outcome
+    + sentinel per row. Failure-isolated — a lyrics-source outage skips rows and never
+    blocks album sync (this is a separate invocation from the SQS album path)."""
+    from worker.service.lyrics_incremental_service import LyricsIncrementalService
+
+    with SessionLocal() as session:
+        svc = LyricsIncrementalService(session)
+        metrics = svc.collect(limit=limit)
+        logger.info("Lyrics incremental metrics: %s", metrics)
+
+
 def _run_alias_generation() -> None:
     """Called by the EventBridge scheduled trigger (not the SQS sync path)."""
     try:
@@ -154,6 +168,16 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         limit = event.get("limit", 1000)
         logger.info("EventBridge/SQS trigger: running ISRC backfill (limit=%s)", limit)
         _run_isrc_backfill(limit=limit)
+        return {}
+
+    # EventBridge/SQS trigger — incremental lyrics collection (FEAT-lyrics-corpus Step 3).
+    # Constant input {"job": "lyrics_incremental"} (routed before the alias source check,
+    # same pattern as isrc_backfill / album_ingest). Bounded per invocation; optional
+    # "limit" overrides settings.LYRICS_INCR_BATCH_LIMIT.
+    if event.get("job") == "lyrics_incremental":
+        limit = event.get("limit")
+        logger.info("EventBridge/SQS trigger: running lyrics incremental collection (limit=%s)", limit)
+        _run_lyrics_incremental(limit=limit)
         return {}
 
     # EventBridge scheduled rule (alias cron) — full event carries source=aws.events
