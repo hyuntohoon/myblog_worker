@@ -7,6 +7,7 @@ by ``last_lyrics_id``, ``duration`` in float seconds, snake_case). RFC:
 ``docs/rfcs/FEAT-lyrics-corpus.md``.
 """
 
+import json
 import sqlite3
 import uuid
 
@@ -16,8 +17,15 @@ from worker.service.lyrics_matcher import (
     Candidate,
     LRCLIBDumpMatcher,
     MatchOutcome,
+    STATUS_AMBIGUOUS,
+    STATUS_MATCHED,
+    STATUS_NO_LYRICS,
+    STATUS_NOT_FOUND,
+    STATUS_REVIEW_REQUIRED,
     TITLE_FUZZY_THRESHOLD,
     TitleNormalizer,
+    _evidence_json,
+    _lyric_plain_for,
     decide_match,
     extract_version_tokens,
 )
@@ -346,3 +354,66 @@ class TestLRCLIBDumpMatcher:
         conn.close()
         with pytest.raises(RuntimeError, match="missing expected columns"):
             LRCLIBDumpMatcher(str(path))
+
+
+# --------------------------------------------------------------------------
+# TrackLyricsWriter persistence helpers (V33 CHECK + JSONB bind safety)
+# --------------------------------------------------------------------------
+class TestWriterHelpers:
+    """Guards the two Phase-2 writer fixes without needing a live Postgres.
+
+    (1) ``_lyric_plain_for`` keeps the V33 ``ck_track_lyrics_lyric_on_resolved``
+        CHECK satisfiable (resolved states non-NULL, unresolved states NULL).
+    (2) ``_evidence_json`` output is JSON-serializable (it is bound via
+        ``json.dumps(...) + CAST(:evidence AS jsonb)`` — a raw dict is not
+        adaptable by psycopg).
+    """
+
+    def _outcome(self, status, lyric_plain=None, lyric_synced=None):
+        return MatchOutcome(
+            track_id=uuid.uuid4(), match_status=status, evidence={"reason": "x"},
+            lyric_plain=lyric_plain, lyric_synced=lyric_synced,
+        )
+
+    def test_matched_none_plain_coerced_to_empty(self):
+        # matched candidate that carried only synced lyrics -> plain must not be NULL
+        o = self._outcome(STATUS_MATCHED, lyric_plain=None, lyric_synced="[00:01.00] hi")
+        assert _lyric_plain_for(o) == ""
+
+    def test_matched_keeps_real_plain(self):
+        o = self._outcome(STATUS_MATCHED, lyric_plain="real words")
+        assert _lyric_plain_for(o) == "real words"
+
+    def test_no_lyrics_stays_empty_string(self):
+        o = self._outcome(STATUS_NO_LYRICS, lyric_plain="")
+        assert _lyric_plain_for(o) == ""
+
+    @pytest.mark.parametrize("status", [STATUS_NOT_FOUND, STATUS_AMBIGUOUS, STATUS_REVIEW_REQUIRED])
+    def test_unresolved_states_stay_null(self, status):
+        o = self._outcome(status, lyric_plain=None)
+        assert _lyric_plain_for(o) is None
+
+    def test_evidence_json_strips_nul(self):
+        # LRCLIB crowd metadata can carry an embedded NUL; jsonb rejects .
+        o = MatchOutcome(
+            track_id=uuid.uuid4(), match_status=STATUS_AMBIGUOUS,
+            evidence={"reason": "multiple_plausible",
+                      "candidates": [{"artist": "Kanye West\x00﻿Kanye West"}]},
+        )
+        s = json.dumps(_evidence_json(o), ensure_ascii=False)
+        assert "\x00" not in s
+        assert "\\u0000" not in s
+        assert "﻿" in s  # BOM is valid Postgres text — left intact
+
+    def test_evidence_json_is_serializable(self):
+        # tokens are stored as lists; ensure the whole payload round-trips through json
+        o = MatchOutcome(
+            track_id=uuid.uuid4(), match_status=STATUS_REVIEW_REQUIRED,
+            evidence={"reason": "version_token_mismatch", "asymmetric_tokens": ["live"]},
+            version_tokens_track=["live"], version_tokens_candidate=[], version_agrees=False,
+            match_basis="fuzzy-title",
+        )
+        payload = _evidence_json(o)
+        s = json.dumps(payload, ensure_ascii=False)
+        assert json.loads(s)["version_agrees"] is False
+        assert json.loads(s)["reason"] == "version_token_mismatch"
