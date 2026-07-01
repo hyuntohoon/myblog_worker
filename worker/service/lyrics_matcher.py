@@ -23,6 +23,7 @@ Correctness-first: ambiguity / weak evidence / version-token conflicts park in
 ``docs/rfcs/FEAT-lyrics-corpus.md``.
 """
 
+import json
 import logging
 import re
 import sqlite3
@@ -494,7 +495,7 @@ class TrackLyricsWriter:
                             (track_id, match_status, evidence,
                              lyric_plain, lyric_synced, matcher_version)
                         VALUES
-                            (:track_id, :match_status, :evidence,
+                            (:track_id, :match_status, CAST(:evidence AS jsonb),
                              :lyric_plain, :lyric_synced, :matcher_version)
                         ON CONFLICT (track_id) DO UPDATE SET
                             match_status   = EXCLUDED.match_status,
@@ -508,9 +509,12 @@ class TrackLyricsWriter:
                     {
                         "track_id": outcome.track_id,
                         "match_status": outcome.match_status,
-                        "evidence": _evidence_json(outcome),
-                        "lyric_plain": outcome.lyric_plain,
-                        "lyric_synced": outcome.lyric_synced,
+                        # JSONB bind: repo pattern is json.dumps(...) + CAST(:x AS jsonb)
+                        # (psycopg does not adapt a raw dict). ensure_ascii=False keeps
+                        # Hangul readable in the stored evidence.
+                        "evidence": json.dumps(_evidence_json(outcome), ensure_ascii=False),
+                        "lyric_plain": _strip_nul(_lyric_plain_for(outcome)),
+                        "lyric_synced": _strip_nul(outcome.lyric_synced),
                         "matcher_version": outcome.matcher_version,
                     },
                 )
@@ -527,6 +531,40 @@ class TrackLyricsWriter:
         return written
 
 
+def _strip_nul(value):
+    """Recursively remove NUL (``\\x00``) from strings.
+
+    PostgreSQL ``text`` and ``jsonb`` cannot store a NUL code point (it rejects
+    the ``\\u0000`` JSON escape too), and LRCLIB crowd-sourced metadata / lyric
+    text occasionally carries an embedded NUL (e.g. ``"Kanye West\\x00\\ufeffKanye
+    West"``). Without this, every such row fails the insert and is silently
+    dropped by the per-row isolation. Only NUL is illegal — other control chars
+    and the BOM are valid Postgres text, so they are left untouched.
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {k: _strip_nul(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_strip_nul(v) for v in value]
+    return value
+
+
+def _lyric_plain_for(outcome: MatchOutcome) -> Optional[str]:
+    """Coerce lyric_plain to satisfy the V33 ``ck_track_lyrics_lyric_on_resolved`` CHECK.
+
+    Resolved states (``matched`` / ``no_lyrics``) require a **non-NULL** lyric_plain;
+    unresolved states (``ambiguous`` / ``review_required`` / ``not_found``) require
+    NULL. ``decide_match`` already writes ``''`` for ``no_lyrics``, but a ``matched``
+    candidate that carried **only synced** lyrics has ``lyric_plain=None`` — store
+    ``''`` (the text lives in ``lyric_synced``) so the row is written instead of being
+    silently rejected by the CHECK.
+    """
+    if outcome.match_status in (STATUS_MATCHED, STATUS_NO_LYRICS):
+        return outcome.lyric_plain if outcome.lyric_plain is not None else ""
+    return outcome.lyric_plain
+
+
 def _evidence_json(outcome: MatchOutcome) -> Dict:
     """Evidence payload (JSONB-safe: sets -> sorted lists)."""
     ev = dict(outcome.evidence or {})
@@ -537,4 +575,6 @@ def _evidence_json(outcome: MatchOutcome) -> Dict:
     ev["version_tokens_candidate"] = outcome.version_tokens_candidate
     if outcome.version_agrees is not None:
         ev["version_agrees"] = outcome.version_agrees
-    return ev
+    # Strip NUL from any source-derived string (candidate titles/artists in the
+    # evidence previews) so json.dumps never emits a NUL escape that jsonb rejects.
+    return _strip_nul(ev)
