@@ -14,16 +14,31 @@ class TestSpotifyClientGetTracks:
         result = client.get_tracks([])
         assert result == []
 
-    def test_get_tracks_filters_empty_strings(self):
+    @patch("worker.clients.spotify_client.SpotifyClient._get_token", return_value="test_token")
+    @patch("worker.clients.spotify_client._request_with_retry")
+    def test_get_tracks_filters_empty_strings(self, mock_request, mock_get_token):
         """Filter out empty/None IDs."""
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "tracks": [
+                {
+                    "id": "abc123",
+                    "name": "Track",
+                    "external_ids": {"isrc": "USRC12345678"},
+                },
+            ]
+        }
+        mock_request.return_value = mock_response
+
         client = SpotifyClient()
         result = client.get_tracks(["", None, "abc123"])
         # Should only fetch for "abc123"
-        # (we'll mock the API call)
         assert isinstance(result, list)
+        assert len(result) == 1
 
+    @patch("worker.clients.spotify_client.SpotifyClient._get_token", return_value="test_token")
     @patch("worker.clients.spotify_client._request_with_retry")
-    def test_get_tracks_single_call(self, mock_request):
+    def test_get_tracks_single_call(self, mock_request, mock_get_token):
         """Single API call for ≤50 tracks."""
         mock_response = Mock()
         mock_response.json.return_value = {
@@ -49,8 +64,9 @@ class TestSpotifyClientGetTracks:
         assert result[0]["external_ids"]["isrc"] == "USRC17607839"
         assert result[1]["external_ids"]["isrc"] == "USRC17607840"
 
+    @patch("worker.clients.spotify_client.SpotifyClient._get_token", return_value="test_token")
     @patch("worker.clients.spotify_client._request_with_retry")
-    def test_get_tracks_handles_null_response(self, mock_request):
+    def test_get_tracks_handles_null_response(self, mock_request, mock_get_token):
         """Handles null tracks in response (invalid/unknown IDs)."""
         mock_response = Mock()
         mock_response.json.return_value = {
@@ -79,8 +95,9 @@ class TestSpotifyClientGetTracks:
         assert result[2]["id"] == "track3"
         assert "isrc" not in result[2]["external_ids"]
 
+    @patch("worker.clients.spotify_client.SpotifyClient._get_token", return_value="test_token")
     @patch("worker.clients.spotify_client._request_with_retry")
-    def test_get_tracks_batches_over_50(self, mock_request):
+    def test_get_tracks_batches_over_50(self, mock_request, mock_get_token):
         """Split into multiple calls when >50 tracks."""
         # Mock two responses (one for each batch)
         mock_response = Mock()
