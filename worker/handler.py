@@ -120,6 +120,20 @@ def _run_lyrics_incremental(limit: int | None = None) -> None:
         logger.info("Lyrics incremental metrics: %s", metrics)
 
 
+def _run_lyrics_reassessment(limit: int | None = None) -> None:
+    """Periodic reassessment of unresolved lyrics rows (FEAT-lyrics-corpus Step 4). Re-checks
+    not_found / ambiguous / review_required tracks (stalest first) against current LRCLIB
+    coverage with the Step 2 canonical matcher: promotes on new evidence, refreshes otherwise,
+    and NEVER overwrites a good match (replacement guard). Separate invocation from album sync;
+    bounded to the 120s Lambda (shared eval loop)."""
+    from worker.service.lyrics_reassessment_service import LyricsReassessmentService
+
+    with SessionLocal() as session:
+        svc = LyricsReassessmentService(session)
+        metrics = svc.reassess(limit=limit)
+        logger.info("Lyrics reassessment metrics: %s", metrics)
+
+
 def _run_alias_generation() -> None:
     """Called by the EventBridge scheduled trigger (not the SQS sync path)."""
     try:
@@ -178,6 +192,15 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         limit = event.get("limit")
         logger.info("EventBridge/SQS trigger: running lyrics incremental collection (limit=%s)", limit)
         _run_lyrics_incremental(limit=limit)
+        return {}
+
+    # EventBridge/SQS trigger — periodic reassessment of unresolved lyrics rows
+    # (FEAT-lyrics-corpus Step 4). Constant input {"job":"lyrics_reassessment"} (routed before
+    # the alias source check). Bounded per invocation; optional "limit" overrides the setting.
+    if event.get("job") == "lyrics_reassessment":
+        limit = event.get("limit")
+        logger.info("EventBridge/SQS trigger: running lyrics reassessment (limit=%s)", limit)
+        _run_lyrics_reassessment(limit=limit)
         return {}
 
     # EventBridge scheduled rule (alias cron) — full event carries source=aws.events

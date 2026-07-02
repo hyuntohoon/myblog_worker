@@ -79,6 +79,15 @@ class Settings(BaseSettings):
     LYRICS_INCR_CONCURRENCY: int = 20
     LYRICS_INCR_TIME_BUDGET_SEC: float = 90.0
 
+    # Periodic reassessment (FEAT-lyrics-corpus Step 4, worker EventBridge job). Re-checks the
+    # unresolved pool (not_found / ambiguous / review_required, stalest first) since LRCLIB
+    # coverage grows over time — promotes on new evidence, refreshes otherwise, never overwrites
+    # a good match. Same bounding as Step 3; a lower cadence (the rule) since coverage changes
+    # slowly. Same shared eval loop, so the limit/concurrency/budget knobs mirror the Step 3 set.
+    LYRICS_REASSESS_BATCH_LIMIT: int = 150
+    LYRICS_REASSESS_CONCURRENCY: int = 20
+    LYRICS_REASSESS_TIME_BUDGET_SEC: float = 90.0
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     SQS_MAX_MESSAGES: int = 1
