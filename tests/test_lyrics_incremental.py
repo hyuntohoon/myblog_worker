@@ -176,7 +176,7 @@ def test_consistency_violation_is_not_written():
         track_id=uuid.uuid4(), match_status=STATUS_MATCHED, evidence={},
         version_agrees=False,
     )
-    with patch("worker.service.lyrics_incremental_service.decide_match", return_value=bad):
+    with patch("worker.service.lyrics_eval_core.decide_match", return_value=bad):
         metrics = svc.collect()
     assert metrics["consistency_errors"] == 1
     assert metrics["evaluated"] == 0

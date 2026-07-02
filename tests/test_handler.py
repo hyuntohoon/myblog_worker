@@ -184,3 +184,27 @@ def test_handler_lyrics_incremental_honors_limit_override(mock_lyrics):
     result = lambda_handler({"job": "lyrics_incremental", "limit": 25}, None)
     mock_lyrics.assert_called_once_with(limit=25)
     assert result == {}
+
+
+# ── FEAT-lyrics-corpus Step 4: periodic reassessment routing ─────────────────────
+
+@pytest.mark.unit
+@patch("worker.handler._run_lyrics_reassessment")
+@patch("worker.handler._run_lyrics_incremental")
+@patch("worker.handler.generate_and_save_aliases")
+def test_handler_eventbridge_lyrics_reassessment_job(mock_alias, mock_incr, mock_reassess):
+    """{"job": "lyrics_reassessment"} → reassessment only; must NOT hit incremental or alias."""
+    result = lambda_handler({"job": "lyrics_reassessment"}, None)
+    mock_reassess.assert_called_once_with(limit=None)
+    mock_incr.assert_not_called()
+    mock_alias.assert_not_called()
+    assert result == {}
+
+
+@pytest.mark.unit
+@patch("worker.handler._run_lyrics_reassessment")
+def test_handler_lyrics_reassessment_honors_limit_override(mock_reassess):
+    """An explicit "limit" is passed through to the reassessment job."""
+    result = lambda_handler({"job": "lyrics_reassessment", "limit": 40}, None)
+    mock_reassess.assert_called_once_with(limit=40)
+    assert result == {}
