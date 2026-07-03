@@ -44,10 +44,21 @@ logger = logging.getLogger(__name__)
 _UNRESOLVED = (STATUS_NOT_FOUND, STATUS_AMBIGUOUS, STATUS_REVIEW_REQUIRED)
 
 # Evidence-strength ladder for the replacement guard. A resolved (matched / no_lyrics) row is
-# replaced only when a NEW matched outcome carries a STRICTLY higher basis. The current matcher
-# only ever emits 'exact-title' for a matched row, so a matched row is never replaced in
-# practice — the higher tiers are reserved for future ISRC / MusicBrainz-recording evidence.
-_BASIS_STRENGTH = {None: 0, "fuzzy-title": 1, "exact-title": 2, "mb-recording": 3, "isrc": 4}
+# replaced only when a NEW matched outcome carries a STRICTLY higher basis. The conservative
+# matcher emits 'exact-title' for a real matched row; the best-of-* bases (FEAT-lyrics-best-of-
+# promotion) sit just above fuzzy-title and below exact-title. Both best-of bases share the
+# same rung so the strict-``>`` guard (a) lets an exact-title match supersede a best-of row,
+# (b) refuses lateral best-of→best-of churn, (c) never lets a best-of displace an exact-title.
+_BASIS_STRENGTH_MAP = {
+    None: 0, "fuzzy-title": 1,
+    "best-of-ambiguous": 2, "best-of-review": 2,
+    "exact-title": 3, "mb-recording": 4, "isrc": 5,
+}
+
+
+def _basis_strength(basis: Optional[str]) -> int:
+    """Strength of a basis on the replacement ladder (unknown basis ⇒ weakest)."""
+    return _BASIS_STRENGTH_MAP.get(basis, 0)
 
 
 def should_replace(row: Dict[str, Any], outcome: MatchOutcome) -> bool:
@@ -63,10 +74,12 @@ def should_replace(row: Dict[str, Any], outcome: MatchOutcome) -> bool:
         return True
     if outcome.match_status != STATUS_MATCHED:
         return False  # never downgrade a resolved good row to an unresolved/no_lyrics state
-    return (
-        _BASIS_STRENGTH.get(outcome.match_basis, 0)
-        > _BASIS_STRENGTH.get(row.get("existing_basis"), 0)
-    )
+    # A best-of-* matched row is now re-selected by the widened _fetch_unresolved_tracks
+    # (FEAT-lyrics-best-of-promotion Step 2), so it reaches this guard. The strictly-``>``
+    # ladder lets an exact-title / mb-recording / isrc match supersede it, refuses a
+    # lateral best-of→best-of swap (both at rung 2), and never lets a best-of displace an
+    # exact-title (3 > 3 is False) — the RFC's supersession-without-churn rule.
+    return _basis_strength(outcome.match_basis) > _basis_strength(row.get("existing_basis"))
 
 
 class LyricsReassessmentService:
@@ -107,11 +120,19 @@ class LyricsReassessmentService:
         )
 
     def _fetch_unresolved_tracks(self, limit: int) -> List[Dict[str, Any]]:
-        """Unresolved corpus rows (stalest first) with artist names + aliases + current state.
+        """Reassessment targets: unresolved rows + best-of-* matched rows (stalest first).
 
-        ``ORDER BY tl.updated_at ASC`` re-checks the longest-parked rows first; because a
-        rewrite bumps ``updated_at`` (the writer's ``ON CONFLICT ... updated_at = NOW()``),
-        the reassessment rotates fairly through the whole unresolved pool over successive runs.
+        FEAT-lyrics-best-of-promotion Step 2 widens the selection: a ``best-of-*``
+        ``matched`` row must stay a reassessment target so a later ``exact-title`` match
+        can supersede it via the replacement guard — without this arm a promoted row
+        would leave the pool forever and the promised supersession could never occur.
+
+        Unresolved rows keep rotation priority over best-of re-checks: a best-of row
+        already carries a usable lyric, so ``not_found`` recovery (the scarcer win) runs
+        first. Within each tier ``ORDER BY tl.updated_at ASC`` re-checks the longest-parked
+        rows first; because a rewrite bumps ``updated_at`` (the writer's
+        ``ON CONFLICT ... updated_at = NOW()``), reassessment rotates fairly across the
+        whole pool over successive runs.
         """
         rows = self.session.execute(
             text(
@@ -127,9 +148,14 @@ class LyricsReassessmentService:
                 JOIN artists a        ON a.id = ta.artist_id
                 LEFT JOIN LATERAL jsonb_array_elements_text(a.aliases) AS al(alias) ON true
                 WHERE tl.match_status IN ('not_found', 'ambiguous', 'review_required')
+                   OR (tl.match_status = 'matched'
+                       AND tl.evidence ->> 'match_basis' LIKE 'best-of-%')
                 GROUP BY t.id, t.title, t.duration_sec,
                          tl.match_status, (tl.evidence ->> 'match_basis'), tl.updated_at
-                ORDER BY tl.updated_at ASC
+                ORDER BY
+                    CASE WHEN tl.match_status IN ('not_found', 'ambiguous', 'review_required')
+                         THEN 0 ELSE 1 END,
+                    tl.updated_at ASC
                 LIMIT :limit
                 """
             ),

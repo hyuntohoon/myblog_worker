@@ -12,6 +12,7 @@ Two units, both DB-free:
 """
 from __future__ import annotations
 
+import json
 import uuid
 from unittest.mock import MagicMock, patch
 
@@ -25,6 +26,10 @@ from worker.service.lyrics_matcher import (
     Candidate,
     MatchOutcome,
     decide_match,
+)
+from worker.service.lyrics_promote import (
+    BASIS_BEST_OF_AMBIGUOUS,
+    BASIS_BEST_OF_REVIEW,
 )
 
 
@@ -189,3 +194,134 @@ def test_owned_client_is_closed():
     # client was injected (not owned) -> service must NOT close it
     svc.collect()
     assert client.closed is False
+
+
+# --------------------------------------------------------------------------
+# Best-of promotion inside the shared eval loop
+# (FEAT-lyrics-best-of-promotion Step 2 — promote_best runs after decide_match)
+# --------------------------------------------------------------------------
+def _dup_noise_candidates():
+    """The RFC's canonical duplicate-noise shape (Come Back to Earth): three
+    same-recording uploads whose base titles differ only by a track-number prefix /
+    a non-rendition parenthetical -> decide_match parks ambiguous; tier 1 promotes
+    the clean title."""
+    def c(title, cid, duration=162.0, plain="la la", synced=None):
+        return Candidate(
+            id=cid, title=title, artist="Mac Miller", album=None,
+            duration_sec=duration, instrumental=False,
+            plain_lyrics=plain, synced_lyrics=synced,
+        )
+    return [
+        c("Come Back to Earth", cid=10, synced="[00:01.00] la la"),
+        c("Come Back to Earth (Paused)", cid=11, duration=161.84),
+        c("01 - Come Back to Earth", cid=12),
+    ]
+
+
+def _mac_miller_row():
+    return {
+        "id": uuid.uuid4(),
+        "title": "Come Back to Earth",
+        "duration_sec": 161.0,
+        "artist_names": ["Mac Miller"],
+        "aliases": [],
+    }
+
+
+def test_ambiguous_candidates_promote_to_best_of_matched():
+    client = _FakeClient(result=_dup_noise_candidates())
+    svc, session = _service(client, [_mac_miller_row()])
+    metrics = svc.collect()
+    # promoted row is written as matched (one row, per-row commit)
+    assert metrics["evaluated"] == 1
+    assert metrics[STATUS_MATCHED] == 1
+    assert metrics["ambiguous"] == 0            # no longer parked
+    assert metrics["promoted_ambiguous"] == 1
+    assert metrics["promoted_review"] == 0
+    assert metrics["promotion_criteria"]["exact-base-title"] == 1
+    assert metrics["consistency_errors"] == 0
+    assert session.execute.call_count == 1
+    # the written row carries the best-of basis + the promotion block + a lyric body
+    params = session.execute.call_args[0][1]
+    assert params["match_status"] == STATUS_MATCHED
+    evidence = json.loads(params["evidence"])
+    assert evidence["match_basis"] == BASIS_BEST_OF_AMBIGUOUS
+    assert evidence["promotion"]["criterion"] == "exact-base-title"
+    assert evidence["promotion"]["from_status"] == "ambiguous"
+    assert evidence["reason"] == "multiple_plausible"  # original evidence preserved
+    assert params["lyric_synced"] == "[00:01.00] la la"  # richest (synced) tier-1 pick
+
+
+def test_review_sibling_promotes_to_best_of_review():
+    # decide_match picks the richest (synced Live) representative -> version mismatch
+    # parks review_required; the clean sibling agrees on version and is the tier-1 pick.
+    cands = [
+        Candidate(id=20, title="Song", artist="Adele", album=None, duration_sec=200.0,
+                  instrumental=False, plain_lyrics="hello", synced_lyrics=None),
+        Candidate(id=21, title="Song (Live)", artist="Adele", album=None, duration_sec=200.5,
+                  instrumental=False, plain_lyrics="hello",
+                  synced_lyrics="[00:01.00] hello"),
+    ]
+    client = _FakeClient(result=cands)
+    row = {"id": uuid.uuid4(), "title": "Song", "duration_sec": 200.0,
+           "artist_names": ["Adele"], "aliases": []}
+    svc, session = _service(client, [row])
+    metrics = svc.collect()
+    assert metrics[STATUS_MATCHED] == 1
+    assert metrics["promoted_review"] == 1
+    assert metrics["review_required"] == 0
+    params = session.execute.call_args[0][1]
+    evidence = json.loads(params["evidence"])
+    assert evidence["match_basis"] == BASIS_BEST_OF_REVIEW
+    assert evidence["promotion"]["chosen"]["lrclib_id"] == 20
+
+
+def test_unpromotable_ambiguous_stays_parked_and_counted():
+    # Two genuinely distinct fuzzy base titles, neither equal to the track's ->
+    # no tier-1 candidate; the row stays parked with the attempt recorded.
+    cands = [
+        Candidate(id=30, title="Hello Worlds", artist="Adele", album=None,
+                  duration_sec=200.0, instrumental=False,
+                  plain_lyrics="x", synced_lyrics=None),
+        Candidate(id=31, title="Hello Worldz", artist="Adele", album=None,
+                  duration_sec=200.0, instrumental=False,
+                  plain_lyrics="y", synced_lyrics=None),
+    ]
+    client = _FakeClient(result=cands)
+    row = {"id": uuid.uuid4(), "title": "Hello World", "duration_sec": 200.0,
+           "artist_names": ["Adele"], "aliases": []}
+    svc, session = _service(client, [row])
+    metrics = svc.collect()
+    assert metrics["ambiguous"] == 1             # still parked (row written as sentinel)
+    assert metrics["promoted_ambiguous"] == 0
+    assert metrics["promotion_parked"] == 1
+    assert session.execute.call_count == 1
+    params = session.execute.call_args[0][1]
+    evidence = json.loads(params["evidence"])
+    assert evidence["promotion"]["reason"] == "no_tier1_candidate"
+    assert params["lyric_plain"] is None         # unresolved stays NULL (V33 CHECK)
+
+
+def test_best_of_matched_row_passes_basis_aware_invariant():
+    # A best-of matched row must NOT be refused as a consistency error (the invariant
+    # is basis-aware: best-of requires the promotion block, which promote_best sets).
+    client = _FakeClient(result=_dup_noise_candidates())
+    svc, session = _service(client, [_mac_miller_row()])
+    metrics = svc.collect()
+    assert metrics["consistency_errors"] == 0
+    assert session.execute.call_count == 1
+
+
+def test_stray_best_of_without_promotion_block_is_refused():
+    # Defensive: a best-of matched row that lost its promotion provenance is refused.
+    client = _FakeClient(result=[_matching_candidate()])
+    svc, session = _service(client, [_track_row()])
+    stray = MatchOutcome(
+        track_id=uuid.uuid4(), match_status=STATUS_MATCHED, evidence={},
+        match_basis=BASIS_BEST_OF_AMBIGUOUS, version_agrees=True,
+    )
+    with patch("worker.service.lyrics_eval_core.decide_match", return_value=stray):
+        metrics = svc.collect()
+    assert metrics["consistency_errors"] == 1
+    assert metrics["evaluated"] == 0
+    session.execute.assert_not_called()
