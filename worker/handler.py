@@ -214,6 +214,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.info("Received %d records", len(records))
 
     failed: List[str] = []
+    album_synced = False  # any album-sync record landed → chain a lyrics pass below
 
     for i, record in enumerate(records, start=1):
         try:
@@ -240,14 +241,29 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 _run_saved_tracks_sync(body.get("mode", "incremental"))
                 continue
 
+            # Lyrics jobs via SQS. The EventBridge constant-input path hits the
+            # event["job"] checks at the top of the handler; an SQS-delivered message
+            # arrives wrapped in Records, so it must ALSO be routed here (the
+            # eventbridge.tf comments promise the manual blogSQS path, and the
+            # near-real-time chain below relies on it).
+            if body.get("job") == "lyrics_incremental":
+                _run_lyrics_incremental(limit=body.get("limit"))
+                continue
+
+            if body.get("job") == "lyrics_reassessment":
+                _run_lyrics_reassessment(limit=body.get("limit"))
+                continue
+
             market = body.get("market", settings.SPOTIFY_DEFAULT_MARKET)
 
             if "album_ids" in body and isinstance(body["album_ids"], list):
                 _process_batch(body["album_ids"], market)
+                album_synced = True
                 continue
 
             if "spotify_album_id" in body:
                 _process_single(body["spotify_album_id"], market)
+                album_synced = True
                 continue
 
             logger.warning("Unknown message format: %s", body)
@@ -255,5 +271,18 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         except Exception as e:
             logger.error("[%d/%d] Record failed: %s", i, len(records), e, exc_info=True)
             failed.append(record.get("messageId", str(i)))
+
+    # Near-real-time lyrics chaining: an album sync just landed new tracks, so kick
+    # the incremental collector now instead of waiting for the 15-min cron. One send
+    # per invocation regardless of record count; DRY_RUN wrote nothing so there is
+    # nothing to chain. Best-effort — a failed send must not fail the album records
+    # (the cron is the safety net).
+    if album_synced and not settings.DRY_RUN:
+        try:
+            from worker.clients.sqs_producer import enqueue_lyrics_incremental
+
+            enqueue_lyrics_incremental()
+        except Exception:
+            logger.warning("lyrics-incremental chain enqueue failed; 15-min cron covers", exc_info=True)
 
     return {"batchItemFailures": [{"itemIdentifier": mid} for mid in failed]}

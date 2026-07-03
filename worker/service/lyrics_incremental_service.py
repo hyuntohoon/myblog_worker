@@ -69,8 +69,23 @@ class LyricsIncrementalService:
             concurrency=self.concurrency,
             time_budget_sec=self.time_budget_sec,
             client=self._client,
+            should_write=self._still_uncorpused,
             log_prefix="Lyrics incremental",
         )
+
+    def _still_uncorpused(self, row: Dict[str, Any], outcome: Any) -> bool:
+        """Concurrent-run guard (near-real-time SQS chaining). The selection is
+        materialized before the slow LRCLIB loop, so a chained peer invocation may
+        corpus a track while this run is still fetching; without a gate the writer's
+        upsert is last-writer-wins and this run could replace the peer's row with a
+        weaker outcome. Re-check just before writing; a lost race is counted as
+        ``guard_kept``. (The remaining check→write window is ms-scale and both sides
+        evaluated the same LRCLIB candidates, so it is benign.)"""
+        exists = self.session.execute(
+            text("SELECT 1 FROM track_lyrics WHERE track_id = :tid"),
+            {"tid": row["id"]},
+        ).first()
+        return exists is None
 
     def _fetch_uncorpused_tracks(self, limit: int) -> List[Dict[str, Any]]:
         """Recently-added tracks lacking a ``track_lyrics`` row, with artist names + aliases.

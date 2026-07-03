@@ -122,6 +122,9 @@ class _FakeClient:
 
 def _service(client, tracks, **kw):
     session = MagicMock()
+    # Concurrent-run write gate re-checks existence via session.execute(...).first();
+    # None = still uncorpused, so the gate passes by default in these units.
+    session.execute.return_value.first.return_value = None
     svc = LyricsIncrementalService(session, client=client, **kw)
     svc._fetch_uncorpused_tracks = MagicMock(return_value=tracks)
     return svc, session
@@ -141,8 +144,8 @@ def test_matched_track_is_written_per_row():
     metrics = svc.collect()
     assert metrics["evaluated"] == 1
     assert metrics[STATUS_MATCHED] == 1
-    # per-row commit: writer INSERTed once and committed
-    assert session.execute.call_count == 1
+    # per-row commit: gate re-check SELECT + writer INSERT, one commit
+    assert session.execute.call_count == 2
     assert session.commit.call_count == 1
 
 
@@ -152,7 +155,7 @@ def test_no_candidate_writes_not_found_sentinel():
     metrics = svc.collect()
     assert metrics["evaluated"] == 1
     assert metrics["not_found"] == 1
-    assert session.execute.call_count == 1  # sentinel row written -> leaves the pool
+    assert session.execute.call_count == 2  # gate re-check + sentinel row written -> leaves the pool
 
 
 def test_transient_error_is_skipped_not_written():
@@ -240,7 +243,7 @@ def test_ambiguous_candidates_promote_to_best_of_matched():
     assert metrics["promoted_review"] == 0
     assert metrics["promotion_criteria"]["exact-base-title"] == 1
     assert metrics["consistency_errors"] == 0
-    assert session.execute.call_count == 1
+    assert session.execute.call_count == 2  # gate re-check + INSERT
     # the written row carries the best-of basis + the promotion block + a lyric body
     params = session.execute.call_args[0][1]
     assert params["match_status"] == STATUS_MATCHED
@@ -295,7 +298,7 @@ def test_unpromotable_ambiguous_stays_parked_and_counted():
     assert metrics["ambiguous"] == 1             # still parked (row written as sentinel)
     assert metrics["promoted_ambiguous"] == 0
     assert metrics["promotion_parked"] == 1
-    assert session.execute.call_count == 1
+    assert session.execute.call_count == 2  # gate re-check + sentinel write
     params = session.execute.call_args[0][1]
     evidence = json.loads(params["evidence"])
     assert evidence["promotion"]["reason"] == "no_tier1_candidate"
@@ -309,7 +312,20 @@ def test_best_of_matched_row_passes_basis_aware_invariant():
     svc, session = _service(client, [_mac_miller_row()])
     metrics = svc.collect()
     assert metrics["consistency_errors"] == 0
-    assert session.execute.call_count == 1
+    assert session.execute.call_count == 2  # gate re-check + INSERT
+
+
+def test_race_lost_row_is_guard_kept_not_overwritten():
+    # Near-real-time chaining: a peer invocation corpused this track between our
+    # selection and our write — the gate re-check sees the row and keeps it, so
+    # last-writer-wins can never replace the peer's outcome with ours.
+    client = _FakeClient(result=[_matching_candidate()])
+    svc, session = _service(client, [_track_row()])
+    session.execute.return_value.first.return_value = (1,)  # row exists by write time
+    metrics = svc.collect()
+    assert metrics["guard_kept"] == 1
+    assert metrics["evaluated"] == 0
+    assert session.commit.call_count == 0  # nothing written
 
 
 def test_stray_best_of_without_promotion_block_is_refused():
