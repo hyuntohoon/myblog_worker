@@ -214,6 +214,7 @@ def test_handler_lyrics_reassessment_honors_limit_override(mock_reassess):
 # Near-real-time lyrics chaining (album sync → SQS {"job":"lyrics_incremental"})
 # --------------------------------------------------------------------------
 @pytest.mark.unit
+@patch("worker.handler.settings.DRY_RUN", False)  # CI test env sets DRY_RUN=true (deploy.yml)
 @patch("worker.clients.sqs_producer.enqueue_lyrics_incremental")
 @patch("worker.handler.spotify")
 @patch("worker.handler.AlbumSyncService")
@@ -240,6 +241,7 @@ def test_non_album_records_do_not_chain(mock_listening, mock_chain):
 
 
 @pytest.mark.unit
+@patch("worker.handler.settings.DRY_RUN", False)  # CI test env sets DRY_RUN=true (deploy.yml)
 @patch("worker.clients.sqs_producer.enqueue_lyrics_incremental", side_effect=RuntimeError("sqs down"))
 @patch("worker.handler.spotify")
 @patch("worker.handler.AlbumSyncService")
@@ -250,6 +252,20 @@ def test_chain_failure_does_not_fail_album_records(mock_session_local, mock_svc_
     results = lambda_handler(event, None)
     assert results == {"batchItemFailures": []}
     mock_chain.assert_called_once()
+
+
+@pytest.mark.unit
+@patch("worker.handler.settings.DRY_RUN", True)
+@patch("worker.clients.sqs_producer.enqueue_lyrics_incremental")
+@patch("worker.handler.spotify")
+@patch("worker.handler.AlbumSyncService")
+@patch("worker.handler.SessionLocal")
+def test_dry_run_does_not_chain(mock_session_local, mock_svc_class, mock_spotify, mock_chain):
+    """DRY_RUN wrote no tracks, so there is nothing to chain."""
+    event = {"Records": [{"body": json.dumps({"album_ids": ["a1"], "market": "KR"})}]}
+    results = lambda_handler(event, None)
+    assert results == {"batchItemFailures": []}
+    mock_chain.assert_not_called()
 
 
 @pytest.mark.unit
