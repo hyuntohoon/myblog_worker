@@ -20,10 +20,17 @@ from sqlalchemy.orm import Session
 
 from worker.clients.lrclib_client import LrclibClient, LrclibTransientError
 from worker.service.lyrics_matcher import (
+    STATUS_AMBIGUOUS,
     STATUS_MATCHED,
+    STATUS_REVIEW_REQUIRED,
     MatchOutcome,
     TrackLyricsWriter,
     decide_match,
+)
+from worker.service.lyrics_promote import (
+    BASIS_BEST_OF_AMBIGUOUS,
+    BASIS_BEST_OF_REVIEW,
+    promote_best,
 )
 
 logger = logging.getLogger(__name__)
@@ -31,9 +38,43 @@ logger = logging.getLogger(__name__)
 # should_write(row, outcome) -> bool. ``row`` may carry 'existing_status'/'existing_basis'.
 WriteGate = Callable[[Dict[str, Any], MatchOutcome], bool]
 
+# The conservative matcher's exact-title/fuzzy bases, whose ``matched`` rows must carry
+# version agreement (a ``matched`` + ``version_agrees=False`` is a matcher bug). Best-of
+# bases (FEAT-lyrics-best-of-promotion) are validated by the presence of an
+# ``evidence["promotion"]`` block instead — the basis-aware form of the invariant so
+# that opening the gated tiers later cannot silently zero out best-of writes as
+# consistency errors (RFC §Target state).
+_BEST_OF_BASES = {BASIS_BEST_OF_AMBIGUOUS, BASIS_BEST_OF_REVIEW}
+
+
+def _consistency_ok(outcome: MatchOutcome) -> bool:
+    """Basis-aware matched-row invariant.
+
+    ``exact-title`` / ``fuzzy-title`` / unknown bases ⇒ the conservative rule: a
+    matched row must agree on version tokens. ``best-of-*`` ⇒ the promotion block must
+    be present (the matched row came from a promotion, which records its choice + why).
+    Under v1 tier-1-only every promotion also carries ``version_agrees=True``, so the
+    version rule still holds for best-of rows; this just refuses a best-of ``matched``
+    row that lost its provenance block.
+    """
+    if outcome.match_status != STATUS_MATCHED:
+        return True
+    if outcome.match_basis in _BEST_OF_BASES:
+        ev = outcome.evidence or {}
+        return isinstance(ev.get("promotion"), dict)
+    # Conservative basis: version agreement is the invariant.
+    return outcome.version_agrees is not False
+
 
 def new_metrics() -> Dict[str, Any]:
-    """Fresh zeroed metrics dict (RFC §Metrics + loop bookkeeping)."""
+    """Fresh zeroed metrics dict (RFC §Metrics + loop bookkeeping).
+
+    ``promoted_ambiguous`` / ``promoted_review`` count rows this run lifted out of the
+    parked pool via ``promote_best`` (a ``best-of-*`` ``matched`` or the
+    all-instrumental ``no_lyrics`` resolution). ``promotion_criteria`` is the
+    per-criterion breakdown (tier-1 = ``exact-base-title``); ``promotion_parked`` counts
+    rows that *stayed* parked after a promotion attempt (reason recorded in evidence).
+    """
     return {
         "evaluated": 0,          # rows written this run
         STATUS_MATCHED: 0,
@@ -43,8 +84,14 @@ def new_metrics() -> Dict[str, Any]:
         "review_required": 0,
         "skipped_transient": 0,  # LRCLIB error — left for the next run, never poisoned
         "skipped_budget": 0,     # not reached before the wall-clock budget expired
-        "consistency_errors": 0, # matched-but-version-disagrees invariant breach (never written)
+        "consistency_errors": 0, # invariant breach (never written) — basis-aware now
         "guard_kept": 0,         # existing row protected by the write gate (not overwritten)
+        "promoted_ambiguous": 0,  # best-of-ambiguous promotions this run
+        "promoted_review": 0,     # best-of-review promotions this run
+        "promotion_parked": 0,    # promotion attempted, row stayed parked
+        "promotion_criteria": {  # per-criterion breakdown of promotions
+            "exact-base-title": 0,
+        },
     }
 
 
@@ -116,12 +163,31 @@ def run_eval_batch(
                 duration_sec=row["duration_sec"],
                 candidates=candidates,
             )
-            # Consistency invariant: a matched outcome must always agree on version.
-            # A violation is a matcher bug — never write the bad row.
-            if outcome.match_status == STATUS_MATCHED and outcome.version_agrees is False:
+            # Step 2 (FEAT-lyrics-best-of-promotion): lift a parked ambiguous /
+            # review_required outcome to a tagged best-of-* matched/no_lyrics. Runs
+            # before the consistency invariant + the writer, reusing the SAME
+            # in-memory candidates the fetch just produced — the candidate bodies live
+            # here (only stripped when flattened into evidence), so promotion attaches a
+            # lyric with no second LRCLIB round trip.
+            if outcome.match_status in (STATUS_AMBIGUOUS, STATUS_REVIEW_REQUIRED):
+                outcome = promote_best(
+                    outcome,
+                    title=row["title"],
+                    artist_names=list(row["artist_names"] or []),
+                    aliases=list(row["aliases"] or []),
+                    duration_sec=row["duration_sec"],
+                    candidates=candidates,
+                )
+
+            # Consistency invariant (basis-aware): a matched row must satisfy the
+            # invariant for its basis — exact-title requires version agreement; a
+            # best-of-* row requires its promotion block. A violation is a matcher bug
+            # — never write the bad row.
+            if not _consistency_ok(outcome):
                 metrics["consistency_errors"] += 1
-                logger.error("%s: CONSISTENCY VIOLATION track %s matched but "
-                             "version_agrees=False — row NOT written", log_prefix, row["id"])
+                logger.error("%s: CONSISTENCY VIOLATION track %s matched (basis=%s) "
+                             "but invariant failed — row NOT written",
+                             log_prefix, row["id"], outcome.match_basis)
                 continue
 
             if should_write is not None and not should_write(row, outcome):
@@ -131,6 +197,7 @@ def run_eval_batch(
             writer.write_outcomes([outcome])  # per-row commit (sentinel included)
             metrics["evaluated"] += 1
             metrics[outcome.match_status] = metrics.get(outcome.match_status, 0) + 1
+            _count_promotion(metrics, outcome)
     finally:
         # Whatever we didn't reach (budget) simply stays selectable for the next run.
         metrics["skipped_budget"] = (
@@ -143,3 +210,32 @@ def run_eval_batch(
 
     logger.info("%s complete: %s", log_prefix, metrics)
     return metrics
+
+
+def _count_promotion(metrics: Dict[str, Any], outcome: MatchOutcome) -> None:
+    """Tally best-of promotion counters for a written outcome.
+
+    A parked outcome that ``promote_best`` lifted to ``matched`` / ``no_lyrics`` carries
+    a ``best-of-*`` basis + an ``evidence["promotion"]`` block; count it by its origin
+    status and the criterion that fired. A best-of outcome still parked (no body / no
+    tier-1 candidate) keeps its parked status and counts under ``promotion_parked``.
+    No-op for every non-best-of outcome (the conservative matcher's rows are unaffected).
+    """
+    ev = outcome.evidence or {}
+    promotion = ev.get("promotion")
+    if not isinstance(promotion, dict):
+        return
+    # A row that stayed parked (no_body_candidate / no_tier1_candidate /
+    # no_plausible_candidate) is a promotion attempt that did not lift the row.
+    if outcome.match_status in (STATUS_AMBIGUOUS, STATUS_REVIEW_REQUIRED):
+        metrics["promotion_parked"] += 1
+        return
+    from_status = promotion.get("from_status")
+    if from_status == STATUS_AMBIGUOUS:
+        metrics["promoted_ambiguous"] += 1
+    elif from_status == STATUS_REVIEW_REQUIRED:
+        metrics["promoted_review"] += 1
+    criterion = promotion.get("criterion")
+    if criterion:
+        criteria = metrics["promotion_criteria"]
+        criteria[criterion] = criteria.get(criterion, 0) + 1
