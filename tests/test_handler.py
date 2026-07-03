@@ -208,3 +208,68 @@ def test_handler_lyrics_reassessment_honors_limit_override(mock_reassess):
     result = lambda_handler({"job": "lyrics_reassessment", "limit": 40}, None)
     mock_reassess.assert_called_once_with(limit=40)
     assert result == {}
+
+
+# --------------------------------------------------------------------------
+# Near-real-time lyrics chaining (album sync → SQS {"job":"lyrics_incremental"})
+# --------------------------------------------------------------------------
+@pytest.mark.unit
+@patch("worker.clients.sqs_producer.enqueue_lyrics_incremental")
+@patch("worker.handler.spotify")
+@patch("worker.handler.AlbumSyncService")
+@patch("worker.handler.SessionLocal")
+def test_album_sync_chains_one_lyrics_pass(mock_session_local, mock_svc_class, mock_spotify, mock_chain):
+    """Album-sync records (any count, both formats) chain exactly ONE lyrics message."""
+    event = {"Records": [
+        {"body": json.dumps({"album_ids": ["a1", "a2"], "market": "KR"})},
+        {"body": json.dumps({"spotify_album_id": "a3", "market": "KR"})},
+    ]}
+    results = lambda_handler(event, None)
+    assert results == {"batchItemFailures": []}
+    mock_chain.assert_called_once()
+
+
+@pytest.mark.unit
+@patch("worker.clients.sqs_producer.enqueue_lyrics_incremental")
+@patch("worker.handler._run_listening_sync")
+def test_non_album_records_do_not_chain(mock_listening, mock_chain):
+    """A non-album SQS job must not trigger the lyrics chain."""
+    event = {"Records": [{"body": json.dumps({"job": "spotify_refresh"})}]}
+    lambda_handler(event, None)
+    mock_chain.assert_not_called()
+
+
+@pytest.mark.unit
+@patch("worker.clients.sqs_producer.enqueue_lyrics_incremental", side_effect=RuntimeError("sqs down"))
+@patch("worker.handler.spotify")
+@patch("worker.handler.AlbumSyncService")
+@patch("worker.handler.SessionLocal")
+def test_chain_failure_does_not_fail_album_records(mock_session_local, mock_svc_class, mock_spotify, mock_chain):
+    """Best-effort send: a failed chain enqueue must not fail the album batch (cron covers)."""
+    event = {"Records": [{"body": json.dumps({"album_ids": ["a1"], "market": "KR"})}]}
+    results = lambda_handler(event, None)
+    assert results == {"batchItemFailures": []}
+    mock_chain.assert_called_once()
+
+
+@pytest.mark.unit
+@patch("worker.clients.sqs_producer.enqueue_lyrics_incremental")
+@patch("worker.handler._run_lyrics_incremental")
+def test_sqs_lyrics_incremental_routed_in_record_loop(mock_run, mock_chain):
+    """SQS-delivered {"job":"lyrics_incremental"} routes in the record loop (the
+    eventbridge.tf manual-message contract) and must NOT re-chain (no feedback loop)."""
+    event = {"Records": [{"body": json.dumps({"job": "lyrics_incremental", "limit": 7})}]}
+    results = lambda_handler(event, None)
+    assert results == {"batchItemFailures": []}
+    mock_run.assert_called_once_with(limit=7)
+    mock_chain.assert_not_called()
+
+
+@pytest.mark.unit
+@patch("worker.handler._run_lyrics_reassessment")
+def test_sqs_lyrics_reassessment_routed_in_record_loop(mock_run):
+    """SQS-delivered {"job":"lyrics_reassessment"} routes in the record loop too."""
+    event = {"Records": [{"body": json.dumps({"job": "lyrics_reassessment"})}]}
+    results = lambda_handler(event, None)
+    assert results == {"batchItemFailures": []}
+    mock_run.assert_called_once_with(limit=None)
