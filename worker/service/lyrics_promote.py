@@ -31,7 +31,7 @@ from worker.service.lyrics_matcher import (
     MatchOutcome,
     TitleNormalizer,
     _artist_identity_ok,
-    _strip_version_tokens,
+    canonical_base_title,
     duration_matches,
     extract_version_tokens,
 )
@@ -61,8 +61,7 @@ def _plausible(
     duration tolerance — promotion never considers a candidate the conservative
     matcher would have dropped outright.
     """
-    norm_track_title = TitleNormalizer.normalize(title or "")
-    stripped_track = _strip_version_tokens(norm_track_title)
+    stripped_track = canonical_base_title(title or "")
     if not stripped_track:
         return []
 
@@ -75,10 +74,9 @@ def _plausible(
     for cand in candidates:
         if not _artist_identity_ok(TitleNormalizer.normalize(cand.artist), identity_norms):
             continue
-        cand_title_norm = TitleNormalizer.normalize(cand.title)
-        if not cand_title_norm:
+        if not TitleNormalizer.normalize(cand.title):
             continue
-        stripped_cand = _strip_version_tokens(cand_title_norm)
+        stripped_cand = canonical_base_title(cand.title)
         if not stripped_cand:
             continue
         if stripped_cand != stripped_track:
@@ -156,10 +154,10 @@ def promote_best(
     # Tier 1: exact stripped-base-title + version-token agreement (duration
     # already gated in _plausible). The only tier live in v1.
     track_tokens = extract_version_tokens(title or "")
-    stripped_track = _strip_version_tokens(TitleNormalizer.normalize(title or ""))
+    stripped_track = canonical_base_title(title or "")
     tier1 = [
         c for c in with_body
-        if _strip_version_tokens(TitleNormalizer.normalize(c.title)) == stripped_track
+        if canonical_base_title(c.title) == stripped_track
         and len(track_tokens ^ extract_version_tokens(c.title)) == 0
     ]
     if not tier1:
