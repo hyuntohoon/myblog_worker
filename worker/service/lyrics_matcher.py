@@ -156,11 +156,31 @@ def _strip_noise(raw_title: str) -> str:
 def canonical_base_title(raw_title: str) -> str:
     """Noise-stripped, normalized, version-token-free base title.
 
-    The single comparison/grouping key for both ``decide_match`` and the
-    best-of tier-1 gate — applied symmetrically to catalog and candidate
-    titles (FIX-lyrics-matcher-noise OQ1/OQ2).
+    The comparison/grouping key for both ``decide_match`` and the best-of
+    tier-1 gate — applied symmetrically to catalog and candidate titles
+    (FIX-lyrics-matcher-noise OQ1/OQ2).
     """
     return _strip_version_tokens(TitleNormalizer.normalize(_strip_noise(raw_title or "")))
+
+
+def plain_base_title(raw_title: str) -> str:
+    """Pre-noise-fix canonical (normalize + version strip only) — the step2-v2 key."""
+    return _strip_version_tokens(TitleNormalizer.normalize(raw_title or ""))
+
+
+def exact_base_equal(track_title: str, cand_title: str) -> bool:
+    """Exact base-title equality: noise-stripped OR plain canonical equality.
+
+    The plain path keeps the new exact set a strict SUPERSET of step2-v2's —
+    a title whose "noise" is actually meaningful (``Doo Wop Freestyle ('99)``:
+    the parenthetical year IS the title) still matches through the old key, so
+    no pre-fix exact match can ever be lost to an over-eager strip.
+    """
+    stripped_track = canonical_base_title(track_title)
+    if stripped_track and canonical_base_title(cand_title) == stripped_track:
+        return True
+    plain_track = plain_base_title(track_title)
+    return bool(plain_track) and plain_base_title(cand_title) == plain_track
 
 
 def duration_matches(catalog_sec: Optional[float], candidate_sec: Optional[float],
@@ -306,6 +326,7 @@ def decide_match(
     """
     track_tokens = extract_version_tokens(title or "")
     stripped_track = canonical_base_title(title or "")
+    plain_track = plain_base_title(title or "")
 
     identity_norms = [TitleNormalizer.normalize(n) for n in (artist_names or []) if n]
     for a in (aliases or []):
@@ -324,11 +345,16 @@ def decide_match(
             continue
         if not TitleNormalizer.normalize(cand.title):
             continue
+        plain_cand = plain_base_title(cand.title)
         stripped_cand = canonical_base_title(cand.title)
-        if stripped_track and stripped_cand == stripped_track:
+        if stripped_track and exact_base_equal(title or "", cand.title):
             kind, sim = "exact", 1.0
-        elif stripped_track and stripped_cand:
-            sim = TitleNormalizer.similarity(stripped_track, stripped_cand)
+            stripped_cand = stripped_track  # collapse into the track-base group
+        elif plain_track and plain_cand:
+            # fuzzy stays on the PLAIN (pre-noise) canonicals — the strip must
+            # widen only the exact path, never pull a longer different title
+            # ("Booty Out the Window") into fuzzy range.
+            sim = TitleNormalizer.similarity(plain_track, plain_cand)
             if sim < TITLE_FUZZY_THRESHOLD:
                 continue
             kind = "fuzzy"
@@ -360,15 +386,11 @@ def decide_match(
     for cand, kind, sim, stripped_cand in plausible:
         groups.setdefault(stripped_cand, []).append((cand, kind, sim))
 
-    plain_track = _strip_version_tokens(TitleNormalizer.normalize(title or ""))
-
     def _representative(entries: List[tuple]) -> tuple:
         def _key(e: tuple):
             cand = e[0]
             agrees = not (extract_version_tokens(cand.title) ^ track_tokens)
-            full_equal = (
-                _strip_version_tokens(TitleNormalizer.normalize(cand.title)) == plain_track
-            )
+            full_equal = plain_base_title(cand.title) == plain_track
             return (agrees, e[1] == "exact", full_equal,
                     bool(cand.synced_lyrics), bool(cand.plain_lyrics))
         return sorted(entries, key=_key, reverse=True)[0]

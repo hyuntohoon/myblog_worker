@@ -415,6 +415,31 @@ class TestNoiseFixesDecideMatch:
         )
         assert out.match_status == "matched"
 
+    def test_meaningful_parenthetical_still_matches_via_plain_key(self):
+        # "('99)" is the title's year qualifier, not noise — the plain-canonical
+        # equality path must keep step2-v2's exact set a subset of the new one
+        out = decide_match(
+            uuid.uuid4(), "Doo Wop Freestyle '99", ["Big L"], None, 86.0,
+            [
+                _cand("Doo Wop Freestyle ('99)", "Big L", 86.3, cid=60),
+                _cand("Doo Wop Freestyle '99", "Big L", 86.0, cid=61),
+            ],
+        )
+        assert out.match_status == "matched"
+
+    def test_noise_strip_must_not_widen_fuzzy(self):
+        # feat-strip must not pull a DIFFERENT song into fuzzy range: old sim
+        # ("out the window" vs "booty out the window feat dvsn") = 0.67 -> drop
+        out = decide_match(
+            uuid.uuid4(), "Out The Window", ["Kehlani"], None, 256.0,
+            [
+                _cand("Out The Window", "Kehlani", 257.0, cid=70),
+                _cand("Booty Out the Window (feat. dvsn)", "Kehlani", 257.0, cid=71),
+            ],
+        )
+        assert out.match_status == "matched"
+        assert out.evidence["lrclib_id"] == 70
+
     def test_rep_prefers_full_title_equal_pick(self):
         # pick stability: the candidate whose unstripped canonical equals the
         # track's wins over a richer noise-variant sibling
