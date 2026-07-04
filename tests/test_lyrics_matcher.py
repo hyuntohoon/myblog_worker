@@ -275,6 +275,22 @@ class TestStripNoise:
         assert _strip_noise("01 - 좋은날") == "좋은날"
         assert canonical_base_title("좋은날 (Feat. 아이유)") == "좋은날"
 
+    def test_non_rendition_dash_suffix_stripped(self):
+        # the Spotify spelling of the same retitle noise (probe regression class)
+        assert _strip_noise('Love Me Like You Do - From "Fifty Shades Of Grey"') == \
+            "Love Me Like You Do"
+        assert _strip_noise("Serve The Servants - 2013 Mix") == "Serve The Servants"
+        assert _strip_noise("And We Vibing - Interlude") == "And We Vibing"
+
+    def test_rendition_dash_suffix_kept(self):
+        assert _strip_noise("Song - Remastered 2011") == "Song - Remastered 2011"
+        assert _strip_noise("Knights of Cydonia - Live") == "Knights of Cydonia - Live"
+
+    def test_hyphenated_words_untouched(self):
+        # no spaces around the hyphen -> not a dash segment
+        assert _strip_noise("Doo-Wop (That Thing)") == "Doo-Wop"  # paren is non-rendition
+        assert _strip_noise("Semi-Charmed Life") == "Semi-Charmed Life"
+
 
 class TestNoiseFixesDecideMatch:
     def test_prefixed_duplicate_collapses_to_matched(self):
@@ -374,6 +390,45 @@ class TestNoiseFixesDecideMatch:
         )
         assert out.match_status == "matched"
         assert out.match_basis == "exact-title"
+
+    def test_dash_suffix_track_matches_parenthetical_candidate(self):
+        # catalog dash-suffix vs candidate parenthetical: both strip to the base
+        out = decide_match(
+            uuid.uuid4(), 'Love Me Like You Do - From "Fifty Shades Of Grey"',
+            ["Ellie Goulding"], None, 252.0,
+            [_cand('Love Me Like You Do (From "Fifty Shades Of Grey")',
+                   "Ellie Goulding", 252.0)],
+        )
+        assert out.match_status == "matched"
+        assert out.match_basis == "exact-title"
+
+    def test_artist_spelling_variants_share_one_group(self):
+        # both candidates pass the identity gate (name + alias); the group key
+        # must not split them into false ambiguity (probe regression class)
+        out = decide_match(
+            uuid.uuid4(), "Blood Sweat & Tears", ["BTS"], ["방탄소년단"], 217.0,
+            [
+                _cand("Blood Sweat & Tears", "BTS", 217.0, cid=1),
+                _cand("Blood Sweat & Tears", "방탄소년단", 217.0, cid=2,
+                      synced="[00:01.00] x"),
+            ],
+        )
+        assert out.match_status == "matched"
+
+    def test_rep_prefers_full_title_equal_pick(self):
+        # pick stability: the candidate whose unstripped canonical equals the
+        # track's wins over a richer noise-variant sibling
+        out = decide_match(
+            uuid.uuid4(), "Trust Me - Dialogue", ["X Artist"], None, 30.0,
+            [
+                _cand("Trust Me", "X Artist", 30.0, cid=50,
+                      synced="[00:01.00] other"),
+                _cand("Trust Me - Dialogue", "X Artist", 30.0, cid=51,
+                      plain="dialogue words"),
+            ],
+        )
+        assert out.match_status == "matched"
+        assert out.evidence["lrclib_id"] == 51
 
 
 # --------------------------------------------------------------------------

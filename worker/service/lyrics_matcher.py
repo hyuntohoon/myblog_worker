@@ -120,14 +120,19 @@ _TRACK_NO_PREFIX_RE = re.compile(r"^\s*\d{1,2}\s*[-–—.]\s+")
 _PAREN_SEGMENT_RE = re.compile(r"\(([^()]*)\)|\[([^\[\]]*)\]")
 
 
+_DASH_SPLIT_RE = re.compile(r"\s+[-–—]\s+")
+
+
 def _strip_noise(raw_title: str) -> str:
     """Strip crowd-data title noise BEFORE normalization.
 
     (1) a leading track-number prefix (``01 - Title``) when text remains after
     it; (2) parenthetical/bracket segments carrying NO version token
-    (``(feat. X)``, ``(From "Movie")``) — rendition parentheticals (``(Live)``)
-    are kept so version-token logic still sees and gates them. Falls back to
-    the original title if stripping would leave nothing.
+    (``(feat. X)``, ``(From "Movie")``); (3) trailing dash segments carrying NO
+    version token (``Song - From "Movie"``, ``Song - 2013 Mix`` — the Spotify
+    spelling of the same retitle noise). Rendition segments (``(Live)``,
+    ``- Remastered 2011``) are kept so version-token logic still sees and gates
+    them. Falls back to the original title if stripping would leave nothing.
     """
     if not raw_title:
         return raw_title
@@ -138,6 +143,12 @@ def _strip_noise(raw_title: str) -> str:
         return m.group(0) if extract_version_tokens(inner or "") else " "
 
     out = _PAREN_SEGMENT_RE.sub(_drop_non_rendition, out)
+
+    parts = _DASH_SPLIT_RE.split(out)
+    if len(parts) > 1:
+        kept = [parts[0]] + [p for p in parts[1:] if extract_version_tokens(p)]
+        out = " - ".join(p for p in kept if p.strip())
+
     out = " ".join(out.split())
     return out if out else raw_title
 
@@ -335,22 +346,31 @@ def decide_match(
         )
 
     # Collapse near-duplicate rows for the SAME song (LRCLIB carries many
-    # same-track uploads at slightly different durations) — group by artist +
-    # noise-stripped base title. Genuine ambiguity (two distinct base titles /
-    # artists) survives as multiple groups. The representative prefers a
-    # version-AGREEING candidate, then an exact-kind title, then the richest
-    # lyric (FIX-lyrics-matcher-noise: lyric richness is the tiebreak, not the
-    # criterion — a richer Live upload must not shadow the plain sibling).
-    groups: Dict[tuple, List[tuple]] = {}
+    # same-track uploads at slightly different durations) — group by the
+    # noise-stripped base title ONLY: every plausible candidate already passed
+    # the artist-identity gate for THIS track, so an artist component in the
+    # key would split mere spelling/alias variants (``IU`` vs ``아이유``) into
+    # false ambiguity. Genuine ambiguity (two distinct base titles) survives
+    # as multiple groups. The representative prefers a version-AGREEING
+    # candidate, then an exact-kind title, then a candidate whose UNSTRIPPED
+    # canonical title equals the track's (pick stability for pre-fix matches),
+    # then the richest lyric (FIX-lyrics-matcher-noise: richness is the
+    # tiebreak, not the criterion).
+    groups: Dict[str, List[tuple]] = {}
     for cand, kind, sim, stripped_cand in plausible:
-        key = (TitleNormalizer.normalize(cand.artist), stripped_cand)
-        groups.setdefault(key, []).append((cand, kind, sim))
+        groups.setdefault(stripped_cand, []).append((cand, kind, sim))
+
+    plain_track = _strip_version_tokens(TitleNormalizer.normalize(title or ""))
 
     def _representative(entries: List[tuple]) -> tuple:
         def _key(e: tuple):
             cand = e[0]
             agrees = not (extract_version_tokens(cand.title) ^ track_tokens)
-            return (agrees, e[1] == "exact", bool(cand.synced_lyrics), bool(cand.plain_lyrics))
+            full_equal = (
+                _strip_version_tokens(TitleNormalizer.normalize(cand.title)) == plain_track
+            )
+            return (agrees, e[1] == "exact", full_equal,
+                    bool(cand.synced_lyrics), bool(cand.plain_lyrics))
         return sorted(entries, key=_key, reverse=True)[0]
 
     reps = [_representative(g) for g in groups.values()]
