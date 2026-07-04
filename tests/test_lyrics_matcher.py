@@ -26,6 +26,8 @@ from worker.service.lyrics_matcher import (
     TitleNormalizer,
     _evidence_json,
     _lyric_plain_for,
+    _strip_noise,
+    canonical_base_title,
     decide_match,
     extract_version_tokens,
 )
@@ -241,6 +243,220 @@ class TestDecideMatch:
 
 
 # --------------------------------------------------------------------------
+# FIX-lyrics-matcher-noise: crowd-noise stripping + version-agreeing rep
+# --------------------------------------------------------------------------
+class TestStripNoise:
+    def test_track_number_prefix_stripped(self):
+        assert _strip_noise("01 - Come Back to Earth") == "Come Back to Earth"
+        assert _strip_noise("7. Interlude") == "Interlude"
+
+    def test_numeric_titles_untouched(self):
+        # no separator+space -> not a track-number prefix
+        assert _strip_noise("1999") == "1999"
+        assert _strip_noise("7 rings") == "7 rings"
+        assert _strip_noise("1-800-273-8255") == "1-800-273-8255"
+
+    def test_prefix_only_title_falls_back(self):
+        assert _strip_noise("01 - ") == "01 - "
+
+    def test_non_rendition_parenthetical_dropped(self):
+        assert _strip_noise("Boyz (feat. Ari)") == "Boyz"
+        assert _strip_noise('Song (From "Movie")') == "Song"
+        assert _strip_noise("Song [Explicit]") == "Song"
+
+    def test_rendition_parenthetical_kept(self):
+        assert _strip_noise("Crazy (Live)") == "Crazy (Live)"
+        assert _strip_noise("Song (Remastered 2019)") == "Song (Remastered 2019)"
+
+    def test_parenthetical_only_title_falls_back(self):
+        assert _strip_noise("(Untitled)") == "(Untitled)"
+
+    def test_korean_prefix_and_feat(self):
+        assert _strip_noise("01 - 좋은날") == "좋은날"
+        assert canonical_base_title("좋은날 (Feat. 아이유)") == "좋은날"
+
+    def test_non_rendition_dash_suffix_stripped(self):
+        # the Spotify spelling of the same retitle noise (probe regression class)
+        assert _strip_noise('Love Me Like You Do - From "Fifty Shades Of Grey"') == \
+            "Love Me Like You Do"
+        assert _strip_noise("Serve The Servants - 2013 Mix") == "Serve The Servants"
+        assert _strip_noise("And We Vibing - Interlude") == "And We Vibing"
+
+    def test_rendition_dash_suffix_kept(self):
+        assert _strip_noise("Song - Remastered 2011") == "Song - Remastered 2011"
+        assert _strip_noise("Knights of Cydonia - Live") == "Knights of Cydonia - Live"
+
+    def test_hyphenated_words_untouched(self):
+        # no spaces around the hyphen -> not a dash segment
+        assert _strip_noise("Doo-Wop (That Thing)") == "Doo-Wop"  # paren is non-rendition
+        assert _strip_noise("Semi-Charmed Life") == "Semi-Charmed Life"
+
+
+class TestNoiseFixesDecideMatch:
+    def test_prefixed_duplicate_collapses_to_matched(self):
+        # was: two groups ("01 come back to earth" vs base) -> false ambiguous
+        out = decide_match(
+            uuid.uuid4(), "Come Back to Earth", ["Mac Miller"], None, 161.0,
+            [
+                _cand("Come Back to Earth", "Mac Miller", 161.0, cid=1),
+                _cand("01 - Come Back to Earth", "Mac Miller", 161.0, cid=2),
+            ],
+        )
+        assert out.match_status == "matched"
+        assert out.match_basis == "exact-title"
+
+    def test_prefix_only_candidate_matches_exact(self):
+        # was: fuzzy -> review_required / title_fuzzy_only
+        out = decide_match(
+            uuid.uuid4(), "Come Back to Earth", ["Mac Miller"], None, 161.0,
+            [_cand("01 - Come Back to Earth", "Mac Miller", 161.0)],
+        )
+        assert out.match_status == "matched"
+        assert out.match_basis == "exact-title"
+        assert out.evidence["title_noise_stripped"] == ["candidate"]
+
+    def test_parenthetical_retitle_collapses_to_matched(self):
+        out = decide_match(
+            uuid.uuid4(), "Song", ["X Artist"], None, 200.0,
+            [
+                _cand("Song", "X Artist", 200.0, cid=1),
+                _cand('Song (From "Movie")', "X Artist", 200.0, cid=2),
+            ],
+        )
+        assert out.match_status == "matched"
+
+    def test_feat_credit_symmetric_both_directions(self):
+        # catalog carries the feat credit, candidate is plain
+        out = decide_match(
+            uuid.uuid4(), "Boyz (feat. Ari)", ["X Artist"], None, 200.0,
+            [_cand("Boyz", "X Artist", 200.0)],
+        )
+        assert out.match_status == "matched"
+        assert out.evidence["title_noise_stripped"] == ["track"]
+        # candidate carries the feat credit, catalog is plain
+        out = decide_match(
+            uuid.uuid4(), "Boyz", ["X Artist"], None, 200.0,
+            [_cand("Boyz (feat. Ari)", "X Artist", 200.0)],
+        )
+        assert out.match_status == "matched"
+        assert out.evidence["title_noise_stripped"] == ["candidate"]
+
+    def test_rendition_mismatch_still_parks(self):
+        # regression guard: (Live) is NOT noise — version gate unchanged
+        out = decide_match(
+            uuid.uuid4(), "Crazy", ["Gnarls Barkley"], None, 180.0,
+            [_cand("Crazy (Live)", "Gnarls Barkley", 180.0)],
+        )
+        assert out.match_status == "review_required"
+        assert out.evidence["reason"] == "version_token_mismatch"
+
+    def test_version_agreeing_rep_beats_richer_mismatched(self):
+        # was: _richest elected the synced Live upload -> version_token_mismatch
+        out = decide_match(
+            uuid.uuid4(), "Crazy", ["Gnarls Barkley"], None, 180.0,
+            [
+                _cand("Crazy", "Gnarls Barkley", 180.0, cid=1, plain="plain words"),
+                _cand("Crazy (Live)", "Gnarls Barkley", 180.0, cid=2,
+                      plain="live words", synced="[00:00]live"),
+            ],
+        )
+        assert out.match_status == "matched"
+        assert out.version_agrees is True
+        assert out.lyric_plain == "plain words"
+
+    def test_genuine_ambiguity_still_parks(self):
+        # de-noising must not merge two DISTINCT base titles
+        out = decide_match(
+            uuid.uuid4(), "Crazy Love", ["X Artist"], None, 200.0,
+            [
+                _cand("Crazy Love", "X Artist", 200.0, cid=1),
+                _cand("Crazy Love II", "X Artist", 200.0, cid=2),
+            ],
+        )
+        assert out.match_status == "ambiguous"
+
+    def test_clean_match_has_no_noise_marker(self):
+        out = decide_match(
+            uuid.uuid4(), "Let It Be", ["The Beatles"], None, 243.0,
+            [_cand("Let It Be", "The Beatles", 243.0)],
+        )
+        assert out.match_status == "matched"
+        assert "title_noise_stripped" not in out.evidence
+
+    def test_korean_prefixed_candidate_matches(self):
+        out = decide_match(
+            uuid.uuid4(), "좋은날", ["IU"], None, 267.0,
+            [_cand("01 - 좋은날", "IU", 267.0)],
+        )
+        assert out.match_status == "matched"
+        assert out.match_basis == "exact-title"
+
+    def test_dash_suffix_track_matches_parenthetical_candidate(self):
+        # catalog dash-suffix vs candidate parenthetical: both strip to the base
+        out = decide_match(
+            uuid.uuid4(), 'Love Me Like You Do - From "Fifty Shades Of Grey"',
+            ["Ellie Goulding"], None, 252.0,
+            [_cand('Love Me Like You Do (From "Fifty Shades Of Grey")',
+                   "Ellie Goulding", 252.0)],
+        )
+        assert out.match_status == "matched"
+        assert out.match_basis == "exact-title"
+
+    def test_artist_spelling_variants_share_one_group(self):
+        # both candidates pass the identity gate (name + alias); the group key
+        # must not split them into false ambiguity (probe regression class)
+        out = decide_match(
+            uuid.uuid4(), "Blood Sweat & Tears", ["BTS"], ["방탄소년단"], 217.0,
+            [
+                _cand("Blood Sweat & Tears", "BTS", 217.0, cid=1),
+                _cand("Blood Sweat & Tears", "방탄소년단", 217.0, cid=2,
+                      synced="[00:01.00] x"),
+            ],
+        )
+        assert out.match_status == "matched"
+
+    def test_meaningful_parenthetical_still_matches_via_plain_key(self):
+        # "('99)" is the title's year qualifier, not noise — the plain-canonical
+        # equality path must keep step2-v2's exact set a subset of the new one
+        out = decide_match(
+            uuid.uuid4(), "Doo Wop Freestyle '99", ["Big L"], None, 86.0,
+            [
+                _cand("Doo Wop Freestyle ('99)", "Big L", 86.3, cid=60),
+                _cand("Doo Wop Freestyle '99", "Big L", 86.0, cid=61),
+            ],
+        )
+        assert out.match_status == "matched"
+
+    def test_noise_strip_must_not_widen_fuzzy(self):
+        # feat-strip must not pull a DIFFERENT song into fuzzy range: old sim
+        # ("out the window" vs "booty out the window feat dvsn") = 0.67 -> drop
+        out = decide_match(
+            uuid.uuid4(), "Out The Window", ["Kehlani"], None, 256.0,
+            [
+                _cand("Out The Window", "Kehlani", 257.0, cid=70),
+                _cand("Booty Out the Window (feat. dvsn)", "Kehlani", 257.0, cid=71),
+            ],
+        )
+        assert out.match_status == "matched"
+        assert out.evidence["lrclib_id"] == 70
+
+    def test_rep_prefers_full_title_equal_pick(self):
+        # pick stability: the candidate whose unstripped canonical equals the
+        # track's wins over a richer noise-variant sibling
+        out = decide_match(
+            uuid.uuid4(), "Trust Me - Dialogue", ["X Artist"], None, 30.0,
+            [
+                _cand("Trust Me", "X Artist", 30.0, cid=50,
+                      synced="[00:01.00] other"),
+                _cand("Trust Me - Dialogue", "X Artist", 30.0, cid=51,
+                      plain="dialogue words"),
+            ],
+        )
+        assert out.match_status == "matched"
+        assert out.evidence["lrclib_id"] == 51
+
+
+# --------------------------------------------------------------------------
 # Candidate adapters
 # --------------------------------------------------------------------------
 class TestCandidateAdapters:
@@ -268,7 +484,7 @@ class TestCandidateAdapters:
 class TestMatchOutcomeDefaults:
     def test_matcher_version(self):
         out = MatchOutcome(track_id=uuid.uuid4(), match_status="matched", evidence={})
-        assert out.matcher_version == "step2-v2"
+        assert out.matcher_version == "step3-v1"
 
 
 # --------------------------------------------------------------------------

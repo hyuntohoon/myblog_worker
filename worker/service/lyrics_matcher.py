@@ -38,7 +38,7 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
-MATCHER_VERSION = "step2-v2"
+MATCHER_VERSION = "step3-v1"
 
 # Duration tolerance. LRCLIB's own /api/get docs gate on +/-2s; we mirror it.
 DURATION_TOLERANCE_SEC = 2.0
@@ -111,6 +111,76 @@ def _strip_version_tokens(norm_title: str) -> str:
     return " ".join(
         w for w in re.split(r"[\s'\-]+", norm_title) if w and w not in _VERSION_TOKENS
     )
+
+
+# Crowd-data title noise (FIX-lyrics-matcher-noise). A leading track-number
+# prefix requires digits + separator + whitespace so genuine numeric titles
+# ("1999", "7 rings", "1-800-273-8255") are never touched.
+_TRACK_NO_PREFIX_RE = re.compile(r"^\s*\d{1,2}\s*[-–—.]\s+")
+_PAREN_SEGMENT_RE = re.compile(r"\(([^()]*)\)|\[([^\[\]]*)\]")
+
+
+_DASH_SPLIT_RE = re.compile(r"\s+[-–—]\s+")
+
+
+def _strip_noise(raw_title: str) -> str:
+    """Strip crowd-data title noise BEFORE normalization.
+
+    (1) a leading track-number prefix (``01 - Title``) when text remains after
+    it; (2) parenthetical/bracket segments carrying NO version token
+    (``(feat. X)``, ``(From "Movie")``); (3) trailing dash segments carrying NO
+    version token (``Song - From "Movie"``, ``Song - 2013 Mix`` — the Spotify
+    spelling of the same retitle noise). Rendition segments (``(Live)``,
+    ``- Remastered 2011``) are kept so version-token logic still sees and gates
+    them. Falls back to the original title if stripping would leave nothing.
+    """
+    if not raw_title:
+        return raw_title
+    out = _TRACK_NO_PREFIX_RE.sub("", raw_title, count=1)
+
+    def _drop_non_rendition(m: "re.Match[str]") -> str:
+        inner = m.group(1) if m.group(1) is not None else m.group(2)
+        return m.group(0) if extract_version_tokens(inner or "") else " "
+
+    out = _PAREN_SEGMENT_RE.sub(_drop_non_rendition, out)
+
+    parts = _DASH_SPLIT_RE.split(out)
+    if len(parts) > 1:
+        kept = [parts[0]] + [p for p in parts[1:] if extract_version_tokens(p)]
+        out = " - ".join(p for p in kept if p.strip())
+
+    out = " ".join(out.split())
+    return out if out else raw_title
+
+
+def canonical_base_title(raw_title: str) -> str:
+    """Noise-stripped, normalized, version-token-free base title.
+
+    The comparison/grouping key for both ``decide_match`` and the best-of
+    tier-1 gate — applied symmetrically to catalog and candidate titles
+    (FIX-lyrics-matcher-noise OQ1/OQ2).
+    """
+    return _strip_version_tokens(TitleNormalizer.normalize(_strip_noise(raw_title or "")))
+
+
+def plain_base_title(raw_title: str) -> str:
+    """Pre-noise-fix canonical (normalize + version strip only) — the step2-v2 key."""
+    return _strip_version_tokens(TitleNormalizer.normalize(raw_title or ""))
+
+
+def exact_base_equal(track_title: str, cand_title: str) -> bool:
+    """Exact base-title equality: noise-stripped OR plain canonical equality.
+
+    The plain path keeps the new exact set a strict SUPERSET of step2-v2's —
+    a title whose "noise" is actually meaningful (``Doo Wop Freestyle ('99)``:
+    the parenthetical year IS the title) still matches through the old key, so
+    no pre-fix exact match can ever be lost to an over-eager strip.
+    """
+    stripped_track = canonical_base_title(track_title)
+    if stripped_track and canonical_base_title(cand_title) == stripped_track:
+        return True
+    plain_track = plain_base_title(track_title)
+    return bool(plain_track) and plain_base_title(cand_title) == plain_track
 
 
 def duration_matches(catalog_sec: Optional[float], candidate_sec: Optional[float],
@@ -255,8 +325,8 @@ def decide_match(
     ambiguous / review_required.
     """
     track_tokens = extract_version_tokens(title or "")
-    norm_track_title = TitleNormalizer.normalize(title or "")
-    stripped_track = _strip_version_tokens(norm_track_title)
+    stripped_track = canonical_base_title(title or "")
+    plain_track = plain_base_title(title or "")
 
     identity_norms = [TitleNormalizer.normalize(n) for n in (artist_names or []) if n]
     for a in (aliases or []):
@@ -273,14 +343,18 @@ def decide_match(
     for cand in candidates:
         if not _artist_identity_ok(TitleNormalizer.normalize(cand.artist), identity_norms):
             continue
-        cand_title_norm = TitleNormalizer.normalize(cand.title)
-        if not cand_title_norm:
+        if not TitleNormalizer.normalize(cand.title):
             continue
-        stripped_cand = _strip_version_tokens(cand_title_norm)
-        if stripped_track and stripped_cand == stripped_track:
+        plain_cand = plain_base_title(cand.title)
+        stripped_cand = canonical_base_title(cand.title)
+        if stripped_track and exact_base_equal(title or "", cand.title):
             kind, sim = "exact", 1.0
-        elif stripped_track and stripped_cand:
-            sim = TitleNormalizer.similarity(stripped_track, stripped_cand)
+            stripped_cand = stripped_track  # collapse into the track-base group
+        elif plain_track and plain_cand:
+            # fuzzy stays on the PLAIN (pre-noise) canonicals — the strip must
+            # widen only the exact path, never pull a longer different title
+            # ("Booty Out the Window") into fuzzy range.
+            sim = TitleNormalizer.similarity(plain_track, plain_cand)
             if sim < TITLE_FUZZY_THRESHOLD:
                 continue
             kind = "fuzzy"
@@ -298,22 +372,30 @@ def decide_match(
         )
 
     # Collapse near-duplicate rows for the SAME song (LRCLIB carries many
-    # same-track uploads at slightly different durations) — group by artist +
-    # base title, pick the richest-lyric representative. Genuine ambiguity (two
-    # distinct base titles / artists) survives as multiple groups.
-    groups: Dict[tuple, List[tuple]] = {}
+    # same-track uploads at slightly different durations) — group by the
+    # noise-stripped base title ONLY: every plausible candidate already passed
+    # the artist-identity gate for THIS track, so an artist component in the
+    # key would split mere spelling/alias variants (``IU`` vs ``아이유``) into
+    # false ambiguity. Genuine ambiguity (two distinct base titles) survives
+    # as multiple groups. The representative prefers a version-AGREEING
+    # candidate, then an exact-kind title, then a candidate whose UNSTRIPPED
+    # canonical title equals the track's (pick stability for pre-fix matches),
+    # then the richest lyric (FIX-lyrics-matcher-noise: richness is the
+    # tiebreak, not the criterion).
+    groups: Dict[str, List[tuple]] = {}
     for cand, kind, sim, stripped_cand in plausible:
-        key = (TitleNormalizer.normalize(cand.artist), stripped_cand)
-        groups.setdefault(key, []).append((cand, kind, sim))
+        groups.setdefault(stripped_cand, []).append((cand, kind, sim))
 
-    def _richest(entries: List[tuple]) -> tuple:
-        return sorted(
-            entries,
-            key=lambda e: (bool(e[0].synced_lyrics), bool(e[0].plain_lyrics)),
-            reverse=True,
-        )[0]
+    def _representative(entries: List[tuple]) -> tuple:
+        def _key(e: tuple):
+            cand = e[0]
+            agrees = not (extract_version_tokens(cand.title) ^ track_tokens)
+            full_equal = plain_base_title(cand.title) == plain_track
+            return (agrees, e[1] == "exact", full_equal,
+                    bool(cand.synced_lyrics), bool(cand.plain_lyrics))
+        return sorted(entries, key=_key, reverse=True)[0]
 
-    reps = [_richest(g) for g in groups.values()]
+    reps = [_representative(g) for g in groups.values()]
 
     if len(reps) > 1:
         previews = [
@@ -378,15 +460,22 @@ def decide_match(
             version_agrees=True,
         )
 
+    matched_ev = {
+        "lrclib_id": cand.id,
+        "lrclib_artist": cand.artist,
+        "lrclib_title": cand.title,
+        "lrclib_album": cand.album,
+        "lrclib_duration_sec": cand.duration_sec,
+    }
+    noise_stripped = [
+        side for side, raw in (("track", title or ""), ("candidate", cand.title))
+        if _strip_noise(raw) != raw
+    ]
+    if noise_stripped:
+        matched_ev["title_noise_stripped"] = noise_stripped
     return _build(
         track_id, STATUS_MATCHED,
-        {
-            "lrclib_id": cand.id,
-            "lrclib_artist": cand.artist,
-            "lrclib_title": cand.title,
-            "lrclib_album": cand.album,
-            "lrclib_duration_sec": cand.duration_sec,
-        },
+        matched_ev,
         lyric_plain=cand.plain_lyrics,
         lyric_synced=cand.synced_lyrics,
         match_basis="exact-title",

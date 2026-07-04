@@ -19,7 +19,6 @@ from worker.service.lyrics_matcher import (
 )
 from worker.service.lyrics_promote import (
     BASIS_BEST_OF_AMBIGUOUS,
-    BASIS_BEST_OF_REVIEW,
     BEST_OF_VERSION,
     CRITERION_TIER1,
     promote_best,
@@ -54,23 +53,33 @@ def _promote(outcome, title, candidates, artists=None, duration=161.0):
 
 
 # --------------------------------------------------------------------------
-# The canonical duplicate-noise case from the RFC
+# The canonical duplicate-noise case from the best-of RFC — now resolved AT
+# SOURCE by FIX-lyrics-matcher-noise (prefix/parenthetical strip collapses the
+# trio into one group). Promotion mechanics are exercised with a shape that
+# STILL parks: genuine fuzzy sibling ambiguity around an exact group.
 # --------------------------------------------------------------------------
 class TestComeBackToEarth:
-    CANDIDATES = [
+    NOISE_TRIO = [
         _cand("Come Back to Earth", duration=162.0, cid=10),
         _cand("Come Back to Earth (Paused)", duration=161.84, cid=11),
         _cand("01 - Come Back to Earth", duration=162.0, cid=12),
     ]
+    # An exact group + a genuinely distinct fuzzy base title -> still ambiguous.
+    STILL_AMBIGUOUS = [
+        _cand("Come Back to Earth", duration=162.0, cid=10),
+        _cand("Come Back to Earth II", duration=161.5, cid=13),
+    ]
 
-    def test_parked_ambiguous_by_conservative_matcher(self):
-        outcome = _decide("Come Back to Earth", self.CANDIDATES)
-        assert outcome.match_status == STATUS_AMBIGUOUS
-        assert outcome.evidence["reason"] == "multiple_plausible"
+    def test_noise_trio_resolves_at_source(self):
+        # was: 3 groups -> ambiguous; FIX-lyrics-matcher-noise collapses to 1
+        outcome = _decide("Come Back to Earth", self.NOISE_TRIO)
+        assert outcome.match_status == STATUS_MATCHED
+        assert outcome.match_basis == "exact-title"
 
     def test_promotes_the_clean_title(self):
-        outcome = _decide("Come Back to Earth", self.CANDIDATES)
-        promoted = _promote(outcome, "Come Back to Earth", self.CANDIDATES)
+        outcome = _decide("Come Back to Earth", self.STILL_AMBIGUOUS)
+        assert outcome.match_status == STATUS_AMBIGUOUS
+        promoted = _promote(outcome, "Come Back to Earth", self.STILL_AMBIGUOUS)
         assert promoted.match_status == STATUS_MATCHED
         assert promoted.match_basis == BASIS_BEST_OF_AMBIGUOUS
         assert promoted.evidence["promotion"]["chosen"]["title"] == "Come Back to Earth"
@@ -80,14 +89,14 @@ class TestComeBackToEarth:
         assert promoted.lyric_plain == "la la"
 
     def test_original_evidence_preserved(self):
-        outcome = _decide("Come Back to Earth", self.CANDIDATES)
-        promoted = _promote(outcome, "Come Back to Earth", self.CANDIDATES)
+        outcome = _decide("Come Back to Earth", self.STILL_AMBIGUOUS)
+        promoted = _promote(outcome, "Come Back to Earth", self.STILL_AMBIGUOUS)
         assert promoted.evidence["reason"] == "multiple_plausible"
-        assert len(promoted.evidence["candidates"]) == 3
+        assert len(promoted.evidence["candidates"]) == 2
 
     def test_matcher_version_tagged(self):
-        outcome = _decide("Come Back to Earth", self.CANDIDATES)
-        promoted = _promote(outcome, "Come Back to Earth", self.CANDIDATES)
+        outcome = _decide("Come Back to Earth", self.STILL_AMBIGUOUS)
+        promoted = _promote(outcome, "Come Back to Earth", self.STILL_AMBIGUOUS)
         assert promoted.matcher_version.endswith(f"+{BEST_OF_VERSION}")
 
 
@@ -114,31 +123,33 @@ class TestPassThrough:
 
 
 # --------------------------------------------------------------------------
-# review_required promotion via a version-agreeing sibling
+# version-agreeing sibling — now elected AT SOURCE by the representative fix
+# (FIX-lyrics-matcher-noise: _richest -> version-agreeing preference)
 # --------------------------------------------------------------------------
 class TestReviewSibling:
-    # decide_match groups both under base "song" and picks the richest (synced)
-    # representative — the Live one — which fails the version gate. The clean
-    # sibling agrees on version and is the tier-1 pick.
+    # Both group under base "song"; the old _richest elected the synced Live
+    # upload -> version_token_mismatch parked review_required. The rep now
+    # prefers the version-AGREEING clean sibling -> matched at source.
     CANDIDATES = [
         _cand("Song", artist="Adele", duration=200.0, plain="hello", cid=20),
         _cand("Song (Live)", artist="Adele", duration=200.5, plain="hello",
               synced="[00:01.00] hello", cid=21),
     ]
 
-    def test_parked_review_by_conservative_matcher(self):
+    def test_agreeing_sibling_resolves_at_source(self):
         outcome = _decide("Song", self.CANDIDATES, artists=["Adele"], duration=200.0)
-        assert outcome.match_status == STATUS_REVIEW_REQUIRED
-        assert outcome.evidence["reason"] == "version_token_mismatch"
+        assert outcome.match_status == STATUS_MATCHED
+        assert outcome.match_basis == "exact-title"
+        assert outcome.version_agrees is True
+        assert outcome.evidence["lrclib_id"] == 20
+        assert outcome.lyric_plain == "hello"
 
-    def test_promotes_the_agreeing_sibling(self):
+    def test_source_resolved_outcome_passes_through_promotion(self):
+        # differential guarantee holds for the newly source-resolved shape
         outcome = _decide("Song", self.CANDIDATES, artists=["Adele"], duration=200.0)
         promoted = _promote(outcome, "Song", self.CANDIDATES,
                             artists=["Adele"], duration=200.0)
-        assert promoted.match_status == STATUS_MATCHED
-        assert promoted.match_basis == BASIS_BEST_OF_REVIEW
-        assert promoted.evidence["promotion"]["chosen"]["lrclib_id"] == 20
-        assert promoted.version_agrees is True
+        assert promoted is outcome
 
     def test_version_disagreeing_only_candidate_stays_parked(self):
         # Only a (Remix) candidate exists: same base title, but tier 1 requires
@@ -204,10 +215,23 @@ class TestBodyFilter:
 # Tiebreak: richest lyric among tier-1 duplicates
 # --------------------------------------------------------------------------
 class TestRichestTiebreak:
-    def test_synced_beats_plain(self):
+    def test_synced_beats_plain_at_source(self):
+        # same-group duplicates now resolve at source; richest is the tiebreak
         cands = [
             _cand("Come Back to Earth", plain="la la", cid=40),
             _cand("Come Back to Earth (Paused)", plain="la la", cid=41),
+            _cand("Come Back to Earth", plain="la la",
+                  synced="[00:01.00] la la", cid=42),
+        ]
+        outcome = _decide("Come Back to Earth", cands)
+        assert outcome.match_status == STATUS_MATCHED
+        assert outcome.lyric_synced == "[00:01.00] la la"
+
+    def test_synced_beats_plain_in_promotion(self):
+        # still-ambiguous shape (fuzzy distinct base) -> tier-1 tiebreak in promote
+        cands = [
+            _cand("Come Back to Earth", plain="la la", cid=40),
+            _cand("Come Back to Earth II", plain="la la", cid=41),
             _cand("Come Back to Earth", plain="la la",
                   synced="[00:01.00] la la", cid=42),
         ]

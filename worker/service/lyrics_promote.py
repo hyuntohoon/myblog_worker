@@ -31,9 +31,11 @@ from worker.service.lyrics_matcher import (
     MatchOutcome,
     TitleNormalizer,
     _artist_identity_ok,
-    _strip_version_tokens,
+    canonical_base_title,
     duration_matches,
+    exact_base_equal,
     extract_version_tokens,
+    plain_base_title,
 )
 
 BEST_OF_VERSION = "best-of-v1"
@@ -61,8 +63,8 @@ def _plausible(
     duration tolerance — promotion never considers a candidate the conservative
     matcher would have dropped outright.
     """
-    norm_track_title = TitleNormalizer.normalize(title or "")
-    stripped_track = _strip_version_tokens(norm_track_title)
+    stripped_track = canonical_base_title(title or "")
+    plain_track = plain_base_title(title or "")
     if not stripped_track:
         return []
 
@@ -75,16 +77,16 @@ def _plausible(
     for cand in candidates:
         if not _artist_identity_ok(TitleNormalizer.normalize(cand.artist), identity_norms):
             continue
-        cand_title_norm = TitleNormalizer.normalize(cand.title)
-        if not cand_title_norm:
+        if not TitleNormalizer.normalize(cand.title):
             continue
-        stripped_cand = _strip_version_tokens(cand_title_norm)
-        if not stripped_cand:
+        plain_cand = plain_base_title(cand.title)
+        if not plain_cand:
             continue
-        if stripped_cand != stripped_track:
+        if not exact_base_equal(title or "", cand.title):
             # fuzzy candidates stay in the plausible pool (they inform the
-            # body-filter classification) but can never win tier 1.
-            if TitleNormalizer.similarity(stripped_track, stripped_cand) < 0.80:
+            # body-filter classification) but can never win tier 1 — gated on
+            # the PLAIN canonicals, mirroring decide_match.
+            if not plain_track or TitleNormalizer.similarity(plain_track, plain_cand) < 0.80:
                 continue
         if not duration_matches(duration_sec, cand.duration_sec):
             continue
@@ -156,10 +158,9 @@ def promote_best(
     # Tier 1: exact stripped-base-title + version-token agreement (duration
     # already gated in _plausible). The only tier live in v1.
     track_tokens = extract_version_tokens(title or "")
-    stripped_track = _strip_version_tokens(TitleNormalizer.normalize(title or ""))
     tier1 = [
         c for c in with_body
-        if _strip_version_tokens(TitleNormalizer.normalize(c.title)) == stripped_track
+        if exact_base_equal(title or "", c.title)
         and len(track_tokens ^ extract_version_tokens(c.title)) == 0
     ]
     if not tier1:

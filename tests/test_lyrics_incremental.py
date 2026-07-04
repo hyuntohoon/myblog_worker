@@ -29,7 +29,6 @@ from worker.service.lyrics_matcher import (
 )
 from worker.service.lyrics_promote import (
     BASIS_BEST_OF_AMBIGUOUS,
-    BASIS_BEST_OF_REVIEW,
 )
 
 
@@ -204,10 +203,10 @@ def test_owned_client_is_closed():
 # (FEAT-lyrics-best-of-promotion Step 2 — promote_best runs after decide_match)
 # --------------------------------------------------------------------------
 def _dup_noise_candidates():
-    """The RFC's canonical duplicate-noise shape (Come Back to Earth): three
-    same-recording uploads whose base titles differ only by a track-number prefix /
-    a non-rendition parenthetical -> decide_match parks ambiguous; tier 1 promotes
-    the clean title."""
+    """The best-of RFC's canonical duplicate-noise shape (Come Back to Earth):
+    three same-recording uploads whose base titles differ only by a track-number
+    prefix / a non-rendition parenthetical. Since FIX-lyrics-matcher-noise these
+    collapse into ONE group and resolve `matched` at source (no promotion)."""
     def c(title, cid, duration=162.0, plain="la la", synced=None):
         return Candidate(
             id=cid, title=title, artist="Mac Miller", album=None,
@@ -221,6 +220,22 @@ def _dup_noise_candidates():
     ]
 
 
+def _still_ambiguous_candidates():
+    """A shape that still parks post-noise-fix: an exact group plus a genuinely
+    distinct fuzzy base title -> multiple_plausible; tier 1 promotes the exact
+    group's pick."""
+    def c(title, cid, duration=162.0, plain="la la", synced=None):
+        return Candidate(
+            id=cid, title=title, artist="Mac Miller", album=None,
+            duration_sec=duration, instrumental=False,
+            plain_lyrics=plain, synced_lyrics=synced,
+        )
+    return [
+        c("Come Back to Earth", cid=10, synced="[00:01.00] la la"),
+        c("Come Back to Earth II", cid=13, duration=161.5),
+    ]
+
+
 def _mac_miller_row():
     return {
         "id": uuid.uuid4(),
@@ -231,8 +246,27 @@ def _mac_miller_row():
     }
 
 
-def test_ambiguous_candidates_promote_to_best_of_matched():
+def test_noise_trio_resolves_at_source_in_loop():
+    # FIX-lyrics-matcher-noise: the duplicate-noise trio no longer parks at all —
+    # decide_match resolves it as a genuine exact-title match, promotion untouched.
     client = _FakeClient(result=_dup_noise_candidates())
+    svc, session = _service(client, [_mac_miller_row()])
+    metrics = svc.collect()
+    assert metrics["evaluated"] == 1
+    assert metrics[STATUS_MATCHED] == 1
+    assert metrics["ambiguous"] == 0
+    assert metrics["promoted_ambiguous"] == 0   # nothing left to promote
+    assert metrics["consistency_errors"] == 0
+    params = session.execute.call_args[0][1]
+    assert params["match_status"] == STATUS_MATCHED
+    evidence = json.loads(params["evidence"])
+    assert evidence["match_basis"] == "exact-title"
+    assert params["matcher_version"] == "step3-v1"  # no +best-of suffix
+    assert params["lyric_synced"] == "[00:01.00] la la"  # richest agreeing rep
+
+
+def test_ambiguous_candidates_promote_to_best_of_matched():
+    client = _FakeClient(result=_still_ambiguous_candidates())
     svc, session = _service(client, [_mac_miller_row()])
     metrics = svc.collect()
     # promoted row is written as matched (one row, per-row commit)
@@ -255,9 +289,10 @@ def test_ambiguous_candidates_promote_to_best_of_matched():
     assert params["lyric_synced"] == "[00:01.00] la la"  # richest (synced) tier-1 pick
 
 
-def test_review_sibling_promotes_to_best_of_review():
-    # decide_match picks the richest (synced Live) representative -> version mismatch
-    # parks review_required; the clean sibling agrees on version and is the tier-1 pick.
+def test_review_sibling_resolves_at_source():
+    # FIX-lyrics-matcher-noise: the representative now prefers the version-AGREEING
+    # clean sibling over the richer Live upload -> matched at source, no promotion
+    # (was: _richest elected the Live one -> version_token_mismatch -> best-of-review).
     cands = [
         Candidate(id=20, title="Song", artist="Adele", album=None, duration_sec=200.0,
                   instrumental=False, plain_lyrics="hello", synced_lyrics=None),
@@ -271,12 +306,12 @@ def test_review_sibling_promotes_to_best_of_review():
     svc, session = _service(client, [row])
     metrics = svc.collect()
     assert metrics[STATUS_MATCHED] == 1
-    assert metrics["promoted_review"] == 1
+    assert metrics["promoted_review"] == 0
     assert metrics["review_required"] == 0
     params = session.execute.call_args[0][1]
     evidence = json.loads(params["evidence"])
-    assert evidence["match_basis"] == BASIS_BEST_OF_REVIEW
-    assert evidence["promotion"]["chosen"]["lrclib_id"] == 20
+    assert evidence["match_basis"] == "exact-title"
+    assert evidence["lrclib_id"] == 20
 
 
 def test_unpromotable_ambiguous_stays_parked_and_counted():
