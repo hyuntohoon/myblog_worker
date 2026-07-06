@@ -8,6 +8,13 @@ the real service on a live engine.
 
 Guarded by TEST_DB_URL; skipped when unset. Also skipped if the V34 table
 (Track.isrc column) isn't on the test branch yet (schema-drift guard).
+
+`test_isrc_backfill_txn_boundary_and_batch_isolation` is the FIX-bug-audit-2026-07
+WS-C H2 regression: it drives the service exactly as the handler now does (a session,
+no outer ``session.begin()``) and proves (a) a completed run does NOT raise
+``InvalidRequestError`` from a desynced transaction, and (b) a failing batch is rolled
+back so a LATER batch still commits (no ``InFailedSqlTransaction`` cascade). A mock
+unit can't see either — both are pool/transaction semantics.
 """
 from __future__ import annotations
 
@@ -111,10 +118,9 @@ def test_isrc_backfill_fetches_tracks_without_isrc(session_factory):
                 },
             )
 
-        # Fetch tracks without ISRC
-        with session.begin():
-            svc = IsrcBackfillService(session.connection())
-            tracks = svc._fetch_tracks_without_isrc(limit=100)
+        # Fetch tracks without ISRC (service now owns the session, not a raw conn)
+        svc = IsrcBackfillService(session)
+        tracks = svc._fetch_tracks_without_isrc(limit=100)
 
         # Should get only track1 (track2 has ISRC already)
         track_ids = [t["id"] for t in tracks]
@@ -180,10 +186,9 @@ def test_isrc_backfill_writes_isrc(mock_spotify, session_factory):
             }
         ]
 
-        # Run backfill
-        with session.begin():
-            svc = IsrcBackfillService(session.connection())
-            metrics = svc.backfill_isrc(limit=100)
+        # Run backfill (service commits per batch via the session — no outer begin)
+        svc = IsrcBackfillService(session)
+        metrics = svc.backfill_isrc(limit=100)
 
         # Verify ISRC was written
         with session.begin():
@@ -255,10 +260,9 @@ def test_isrc_backfill_writes_sentinel_on_miss(mock_spotify, session_factory):
             }
         ]
 
-        # Run backfill
-        with session.begin():
-            svc = IsrcBackfillService(session.connection())
-            metrics = svc.backfill_isrc(limit=100)
+        # Run backfill (service commits per batch via the session — no outer begin)
+        svc = IsrcBackfillService(session)
+        metrics = svc.backfill_isrc(limit=100)
 
         # Verify sentinel was written
         with session.begin():
@@ -282,3 +286,105 @@ def test_isrc_backfill_writes_sentinel_on_miss(mock_spotify, session_factory):
                 {"pat": "test_album_%"},
             )
         session.close()
+
+
+def test_isrc_backfill_txn_boundary_and_batch_isolation(session_factory):
+    """H2 regression — txn boundary + per-batch failure isolation on a real engine.
+
+    Seeds 60 NULL-isrc tracks and drives ``backfill_isrc`` through TWO 50-row batches
+    (``_fetch_tracks_without_isrc`` is stubbed to return exactly the seeds so the run is
+    isolated from other NULL rows on the shared branch). Spotify raises on the FIRST
+    batch and returns ISRCs on the SECOND. Expected:
+
+      - the run returns metrics WITHOUT raising ``InvalidRequestError`` (the old
+        ``conn.commit()``-inside-``session.begin()`` desync),
+      - batch 1 is rolled back (``errors == 1``) so batch 2 still commits
+        (``matched == 10``) instead of failing with ``InFailedSqlTransaction``,
+      - a FRESH session sees exactly the 10 committed ISRCs (proves the commit landed).
+    """
+    Session = session_factory
+    prefix = f"wsc_txn_{uuid.uuid4().hex[:8]}_"
+    album_sid = f"test_album_{uuid.uuid4()}"
+
+    seeded = [(str(uuid.uuid4()), f"{prefix}{n:03d}") for n in range(60)]
+
+    session = Session()
+    try:
+        with session.begin():
+            session.execute(
+                text(
+                    """
+                    INSERT INTO albums (id, spotify_id, title)
+                    VALUES (:id, :sid, 'Test Album')
+                    ON CONFLICT (spotify_id) DO NOTHING
+                    """
+                ),
+                {"id": str(uuid.uuid4()), "sid": album_sid},
+            )
+            alb_id = session.execute(
+                text("SELECT id FROM albums WHERE spotify_id = :sid"),
+                {"sid": album_sid},
+            ).scalar()
+            session.execute(
+                text(
+                    """
+                    INSERT INTO tracks (id, album_id, spotify_id, title)
+                    VALUES (CAST(:id AS UUID), :alb_id, :sid, 'Test Track')
+                    ON CONFLICT (spotify_id) DO NOTHING
+                    """
+                ),
+                [{"id": tid, "alb_id": alb_id, "sid": sid} for tid, sid in seeded],
+            )
+        session.close()
+
+        # Spotify: outage on batch 1, ISRCs on batch 2.
+        calls = {"n": 0}
+
+        def get_tracks_side_effect(ids, market=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("simulated Spotify outage on batch 1")
+            return [
+                {"id": sid, "external_ids": {"isrc": f"US{sid[-8:].upper()}"}}
+                for sid in ids
+            ]
+
+        # Drive the service exactly like worker.handler._run_isrc_backfill does now:
+        # a session, NO outer session.begin(). Stub the selection so the run only
+        # touches our 60 seeds (deterministic 50 + 10 split).
+        run_session = Session()
+        with patch("worker.service.isrc_backfill_service.spotify") as mock_spotify:
+            mock_spotify.get_tracks.side_effect = get_tracks_side_effect
+            svc = IsrcBackfillService(run_session)
+            svc._fetch_tracks_without_isrc = lambda limit: [
+                {"id": tid, "spotify_id": sid} for tid, sid in seeded
+            ]
+            metrics = svc.backfill_isrc(limit=1000)  # must NOT raise
+        run_session.close()
+
+        assert calls["n"] == 2, "both batches should have been attempted"
+        assert metrics["errors"] == 1, "batch 1 (outage) should be counted as an error"
+        assert metrics["matched"] == 10, "batch 2 (10 tracks) should have committed"
+
+        # Fresh session read-back: exactly the 10 batch-2 tracks carry an ISRC; the
+        # 50 rolled-back batch-1 tracks are still NULL.
+        with Session() as rb:
+            non_null = rb.execute(
+                text(
+                    "SELECT count(*) FROM tracks "
+                    "WHERE spotify_id LIKE :pat AND isrc IS NOT NULL"
+                ),
+                {"pat": f"{prefix}%"},
+            ).scalar()
+        assert non_null == 10, f"expected 10 committed ISRCs, got {non_null}"
+
+    finally:
+        with Session() as cleanup, cleanup.begin():
+            cleanup.execute(
+                text("DELETE FROM tracks WHERE spotify_id LIKE :pat"),
+                {"pat": f"{prefix}%"},
+            )
+            cleanup.execute(
+                text("DELETE FROM albums WHERE spotify_id = :sid"),
+                {"sid": album_sid},
+            )

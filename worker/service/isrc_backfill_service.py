@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Dict, Any, List, Optional
 import logging
 from sqlalchemy import text
-from sqlalchemy.engine import Connection
+from sqlalchemy.orm import Session
 
 from worker.clients.spotify_client import spotify
 
@@ -20,15 +20,28 @@ logger = logging.getLogger(__name__)
 class IsrcBackfillService:
     """Populate Track.isrc column via Spotify GET /v1/tracks?ids=..."""
 
-    def __init__(self, conn: Connection) -> None:
-        self.conn = conn
+    def __init__(self, session: Session) -> None:
+        # Own the transaction via the SESSION (commit/rollback per batch), NOT a
+        # cached connection. Committing a raw connection while the handler holds a
+        # session.begin() deassociates the session transaction → InvalidRequestError
+        # on context exit; caching session.connection() across a commit returns a
+        # stale handle to the pool (BUG-17). session.execute + per-batch
+        # session.commit()/rollback() is the failure-isolation pattern used by
+        # generate_and_save_aliases / the lyrics pipeline.
+        self.session = session
 
     def backfill_isrc(
         self,
         limit: int = 1000,
         market: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Bounded backfill: fetch tracks without ISRC, enrich from Spotify, commit.
+        """Bounded backfill: fetch tracks without ISRC, enrich from Spotify, commit
+        per batch.
+
+        Each batch commits via the owning session; a batch that raises is rolled
+        back (recovering the aborted transaction so LATER batches still commit —
+        without the rollback the first failure poisons the tx and every subsequent
+        batch fails with InFailedSqlTransaction).
 
         Returns metrics: {fetched, matched, sentinel_written, errors}.
         """
@@ -82,12 +95,17 @@ class IsrcBackfillService:
                         metrics["sentinel_written"] += 1
                         logger.debug(f"Sentinel: track {spotify_id} has no ISRC")
 
-                # Commit batch to DB
+                # Commit batch to DB (per-batch commit via the owning session)
                 if updates:
                     self._update_isrc_batch(updates)
+                    self.session.commit()
                     logger.info(f"Batch committed: {len(updates)} tracks updated")
 
             except Exception as e:
+                # Roll back the aborted transaction so the NEXT batch starts clean.
+                # Without this, an ON-CONFLICT/Spotify error leaves the tx in a
+                # failed state and every later batch fails with InFailedSqlTransaction.
+                self.session.rollback()
                 logger.error(f"Batch failed (batch start={i}): {e}", exc_info=True)
                 metrics["errors"] += 1
                 # Don't re-raise; failure-isolation pattern means one batch failure
@@ -107,7 +125,7 @@ class IsrcBackfillService:
         limit: int = 1000,
     ) -> List[Dict[str, Any]]:
         """Fetch up to `limit` tracks with NULL isrc."""
-        result = self.conn.execute(
+        result = self.session.execute(
             text("""
                 SELECT id, spotify_id
                 FROM tracks
@@ -122,8 +140,8 @@ class IsrcBackfillService:
         ]
 
     def _update_isrc_batch(self, updates: List[Dict[str, Any]]) -> None:
-        """Update isrc for a batch of tracks."""
-        self.conn.execute(
+        """Write isrc for a batch of tracks. The caller commits per batch."""
+        self.session.execute(
             text("""
                 UPDATE tracks
                 SET isrc = :isrc
@@ -131,4 +149,3 @@ class IsrcBackfillService:
             """),
             updates,
         )
-        self.conn.commit()

@@ -252,90 +252,144 @@ def run_library_sync(
     }
     unknown_ids: List[str] = []
 
+    # ── Phase 1: READ ──────────────────────────────────────────────────────────
+    # Materialize all catalog state in a short session, then CLOSE before any slow
+    # Spotify call (check_saved_albums / save_albums / remove_albums). Neon's pooler
+    # drops a connection left idle-in-transaction across an external call
+    # (reference-db-session-across-long-external-loop).
+    with session_factory() as session:
+        bucket_id = _find_special_bucket_id(session)
+        if bucket_id is None:
+            # Get-or-create is the backend's job; nothing for the worker to do.
+            logger.info("no kind='spotify_library' bucket — nothing to reconcile")
+            return {"bucket": "absent"}
+
+        # 2. Map L spotify_ids → albums.id; unknown → enqueue + skip this pass.
+        sid_to_uuid: Dict[str, Any] = {}
+        if saved_ids:
+            rows = session.execute(
+                text("SELECT id, spotify_id FROM albums WHERE spotify_id = ANY(:sids)"),
+                {"sids": saved_ids},
+            ).fetchall()
+            sid_to_uuid = {r.spotify_id: r.id for r in rows}
+        unknown_ids = [s for s in saved_ids if s not in sid_to_uuid]
+
+        # B = catalog-known album uuids in the special bucket, with their sids.
+        bucket_uuids = _bucket_album_ids(session, bucket_id)
+        bucket_sid: Dict[Any, str] = {}
+        if bucket_uuids:
+            brows = session.execute(
+                text("SELECT id, spotify_id FROM albums WHERE id = ANY(:ids)"),
+                {"ids": list(bucket_uuids)},
+            ).fetchall()
+            bucket_sid = {r.id: r.spotify_id for r in brows if r.spotify_id}
+        bucket_set = set(bucket_sid.keys())
+
+        # Existing provenance (source is immutable once stamped).
+        existing_source: Dict[Any, str] = {}
+        for r in session.execute(
+            text("SELECT album_id, source FROM spotify_library_albums")
+        ).fetchall():
+            existing_source[r.album_id] = r.source
+
+    # Bucket albums lacking a side row need a first-touch source stamp
+    # (contains-check → 'preexisting' if already saved else 'myblog_added').
+    untouched = [aid for aid in bucket_set if aid not in existing_source]
+    untouched_sids = [bucket_sid[aid] for aid in untouched]
+
+    # ── Phase 2: EXTERNAL Spotify I/O (no DB session held open) ──────────────────
+    # 3a. Contains-check for untouched bucket albums.
+    contains: Dict[str, bool] = {}
+    if untouched:
+        try:
+            contains = spotify_user.check_saved_albums(untouched_sids)
+        except SpotifyScopeError as e:
+            logger.warning("contains-check missing scope: %s", e)
+            # Stamp the untouched rows needs_attention in a fresh short tx, then abort.
+            with session_factory() as session, session.begin():
+                for aid in untouched:
+                    _upsert_side_row(
+                        session, album_id=aid, spotify_id=bucket_sid[aid],
+                        source="myblog_added", state="needs_attention",
+                        in_bucket=True, last_error="missing user-library-* scope",
+                        stamp_synced=True,
+                    )
+            summary["needs_reauth"] = True
+            summary["failed"] += len(untouched)
+            return summary
+
+    # First-touch provenance (kept in-memory now; persisted in Phase 3). Updating
+    # existing_source here is what the REMOVE/PULL filters below key off, exactly as
+    # in the original single-transaction flow.
+    first_touch: Dict[Any, tuple] = {}  # aid -> (source, is_saved)
+    for aid in untouched:
+        sid = bucket_sid[aid]
+        is_saved = bool(contains.get(sid, False)) or sid in seen
+        src = "preexisting" if is_saved else "myblog_added"
+        first_touch[aid] = (src, is_saved)
+        existing_source[aid] = src
+
+    # Authoritative current Library membership for each bucket album, from L.
+    in_spotify_now: Dict[Any, bool] = {aid: bucket_sid[aid] in seen for aid in bucket_set}
+
+    # Compute the ADD / REMOVE / PULL sets (pure Python — no DB, no I/O).
+    add_aids = [aid for aid in bucket_set if not in_spotify_now[aid]]
+    add_sids = [bucket_sid[aid] for aid in add_aids]
+
+    remove_pairs = [
+        (sid_to_uuid[sid], sid)
+        for sid in saved_ids
+        if sid in sid_to_uuid
+        and sid_to_uuid[sid] not in bucket_set
+        and existing_source.get(sid_to_uuid[sid]) == "myblog_added"
+    ]
+    remove_sids = [sid for _, sid in remove_pairs]
+
+    pull_pairs = [
+        (sid_to_uuid[sid], sid)
+        for sid in saved_ids
+        if sid in sid_to_uuid
+        and sid_to_uuid[sid] not in bucket_set
+        and existing_source.get(sid_to_uuid[sid]) != "myblog_added"
+    ]
+
+    # 3b. Gated Spotify mutations (PUT/DELETE /me/albums). Plan-only just logs.
+    add_err = add_scope = None
+    if add_sids:
+        _ok, add_err, add_scope = _maybe_write(
+            writes_enabled, lambda: spotify_user.save_albums(add_sids),
+            op="PUT /me/albums (ADD)", ids=add_sids,
+        )
+    remove_err = remove_scope = None
+    if remove_sids:
+        _ok, remove_err, remove_scope = _maybe_write(
+            writes_enabled, lambda: spotify_user.remove_albums(remove_sids),
+            op="DELETE /me/albums (REMOVE)", ids=remove_sids,
+        )
+
+    # ── Phase 3: WRITE ──────────────────────────────────────────────────────────
+    # Fresh short transaction for every DB mutation (first-touch stamp + ADD/REMOVE
+    # state + PULL inserts). Atomic as a unit, exactly like the original.
     with session_factory() as session:
         with session.begin():
-            bucket_id = _find_special_bucket_id(session)
-            if bucket_id is None:
-                # Get-or-create is the backend's job; nothing for the worker to do.
-                logger.info("no kind='spotify_library' bucket — nothing to reconcile")
-                return {"bucket": "absent"}
-
-            # 2. Map L spotify_ids → albums.id; unknown → enqueue + skip this pass.
-            sid_to_uuid: Dict[str, Any] = {}
-            if saved_ids:
-                rows = session.execute(
-                    text("SELECT id, spotify_id FROM albums WHERE spotify_id = ANY(:sids)"),
-                    {"sids": saved_ids},
-                ).fetchall()
-                sid_to_uuid = {r.spotify_id: r.id for r in rows}
-            unknown_ids = [s for s in saved_ids if s not in sid_to_uuid]
-
-            # B = catalog-known album uuids in the special bucket, with their sids.
-            bucket_uuids = _bucket_album_ids(session, bucket_id)
-            bucket_sid: Dict[Any, str] = {}
-            if bucket_uuids:
-                brows = session.execute(
-                    text("SELECT id, spotify_id FROM albums WHERE id = ANY(:ids)"),
-                    {"ids": list(bucket_uuids)},
-                ).fetchall()
-                bucket_sid = {r.id: r.spotify_id for r in brows if r.spotify_id}
-            bucket_set = set(bucket_sid.keys())
-
-            # Existing provenance (source is immutable once stamped).
-            existing_source: Dict[Any, str] = {}
-            for r in session.execute(
-                text("SELECT album_id, source FROM spotify_library_albums")
-            ).fetchall():
-                existing_source[r.album_id] = r.source
-
-            # 3. First-touch source stamp for bucket albums lacking a side row:
-            #    contains-check (chunked) → 'preexisting' if already saved else 'myblog_added'.
-            untouched = [aid for aid in bucket_set if aid not in existing_source]
-            if untouched:
-                untouched_sids = [bucket_sid[aid] for aid in untouched]
-                try:
-                    contains = spotify_user.check_saved_albums(untouched_sids)
-                except SpotifyScopeError as e:
-                    logger.warning("contains-check missing scope: %s", e)
-                    for aid in untouched:
-                        _upsert_side_row(
-                            session, album_id=aid, spotify_id=bucket_sid[aid],
-                            source="myblog_added", state="needs_attention",
-                            in_bucket=True, last_error="missing user-library-* scope",
-                            stamp_synced=True,
-                        )
-                    summary["needs_reauth"] = True
-                    summary["failed"] += len(untouched)
-                    return summary
-                for aid in untouched:
-                    sid = bucket_sid[aid]
-                    is_saved = bool(contains.get(sid, False)) or sid in seen
-                    src = "preexisting" if is_saved else "myblog_added"
-                    _upsert_side_row(
-                        session, album_id=aid, spotify_id=sid, source=src,
-                        state="pending", in_bucket=True, in_spotify=is_saved,
-                    )
-                    existing_source[aid] = src
-
-            # Authoritative current Library membership for each bucket album, from L.
-            in_spotify_now: Dict[Any, bool] = {aid: bucket_sid[aid] in seen for aid in bucket_set}
+            # 3. First-touch source stamp.
+            for aid in untouched:
+                src, is_saved = first_touch[aid]
+                _upsert_side_row(
+                    session, album_id=aid, spotify_id=bucket_sid[aid], source=src,
+                    state="pending", in_bucket=True, in_spotify=is_saved,
+                )
 
             # 4a. ADD = bucket albums NOT currently saved in Spotify.
-            add_aids = [aid for aid in bucket_set if not in_spotify_now[aid]]
-            add_sids = [bucket_sid[aid] for aid in add_aids]
             if add_sids:
-                _ok, err, scope = _maybe_write(
-                    writes_enabled, lambda: spotify_user.save_albums(add_sids),
-                    op="PUT /me/albums (ADD)", ids=add_sids,
-                )
-                if scope:
+                if add_scope:
                     for aid in add_aids:
-                        _set_state(session, aid, "needs_attention", err)
+                        _set_state(session, aid, "needs_attention", add_err)
                     summary["needs_reauth"] = True
                     summary["failed"] += len(add_aids)
-                elif err:
+                elif add_err:
                     for aid in add_aids:
-                        _set_state(session, aid, "failed", err)
+                        _set_state(session, aid, "failed", add_err)
                     summary["failed"] += len(add_aids)
                 else:
                     # write succeeded → in_spotify True; plan-only → keep observed state.
@@ -350,27 +404,15 @@ def run_library_sync(
 
             # 4b. REMOVE = saved in Spotify, NOT in bucket, source='myblog_added'.
             #     NEVER a preexisting album (req 5).
-            remove_pairs = [
-                (sid_to_uuid[sid], sid)
-                for sid in saved_ids
-                if sid in sid_to_uuid
-                and sid_to_uuid[sid] not in bucket_set
-                and existing_source.get(sid_to_uuid[sid]) == "myblog_added"
-            ]
-            remove_sids = [sid for _, sid in remove_pairs]
             if remove_sids:
-                _ok, err, scope = _maybe_write(
-                    writes_enabled, lambda: spotify_user.remove_albums(remove_sids),
-                    op="DELETE /me/albums (REMOVE)", ids=remove_sids,
-                )
-                if scope:
+                if remove_scope:
                     for aid, _ in remove_pairs:
-                        _set_state(session, aid, "needs_attention", err)
+                        _set_state(session, aid, "needs_attention", remove_err)
                     summary["needs_reauth"] = True
                     summary["failed"] += len(remove_pairs)
-                elif err:
+                elif remove_err:
                     for aid, _ in remove_pairs:
-                        _set_state(session, aid, "failed", err)
+                        _set_state(session, aid, "failed", remove_err)
                     summary["failed"] += len(remove_pairs)
                 else:
                     now_in_spotify = False if writes_enabled else None
@@ -385,13 +427,6 @@ def run_library_sync(
             # 4c. PULL = saved in Spotify, NOT in the bucket, and NOT a myblog_added
             #     row (those are REMOVE candidates). The other half of the never-delete
             #     rule: a Library album kept out of the bucket is pulled IN, not deleted.
-            pull_pairs = [
-                (sid_to_uuid[sid], sid)
-                for sid in saved_ids
-                if sid in sid_to_uuid
-                and sid_to_uuid[sid] not in bucket_set
-                and existing_source.get(sid_to_uuid[sid]) != "myblog_added"
-            ]
             position = _next_bucket_position(session, bucket_id)
             for aid, sid in pull_pairs:
                 # SAVEPOINT per item so a single bad PULL rolls back to the savepoint

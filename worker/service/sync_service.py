@@ -143,6 +143,12 @@ class AlbumSyncService:
             logger.info("artists upserted: %d", len(artists_list))
 
         if album_data:
+            # Sort by spotify_id (the ON CONFLICT key) so concurrent album-sync
+            # invocations that share albums take the albums row locks in the SAME
+            # order — same deadlock-avoidance rationale as the artists upsert above
+            # (ON CONFLICT DO UPDATE takes a row lock; unsorted batches that overlap
+            # deadlock under the account's 10-way SQS concurrency).
+            album_data.sort(key=lambda a: a["sid"])
             self.conn.execute(
                 text("""
                     INSERT INTO albums (
@@ -189,6 +195,10 @@ class AlbumSyncService:
             logger.info("album_artists linked: %d", len(album_artist_pairs))
 
         if track_data:
+            # Sort by spotify_id (the ON CONFLICT key) so overlapping concurrent
+            # batches lock the shared tracks rows in a consistent order (deadlock
+            # avoidance under 10-way SQS concurrency — see the artists/albums sorts).
+            track_data.sort(key=lambda t: t["sid"])
             self.conn.execute(
                 text("""
                     INSERT INTO tracks (spotify_id, album_id, title, track_no, duration_sec)
