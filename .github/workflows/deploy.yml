@@ -6,6 +6,15 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Least privilege: default GITHUB_TOKEN is too broad; this workflow only needs to read the repo.
+permissions:
+  contents: read
+
+# Serialize prod deploys so out-of-order pushes can't overwrite a newer Lambda with an older build.
+concurrency:
+  group: worker-deploy-prod
+  cancel-in-progress: false
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -42,6 +51,12 @@ jobs:
 
   deploy:
     needs: test
+    # Production deploy is main-only. push already filters to main (on.push.branches), but
+    # workflow_dispatch can be invoked against ANY ref, so guard the ref explicitly — otherwise
+    # a dispatch from a feature branch would ship that branch's code to prod.
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
