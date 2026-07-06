@@ -50,6 +50,10 @@ def run_album_ingest(
         "novel": 0, "passed_gate": 0, "enqueued": 0,
     }
 
+    # Read the catalog cap + eligible-artist list in a short session, then CLOSE
+    # before the slow per-artist get_artist_albums loop. Neon's pooler drops a
+    # connection left idle-in-transaction across a minutes-long external loop
+    # (reference-db-session-across-long-external-loop).
     with session_factory() as session:
         album_count = session.execute(text("SELECT count(*) FROM albums")).scalar()
         if album_count is not None and album_count >= settings.MAX_CATALOG_ALBUMS:
@@ -68,39 +72,43 @@ def run_album_ingest(
             """),
             {"pop_min": settings.ARTIST_POP_MIN},
         ).fetchall()
-        eligible = [r[0] for r in rows]
-        counters["eligible"] = len(eligible)
-        if not eligible:
-            logger.warning("album_ingest: no artists clear ARTIST_POP_MIN=%d", settings.ARTIST_POP_MIN)
-            return counters
 
-        buckets = max(1, math.ceil(len(eligible) / settings.SWEEP_ARTISTS_PER_TICK))
-        bucket = days_since_epoch % buckets
-        start = bucket * settings.SWEEP_ARTISTS_PER_TICK
-        sweep = eligible[start : start + settings.SWEEP_ARTISTS_PER_TICK]
-        counters["swept"] = len(sweep)
+    eligible = [r[0] for r in rows]
+    counters["eligible"] = len(eligible)
+    if not eligible:
+        logger.warning("album_ingest: no artists clear ARTIST_POP_MIN=%d", settings.ARTIST_POP_MIN)
+        return counters
 
-        since = _release_date_key(settings.INGEST_SINCE)
-        fresh_ids: List[str] = []
-        for artist_sid in sweep:
-            items = catalog_client.get_artist_albums(artist_sid, include_groups="album")
-            counters["discovered"] += len(items)
-            for alb in items:
-                if _release_date_key(alb.get("release_date", "")) >= since and alb.get("id"):
-                    fresh_ids.append(alb["id"])
-        # collab albums can surface under several swept artists in one tick
-        fresh_ids = list(dict.fromkeys(fresh_ids))
-        counters["fresh"] = len(fresh_ids)
+    buckets = max(1, math.ceil(len(eligible) / settings.SWEEP_ARTISTS_PER_TICK))
+    bucket = days_since_epoch % buckets
+    start = bucket * settings.SWEEP_ARTISTS_PER_TICK
+    sweep = eligible[start : start + settings.SWEEP_ARTISTS_PER_TICK]
+    counters["swept"] = len(sweep)
 
-        novel_ids: List[str] = []
-        if fresh_ids:
+    # Slow external discovery loop — no DB session held open here.
+    since = _release_date_key(settings.INGEST_SINCE)
+    fresh_ids: List[str] = []
+    for artist_sid in sweep:
+        items = catalog_client.get_artist_albums(artist_sid, include_groups="album")
+        counters["discovered"] += len(items)
+        for alb in items:
+            if _release_date_key(alb.get("release_date", "")) >= since and alb.get("id"):
+                fresh_ids.append(alb["id"])
+    # collab albums can surface under several swept artists in one tick
+    fresh_ids = list(dict.fromkeys(fresh_ids))
+    counters["fresh"] = len(fresh_ids)
+
+    # Fresh short session to resolve which discovered ids are novel.
+    novel_ids: List[str] = []
+    if fresh_ids:
+        with session_factory() as session:
             known = session.execute(
                 text("SELECT spotify_id FROM albums WHERE spotify_id = ANY(:sids)"),
                 {"sids": fresh_ids},
             ).fetchall()
-            known_set = {r[0] for r in known}
-            novel_ids = [i for i in fresh_ids if i not in known_set]
-        counters["novel"] = len(novel_ids)
+        known_set = {r[0] for r in known}
+        novel_ids = [i for i in fresh_ids if i not in known_set]
+    counters["novel"] = len(novel_ids)
 
     passed: List[str] = []
     if novel_ids:

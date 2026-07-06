@@ -10,6 +10,12 @@
 
 `myblog_music`이 SQS에 enqueue한 동기화 메시지를 소비하여 Spotify API에서 앨범·트랙·아티스트 데이터를 가져오고, 정규화한 뒤 DB에 upsert합니다. 요청-응답 경로와 완전히 분리된 **백그라운드 처리 전용** 서비스입니다.
 
+### 반복 함정 (FIX-bug-audit-2026-07 WS-C)
+
+- **DB 세션/트랜잭션을 수 분짜리 외부 API 루프에 걸쳐 열어두지 말 것.** Neon pooler가 idle-in-transaction 커넥션을 끊어 ProtocolViolation이 납니다. `fetch → materialize(읽기 세션 닫기) → 외부 루프 → 새 짧은 쓰기 세션` 패턴을 쓰세요 (lyrics 파이프라인이 레퍼런스). album_ingest / saved_tracks_sync / library_sync가 이 패턴으로 정리됨.
+- **bulk `ON CONFLICT` upsert는 conflict key로 정렬**한 뒤 실행 (10-way SQS 동시성에서 row-lock 데드락 방지). artists뿐 아니라 albums/tracks도 정렬됨 (`sync_service.py`).
+- **핸들러가 소유한 `session.begin()` 트랜잭션 안에서 raw `conn.commit()` 호출 금지** — 세션 트랜잭션을 deassociate시켜 `InvalidRequestError`가 납니다. 배치 커밋은 소유 세션으로, 실패 시 `session.rollback()`.
+
 ---
 
 ## 처리 흐름

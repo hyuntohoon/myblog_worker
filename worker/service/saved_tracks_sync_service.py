@@ -61,16 +61,24 @@ def run_saved_tracks_sync(
     if mode not in ("incremental", "full"):
         raise ValueError(f"unknown saved-tracks sync mode: {mode!r}")
 
+    # Read the incremental cursor in a short session, then CLOSE before the slow
+    # Spotify saved-tracks paging. Neon's pooler drops a connection left
+    # idle-in-transaction across the external paging loop
+    # (reference-db-session-across-long-external-loop).
+    since = None
+    if mode == "incremental":
+        with session_factory() as session:
+            since = session.execute(
+                text("SELECT max(added_at) FROM spotify_saved_tracks")
+            ).scalar()
+
+    # Slow external paging — no DB session held open. incremental fetches only
+    # rows newer than the cursor; full pages the whole library.
+    rows = spotify_user.get_saved_tracks(since=since)
+
+    # Fresh short write transaction for the upsert (+ full-mode prune).
     with session_factory() as session:
         with session.begin():
-            if mode == "incremental":
-                since = session.execute(
-                    text("SELECT max(added_at) FROM spotify_saved_tracks")
-                ).scalar()
-                rows = spotify_user.get_saved_tracks(since=since)
-            else:  # full
-                rows = spotify_user.get_saved_tracks(since=None)
-
             upserted = _upsert_rows(session, rows)
 
             pruned = 0

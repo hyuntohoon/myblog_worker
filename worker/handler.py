@@ -100,8 +100,12 @@ def _run_isrc_backfill(limit: int = 1000) -> None:
     doesn't block the job)."""
     from worker.service.isrc_backfill_service import IsrcBackfillService
 
-    with SessionLocal() as session, session.begin():
-        svc = IsrcBackfillService(session.connection())
+    # No handler-owned session.begin(): the service commits per batch via the
+    # session (and rolls back a failed batch), following the alias-fill /
+    # lyrics-incremental pattern. Wrapping this in session.begin() would
+    # deassociate the transaction the moment the service commits.
+    with SessionLocal() as session:
+        svc = IsrcBackfillService(session)
         metrics = svc.backfill_isrc(limit=limit)
         logger.info("ISRC backfill metrics: %s", metrics)
 
