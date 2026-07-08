@@ -60,6 +60,20 @@ def _run_saved_tracks_sync(mode: str = "incremental") -> None:
     run_saved_tracks_sync(SessionLocal, spotify_user, mode=mode)
 
 
+def _run_lastfm_sync() -> None:
+    """Per-user Last.fm recent-tracks poll (FEAT-multi-user Phase 3a). Triggered by
+    the EventBridge cron {"job":"lastfm_recent_tracks"}. Fetch→close per user; never
+    holds a DB session across the Last.fm HTTP calls (rule #9 principle: the cron
+    triggers, the worker reads Last.fm). No-op when LASTFM_API_KEY is unset."""
+    if not settings.LASTFM_API_KEY:
+        logger.info("lastfm sync skipped: LASTFM_API_KEY unset")
+        return
+    from worker.clients.lastfm_client import lastfm
+    from worker.service.lastfm_sync_service import run_lastfm_sync
+
+    run_lastfm_sync(SessionLocal, lastfm, max_users=settings.LASTFM_MAX_USERS_PER_TICK)
+
+
 def _process_single(album_id: str, market: str) -> None:
     logger.info("Processing single album_id=%s market=%s DRY_RUN=%s", album_id, market, settings.DRY_RUN)
     if settings.DRY_RUN:
@@ -205,6 +219,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         limit = event.get("limit")
         logger.info("EventBridge/SQS trigger: running lyrics reassessment (limit=%s)", limit)
         _run_lyrics_reassessment(limit=limit)
+        return {}
+
+    # EventBridge cron — per-user Last.fm recent-tracks poll (constant input, no
+    # "source"; FEAT-multi-user Phase 3a). Routed before the alias source check.
+    if event.get("job") == "lastfm_recent_tracks":
+        logger.info("EventBridge trigger: running Last.fm recent-tracks sync")
+        _run_lastfm_sync()
         return {}
 
     # EventBridge scheduled rule (alias cron) — full event carries source=aws.events
