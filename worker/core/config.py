@@ -23,6 +23,14 @@ class Settings(BaseSettings):
     SPOTIFY_API_BASE: str = "https://api.spotify.com/v1"
     SPOTIFY_DEFAULT_MARKET: str = "KR"
 
+    # Last.fm (FEAT-multi-user Phase 3a) — public-profile reads need only an api_key
+    # + username (no OAuth). The key lives in the SSM /myblog/worker blob (no new IAM).
+    # OPTIONAL: unset ⇒ the poll no-ops (never a boot failure).
+    LASTFM_API_KEY: str = ""
+    LASTFM_API_BASE: str = "https://ws.audioscrobbler.com/2.0/"
+    # Per-tick user bound so the 120s Lambda always finishes.
+    LASTFM_MAX_USERS_PER_TICK: int = 50
+
     # Spotify user-scoped player reads (FEAT-member-dashboard Step 3).
     # Refresh token + client creds live in Secrets Manager myblog/spotify (Q17);
     # SPOTIFY_REFRESH_TOKEN is an env fallback for local dev / tests only.
@@ -126,6 +134,9 @@ def get_settings() -> Settings:
             s.SPOTIFY_CLIENT_ID = secrets["SPOTIFY_CLIENT_ID"]
         if secrets.get("SPOTIFY_CLIENT_SECRET"):
             s.SPOTIFY_CLIENT_SECRET = secrets["SPOTIFY_CLIENT_SECRET"]
+        # Last.fm key is OPTIONAL — absent ⇒ the poll no-ops; do NOT add to `missing`.
+        if secrets.get("LASTFM_API_KEY"):
+            s.LASTFM_API_KEY = secrets["LASTFM_API_KEY"]
         missing = [k for k, v in {
             "DATABASE_URL": s.DATABASE_URL,
             "SPOTIFY_CLIENT_ID": s.SPOTIFY_CLIENT_ID,
