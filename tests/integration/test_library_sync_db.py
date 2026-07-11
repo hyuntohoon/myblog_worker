@@ -59,12 +59,21 @@ def test_insert_bucket_item_idempotent_against_partial_index(factory):
         tx = session.begin()
         try:
             album_id = session.execute(text("SELECT id FROM albums LIMIT 1")).scalar()
+            # V42: review_buckets.user_id is NOT NULL — seed a throwaway owner
+            # inside the same rolled-back transaction.
+            user_id = session.execute(
+                text(
+                    "INSERT INTO users (id, handle, display_name) "
+                    "VALUES (gen_random_uuid(), :h, :h) RETURNING id"
+                ),
+                {"h": f"itest-user-{uuid.uuid4().hex[:8]}"},
+            ).scalar()
             bucket_id = session.execute(
                 text(
-                    "INSERT INTO review_buckets (name, position, kind) "
-                    "VALUES (:n, 0, 'review') RETURNING id"
+                    "INSERT INTO review_buckets (name, position, kind, user_id) "
+                    "VALUES (:n, 0, 'review', :u) RETURNING id"
                 ),
-                {"n": f"itest-onconflict-{uuid.uuid4().hex[:8]}"},
+                {"n": f"itest-onconflict-{uuid.uuid4().hex[:8]}", "u": user_id},
             ).scalar()
 
             _insert_bucket_item(session, bucket_id, album_id, 0)
