@@ -127,3 +127,17 @@ class TestGetSettings:
         with patch.dict("os.environ", {"SECRETS_ARN": ""}, clear=False):
             s = get_settings()
         assert s.SECRETS_ARN == ""
+
+
+class TestReleaseCalendarStep5Defaults:
+    def test_oq5_ingest_floor_aligned_with_watchlist_floor(self):
+        """OQ5 (owner-decided 2026-07-12): ARTIST_POP_MIN 60 → 50 == the
+        calendar watchlist floor, so announced rows of every artist can flip."""
+        s = _make_settings(SECRETS_ARN="")
+        assert s.ARTIST_POP_MIN == 50
+        assert s.ARTIST_POP_MIN == s.RELEASE_POLL_POP_MIN
+
+    def test_confirm_window_defaults(self):
+        s = _make_settings(SECRETS_ARN="")
+        assert s.RELEASE_CONFIRM_DATE_PROXIMITY_DAYS == 7
+        assert s.RELEASE_CONFIRM_LOOKBACK_DAYS == 90

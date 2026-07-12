@@ -47,6 +47,16 @@ ITUNES_TICK_SECONDS = 1800
 # precedent — prevents re-querying iTunes for the same artist every cycle).
 ITUNES_ID_NOT_FOUND = "not_found"
 
+# resolved_via for a sentinel written because the artist had no UPC-bearing
+# catalog album (vs a lookup miss, resolved_via='not_found'). no_upc sentinels
+# bypass the retry_days gate: re-checking costs only the already-batched UPC
+# prefetch SELECT (zero HTTP unless a UPC has appeared), and after OQ5 widens
+# the catalog to singles/EPs a newly-ingested UPC-bearing release makes the
+# artist resolvable at its next bucket visit instead of ≤30 d later. Legacy
+# rows (both kinds written as 'not_found' pre-Step-5) keep the 30 d gate; a
+# one-time ops DELETE clears the no-UPC ones (Step 5 PR body).
+RESOLVED_VIA_NO_UPC = "no_upc"
+
 _SELECT_MB_WATCHLIST = text(
     """
     SELECT id AS artist_id, musicbrainz_id
@@ -62,7 +72,8 @@ _SELECT_ITUNES_WATCHLIST = text(
     """
     SELECT a.id AS artist_id,
            asi.source_artist_id AS itunes_id,
-           (asi.resolved_at < now() - make_interval(days => :retry_days)) AS sentinel_stale
+           (asi.resolved_at < now() - make_interval(days => :retry_days)) AS sentinel_stale,
+           asi.resolved_via AS resolved_via
       FROM artists a
       LEFT JOIN artist_source_ids asi
         ON asi.artist_id = a.id AND asi.source = 'itunes'
@@ -112,11 +123,27 @@ _UPSERT_EVENT = text(
 )
 
 
-def _bucket(items: Sequence, per_tick: int, tick_index: int) -> Sequence:
-    """The tick's slice of the stable-ordered watchlist (stateless rotation)."""
+def _bucket(items: Sequence, per_tick: int, tick_index: int) -> List:
+    """The tick's slice of the stable-ordered watchlist (stateless rotation).
+
+    Intra-bucket fairness (Step 5 부수 픽스): the 90 s budget guard can stop a
+    tick partway through its bucket, and a fixed start-at-0 order made the SAME
+    tail artists the casualty every cycle (live: budget_stop on 8/14 MB ticks,
+    stopping at 35–64 of 70). The bucket's start therefore rotates by the cycle
+    index (tick_index // bucket count) — still fully stateless (derived from
+    the tick clock, no cursor row) and bucket MEMBERSHIP is unchanged, only the
+    visit order inside the bucket shifts each cycle. With observed progress of
+    ≥ half the bucket per tick, every artist is reached within ~2 cycles; any
+    progress ≥ 1 artist/tick still guarantees full coverage within
+    len(bucket) cycles.
+    """
     buckets = max(1, math.ceil(len(items) / per_tick))
     start = (tick_index % buckets) * per_tick
-    return items[start : start + per_tick]
+    sweep = list(items[start : start + per_tick])
+    if len(sweep) > 1:
+        offset = (tick_index // buckets) % len(sweep)
+        sweep = sweep[offset:] + sweep[:offset]
+    return sweep
 
 
 def _is_full_date(raw: Optional[str]) -> bool:
@@ -224,17 +251,19 @@ def _resolve_itunes_ids(
     *,
     started: float,
     counters: Dict[str, int],
-) -> Dict[Any, Optional[str]]:
+) -> Dict[Any, Tuple[Optional[str], str]]:
     """UPC hard-ID chain per unresolved artist: newest UPC → next-newest → sentinel.
-    Returns {artist_id: itunes_id | None(sentinel, no HTTP hit) }."""
-    resolutions: Dict[Any, Optional[str]] = {}
+    Returns {artist_id: (itunes_id | None, resolved_via)} where resolved_via ∈
+    'upc' (resolved) | 'no_upc' (no UPC-bearing album, zero HTTP) |
+    'not_found' (all UPCs missed in iTunes — 30 d retry sentinel)."""
+    resolutions: Dict[Any, Tuple[Optional[str], str]] = {}
     for artist_id in to_resolve:
         if time.monotonic() - started > settings.RELEASE_POLL_TIME_BUDGET_SEC:
             counters["budget_stop"] = 1
             break
         upcs = upcs_by_artist.get(artist_id, [])[:2]
         if not upcs:
-            resolutions[artist_id] = None
+            resolutions[artist_id] = (None, RESOLVED_VIA_NO_UPC)
             counters["no_upc"] += 1
             continue
         resolved: Optional[str] = None
@@ -248,11 +277,11 @@ def _resolve_itunes_ids(
             if resolved:
                 break
         else:
-            resolutions[artist_id] = None  # all UPCs missed → sentinel
+            resolutions[artist_id] = (None, ITUNES_ID_NOT_FOUND)  # all UPCs missed
             counters["resolve_miss"] += 1
             continue
         if resolved:
-            resolutions[artist_id] = resolved
+            resolutions[artist_id] = (resolved, "upc")
             counters["resolved"] += 1
     return resolutions
 
@@ -273,7 +302,9 @@ def _itunes_pass(
                 "retry_days": settings.RELEASE_POLL_RESOLVE_RETRY_DAYS,
             },
         ).fetchall()
-    watchlist = [(r.artist_id, r.itunes_id, r.sentinel_stale) for r in rows]
+    watchlist = [
+        (r.artist_id, r.itunes_id, r.sentinel_stale, r.resolved_via) for r in rows
+    ]
     counters["eligible"] = len(watchlist)
 
     sweep = list(
@@ -283,9 +314,17 @@ def _itunes_pass(
 
     lookups: List[Tuple[Any, str]] = []  # (artist_id, itunes_id) to query
     to_resolve: List[Any] = []
-    for artist_id, itunes_id, sentinel_stale in sweep:
-        if itunes_id is None or (itunes_id == ITUNES_ID_NOT_FOUND and sentinel_stale):
+    prior_no_upc: set = set()  # skip rewriting an unchanged no_upc sentinel
+    for artist_id, itunes_id, sentinel_stale, resolved_via in sweep:
+        if itunes_id is None or (
+            itunes_id == ITUNES_ID_NOT_FOUND
+            # no_upc sentinels bypass the retry gate (DB-only recheck, see
+            # RESOLVED_VIA_NO_UPC); lookup-miss sentinels wait out retry_days.
+            and (sentinel_stale or resolved_via == RESOLVED_VIA_NO_UPC)
+        ):
             to_resolve.append(artist_id)
+            if resolved_via == RESOLVED_VIA_NO_UPC:
+                prior_no_upc.add(artist_id)
         elif itunes_id == ITUNES_ID_NOT_FOUND:
             counters["sentinel_skip"] += 1
         else:
@@ -310,12 +349,16 @@ def _itunes_pass(
         {
             "artist_id": artist_id,
             "source_artist_id": itunes_id or ITUNES_ID_NOT_FOUND,
-            "resolved_via": "upc" if itunes_id else ITUNES_ID_NOT_FOUND,
+            "resolved_via": via,
         }
-        for artist_id, itunes_id in resolutions.items()
+        for artist_id, (itunes_id, via) in resolutions.items()
+        # still-no-UPC recheck of an existing no_upc sentinel → no write churn
+        if not (via == RESOLVED_VIA_NO_UPC and artist_id in prior_no_upc)
     ]
     lookups.extend(
-        (artist_id, itunes_id) for artist_id, itunes_id in resolutions.items() if itunes_id
+        (artist_id, itunes_id)
+        for artist_id, (itunes_id, _via) in resolutions.items()
+        if itunes_id
     )
 
     events: List[Dict[str, Any]] = []
