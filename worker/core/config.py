@@ -73,7 +73,10 @@ class Settings(BaseSettings):
     # mode switch — albums released before it are never batch-ingested (the
     # reactive candidates path covers back-catalog on demand); relax it to
     # enable backfill.
-    ARTIST_POP_MIN: int = 60
+    # ARTIST_POP_MIN 60 → 50 (FEAT-release-calendar OQ5, owner-decided
+    # 2026-07-12): aligned with RELEASE_POLL_POP_MIN so every calendar-watchlist
+    # artist is also ingest-swept and its announced rows can flip to released.
+    ARTIST_POP_MIN: int = 50
     ALBUM_POP_MIN: int = 20
     SWEEP_ARTISTS_PER_TICK: int = 30
     MAX_ENQUEUE_PER_TICK: int = 60
@@ -99,6 +102,18 @@ class Settings(BaseSettings):
     RELEASE_POLL_RESOLVE_RETRY_DAYS: int = 30
     ITUNES_LOOKUP_URL: str = "https://itunes.apple.com/lookup"
     ITUNES_THROTTLE_S: float = 3.5
+
+    # Release-day confirm via album_ingest (FEAT-release-calendar Step 5).
+    # An ingested watchlist album confirms announced rows whose release_date is
+    # within ±PROXIMITY days (probe: 11/11 exact date agreement across sources,
+    # so 7 d absorbs small announce-date slips without fuzzy-merging distinct
+    # releases). LOOKBACK bounds how far back an ingested album still counts as
+    # calendar-relevant: the ingest rotation revisits an artist once per cycle
+    # (~51 d at the OQ5 floor), and announced lead times run to p90 68 d, so
+    # 90 d keeps late-swept releases confirmable without dragging deep
+    # back-catalog into the calendar. Upper bound = RELEASE_POLL_HORIZON_DAYS.
+    RELEASE_CONFIRM_DATE_PROXIMITY_DAYS: int = 7
+    RELEASE_CONFIRM_LOOKBACK_DAYS: int = 90
 
     # Secrets Manager (legacy) + SSM Parameter Store (CHORE-secrets-ssm-migration).
     # SECRETS_PARAM (SSM SecureString name, e.g. /myblog/worker) takes priority;

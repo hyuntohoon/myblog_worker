@@ -16,6 +16,7 @@ from worker.core.config import settings
 from worker.service import release_upcoming_service as svc
 from worker.service.release_upcoming_service import (
     ITUNES_ID_NOT_FOUND,
+    RESOLVED_VIA_NO_UPC,
     _bucket,
     _dedup_sorted,
     _itunes_release_type,
@@ -83,14 +84,37 @@ class _FakeSession:
 class TestBucketRotation:
     def test_slices_and_wraps(self):
         items = list(range(10))
+        # cycle 0: plain slices, start offset 0
         assert _bucket(items, 4, 0) == [0, 1, 2, 3]
         assert _bucket(items, 4, 1) == [4, 5, 6, 7]
         assert _bucket(items, 4, 2) == [8, 9]
-        assert _bucket(items, 4, 3) == [0, 1, 2, 3]  # modulo wrap
+        # modulo wrap → cycle 1: same MEMBERSHIP, start rotated by 1 (fairness fix)
+        assert _bucket(items, 4, 3) == [1, 2, 3, 0]
 
     def test_empty_and_small(self):
         assert list(_bucket([], 4, 7)) == []
         assert _bucket([1], 4, 5) == [1]
+
+    def test_intra_bucket_rotation_keeps_membership(self):
+        # 부수 픽스 #1: the budget guard used to cut the SAME tail every cycle;
+        # rotation must reorder, never change which artists belong to the bucket.
+        items = list(range(10))
+        for tick in (0, 3, 6, 9, 12):  # bucket 0 across 5 cycles
+            assert set(_bucket(items, 4, tick)) == {0, 1, 2, 3}
+        assert _bucket(items, 4, 6) == [2, 3, 0, 1]   # cycle 2 → offset 2
+        assert _bucket(items, 4, 12) == [0, 1, 2, 3]  # offset wraps at len(bucket)
+
+    def test_budget_tail_covered_across_cycles(self):
+        # Simulate a budget stop after 2 of 4 artists every tick: the fixed
+        # start-at-0 order would starve indices 2 and 3 forever; the rotating
+        # offset covers the whole bucket within len(bucket) cycles.
+        items = list(range(8))
+        progress = 2
+        covered = set()
+        for cycle in range(4):
+            tick = cycle * 2  # 8 items / 4 per tick = 2 buckets; bucket 0 ticks
+            covered.update(_bucket(items, 4, tick)[:progress])
+        assert covered == {0, 1, 2, 3}
 
 
 class TestTypeMapping:
@@ -232,7 +256,9 @@ class TestItunesPass:
     def test_resolved_artist_gets_lookup_and_events(self):
         aid = uuid.uuid4()
         session = _FakeSession(
-            itunes_watchlist=[_Row(artist_id=aid, itunes_id="777", sentinel_stale=None)]
+            itunes_watchlist=[
+                _Row(artist_id=aid, itunes_id="777", sentinel_stale=None, resolved_via="upc")
+            ]
         )
         client = _FakeItunes(albums=[
             _col(1, "Future - Single", "2026-08-01T07:00:00Z"),
@@ -252,7 +278,7 @@ class TestItunesPass:
     def test_upc_chain_falls_back_to_next_newest(self):
         aid = uuid.uuid4()
         session = _FakeSession(
-            itunes_watchlist=[_Row(artist_id=aid, itunes_id=None, sentinel_stale=None)],
+            itunes_watchlist=[_Row(artist_id=aid, itunes_id=None, sentinel_stale=None, resolved_via=None)],
             upc_rows=[_Row(artist_id=aid, upc="upc-new"), _Row(artist_id=aid, upc="upc-old")],
         )
         client = _FakeItunes(upc_map={"upc-old": "999"})  # newest misses
@@ -268,7 +294,7 @@ class TestItunesPass:
     def test_all_upcs_miss_writes_sentinel(self):
         aid = uuid.uuid4()
         session = _FakeSession(
-            itunes_watchlist=[_Row(artist_id=aid, itunes_id=None, sentinel_stale=None)],
+            itunes_watchlist=[_Row(artist_id=aid, itunes_id=None, sentinel_stale=None, resolved_via=None)],
             upc_rows=[_Row(artist_id=aid, upc="upc-1")],
         )
         client = _FakeItunes(upc_map={})
@@ -284,7 +310,7 @@ class TestItunesPass:
     def test_no_upc_writes_sentinel_without_http(self):
         aid = uuid.uuid4()
         session = _FakeSession(
-            itunes_watchlist=[_Row(artist_id=aid, itunes_id=None, sentinel_stale=None)]
+            itunes_watchlist=[_Row(artist_id=aid, itunes_id=None, sentinel_stale=None, resolved_via=None)]
         )
         client = _FakeItunes()
         res = run_release_upcoming_poll(
@@ -292,14 +318,78 @@ class TestItunesPass:
             tick_index=0, today=TODAY,
         )
         assert res["no_upc"] == 1 and not client.upc_calls and not client.album_calls
-        assert session.sql_of(lambda s: "INSERT INTO artist_source_ids" in s)
+        (_, params), = session.sql_of(lambda s: "INSERT INTO artist_source_ids" in s)
+        assert params["source_artist_id"] == ITUNES_ID_NOT_FOUND
+        # Step 5 부수 픽스 #2: the no-UPC kind is now distinguishable from a
+        # lookup miss so it can bypass the 30 d retry gate.
+        assert params["resolved_via"] == RESOLVED_VIA_NO_UPC
+
+    def test_no_upc_sentinel_rechecked_without_retry_gate(self):
+        # FRESH (not stale) no_upc sentinel + a UPC that has since appeared
+        # (OQ5 widened the catalog) → re-resolved immediately, no 30 d wait.
+        aid = uuid.uuid4()
+        session = _FakeSession(
+            itunes_watchlist=[
+                _Row(artist_id=aid, itunes_id=ITUNES_ID_NOT_FOUND,
+                     sentinel_stale=False, resolved_via=RESOLVED_VIA_NO_UPC),
+            ],
+            upc_rows=[_Row(artist_id=aid, upc="upc-new")],
+        )
+        client = _FakeItunes(upc_map={"upc-new": "321"})
+        res = run_release_upcoming_poll(
+            lambda: session, mode="itunes", itunes_client=client,
+            tick_index=0, today=TODAY,
+        )
+        assert res["resolved"] == 1 and res["sentinel_skip"] == 0
+        assert client.upc_calls == ["upc-new"] and client.album_calls == ["321"]
+        (_, params), = session.sql_of(lambda s: "INSERT INTO artist_source_ids" in s)
+        assert params["source_artist_id"] == "321" and params["resolved_via"] == "upc"
+
+    def test_unchanged_no_upc_sentinel_not_rewritten(self):
+        # Still no UPC on recheck → zero HTTP AND zero write churn.
+        aid = uuid.uuid4()
+        session = _FakeSession(
+            itunes_watchlist=[
+                _Row(artist_id=aid, itunes_id=ITUNES_ID_NOT_FOUND,
+                     sentinel_stale=False, resolved_via=RESOLVED_VIA_NO_UPC),
+            ],
+        )
+        client = _FakeItunes()
+        res = run_release_upcoming_poll(
+            lambda: session, mode="itunes", itunes_client=client,
+            tick_index=0, today=TODAY,
+        )
+        assert res["no_upc"] == 1
+        assert not client.upc_calls and not client.album_calls
+        assert not session.sql_of(lambda s: "INSERT INTO artist_source_ids" in s)
+
+    def test_legacy_not_found_via_keeps_retry_gate(self):
+        # Pre-Step-5 rows wrote resolved_via='not_found' for both kinds; they
+        # keep the 30 d gate (the one-time ops DELETE clears the no-UPC ones).
+        aid = uuid.uuid4()
+        session = _FakeSession(
+            itunes_watchlist=[
+                _Row(artist_id=aid, itunes_id=ITUNES_ID_NOT_FOUND,
+                     sentinel_stale=False, resolved_via=ITUNES_ID_NOT_FOUND),
+            ],
+            upc_rows=[_Row(artist_id=aid, upc="upc-x")],
+        )
+        client = _FakeItunes(upc_map={"upc-x": "999"})
+        res = run_release_upcoming_poll(
+            lambda: session, mode="itunes", itunes_client=client,
+            tick_index=0, today=TODAY,
+        )
+        assert res["sentinel_skip"] == 1 and res["resolved"] == 0
+        assert not client.upc_calls
 
     def test_fresh_sentinel_skipped_stale_sentinel_retried(self):
         fresh, stale = uuid.uuid4(), uuid.uuid4()
         session = _FakeSession(
             itunes_watchlist=[
-                _Row(artist_id=fresh, itunes_id=ITUNES_ID_NOT_FOUND, sentinel_stale=False),
-                _Row(artist_id=stale, itunes_id=ITUNES_ID_NOT_FOUND, sentinel_stale=True),
+                _Row(artist_id=fresh, itunes_id=ITUNES_ID_NOT_FOUND,
+                     sentinel_stale=False, resolved_via=ITUNES_ID_NOT_FOUND),
+                _Row(artist_id=stale, itunes_id=ITUNES_ID_NOT_FOUND,
+                     sentinel_stale=True, resolved_via=ITUNES_ID_NOT_FOUND),
             ],
             upc_rows=[_Row(artist_id=stale, upc="upc-s")],
         )
@@ -314,7 +404,7 @@ class TestItunesPass:
     def test_transient_resolution_error_leaves_no_sentinel(self):
         aid = uuid.uuid4()
         session = _FakeSession(
-            itunes_watchlist=[_Row(artist_id=aid, itunes_id=None, sentinel_stale=None)],
+            itunes_watchlist=[_Row(artist_id=aid, itunes_id=None, sentinel_stale=None, resolved_via=None)],
             upc_rows=[_Row(artist_id=aid, upc="upc-1")],
         )
         client = _FakeItunes(raise_on_lookup=True)
@@ -329,7 +419,7 @@ class TestItunesPass:
         aids = sorted([uuid.uuid4() for _ in range(3)], key=str, reverse=True)
         session = _FakeSession(
             itunes_watchlist=[
-                _Row(artist_id=a, itunes_id=None, sentinel_stale=None) for a in aids
+                _Row(artist_id=a, itunes_id=None, sentinel_stale=None, resolved_via=None) for a in aids
             ],
         )
         client = _FakeItunes()
