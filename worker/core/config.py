@@ -80,6 +80,26 @@ class Settings(BaseSettings):
     MAX_CATALOG_ALBUMS: int = 5000
     INGEST_SINCE: str = "2026-06-10"
 
+    # Multi-source upcoming-release poller (FEAT-release-calendar Step 4).
+    # Watchlist floor + horizon are owner-decided 2026-07-12 (RFC OQ1/OQ2).
+    # Per-tick artist bounds keep each EventBridge tick inside the 120s Lambda:
+    # MB ~1 req/s (musicbrainzngs limiter) → 70 artists ≈ 70 s; iTunes 3.5 s
+    # throttle → 22 artists ≈ 77 s (resolution pre-pass misses cost a 2nd
+    # request, which the wall-clock budget absorbs). Coverage cadence at the
+    # eventbridge.tf rates (MB hourly / iTunes 30 min): ≥50 tier ≈ 1,530
+    # artists → full MB cycle ≈ 22 h, iTunes ≈ 21 h — "fresh within a day".
+    RELEASE_POLL_POP_MIN: int = 50
+    RELEASE_POLL_HORIZON_DAYS: int = 180
+    RELEASE_POLL_MB_ARTISTS_PER_TICK: int = 70
+    RELEASE_POLL_ITUNES_ARTISTS_PER_TICK: int = 22
+    RELEASE_POLL_TIME_BUDGET_SEC: float = 90.0
+    # Failed iTunes artistId resolutions are sentinel-cached (artist_source_ids
+    # 'not_found') and re-attempted after this many days — new UPC-bearing
+    # catalog albums can make a previously-unresolvable artist resolvable.
+    RELEASE_POLL_RESOLVE_RETRY_DAYS: int = 30
+    ITUNES_LOOKUP_URL: str = "https://itunes.apple.com/lookup"
+    ITUNES_THROTTLE_S: float = 3.5
+
     # Secrets Manager (legacy) + SSM Parameter Store (CHORE-secrets-ssm-migration).
     # SECRETS_PARAM (SSM SecureString name, e.g. /myblog/worker) takes priority;
     # SECRETS_ARN is the fallback. Setting SECRETS_PARAM is the cutover switch.
