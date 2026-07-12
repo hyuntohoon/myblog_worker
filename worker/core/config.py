@@ -40,6 +40,16 @@ class Settings(BaseSettings):
     SPOTIFY_SECRETS_PARAM: str = ""
     SPOTIFY_REFRESH_TOKEN: str = ""
 
+    # Per-user Spotify listening poll (FEAT-multi-user Phase 3b-d).
+    # USER_TOKENS_KMS_KEY_ID = the customer-managed CMK (alias/myblog-user-tokens,
+    # 3b-a) — Lambda env var, same as the backend connect path; needed only for the
+    # rotation re-encrypt (Decrypt reads the key id from the envelope). Unset ⇒
+    # decrypt+poll still work; a rotation keeps the old payload (logged).
+    USER_TOKENS_KMS_KEY_ID: str = ""
+    # Per-tick member bound so the 120s Lambda always finishes (the ≤5-user tier
+    # means one tick covers everyone; stalest-synced-first rotation above that).
+    SPOTIFY_MEMBER_MAX_USERS_PER_TICK: int = 10
+
     # AWS / SQS (for local testing convenience)
     AWS_DEFAULT_REGION: str = "ap-northeast-2"
     LOCALSTACK_ENDPOINT: str | None = None
