@@ -74,6 +74,24 @@ def _run_lastfm_sync() -> None:
     run_lastfm_sync(SessionLocal, lastfm, max_users=settings.LASTFM_MAX_USERS_PER_TICK)
 
 
+def _run_spotify_member_poll() -> None:
+    """Per-user Spotify listening poll (FEAT-multi-user Phase 3b-d). Triggered by
+    the EventBridge cron {"job":"spotify_member_poll"}. Per member: KMS-decrypt the
+    3b-c refresh token → refresh → rotate/re-encrypt → write the V45 member
+    listening tables. invalid_grant ⇒ status='reauth' (never retried); infra/KMS
+    failures skip the user without a status change. Fetch→materialize→close; no DB
+    session is ever held across the KMS/Spotify calls (rule #9: the cron pulls, the
+    API only reads the cached rows). No connected members ⇒ natural no-op."""
+    from worker.clients.spotify_member_client import spotify_member
+    from worker.service.spotify_member_sync_service import run_spotify_member_sync
+
+    run_spotify_member_sync(
+        SessionLocal,
+        spotify_member,
+        max_users=settings.SPOTIFY_MEMBER_MAX_USERS_PER_TICK,
+    )
+
+
 def _process_single(album_id: str, market: str) -> None:
     logger.info("Processing single album_id=%s market=%s DRY_RUN=%s", album_id, market, settings.DRY_RUN)
     if settings.DRY_RUN:
@@ -226,6 +244,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     if event.get("job") == "lastfm_recent_tracks":
         logger.info("EventBridge trigger: running Last.fm recent-tracks sync")
         _run_lastfm_sync()
+        return {}
+
+    # EventBridge cron — per-user Spotify listening poll (constant input, no
+    # "source"; FEAT-multi-user Phase 3b-d). Routed before the alias source check.
+    if event.get("job") == "spotify_member_poll":
+        logger.info("EventBridge trigger: running Spotify member listening poll")
+        _run_spotify_member_poll()
         return {}
 
     # EventBridge scheduled rule (alias cron) — full event carries source=aws.events
