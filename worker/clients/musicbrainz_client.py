@@ -206,3 +206,20 @@ def fetch_artist_mbid_and_aliases(
     except Exception as exc:
         logger.warning("MB lookup failed for '%s': %s", name, exc)
         return MBID_NOT_FOUND, []
+
+
+def search_upcoming_release_groups(mbid: str, date_from: str, date_to: str) -> list[dict]:
+    """FEAT-release-calendar Step 4 — release groups by artist within a
+    firstreleasedate window (one request per artist; RG level deliberately —
+    the 2026-07-12 probe showed RG `firstreleasedate` == release date 11/11
+    while release-level missed 2 announce-stage albums).
+
+    `mbid` and the ISO dates are hard IDs / fixed formats, so no Lucene
+    escaping is needed. Errors raise to the caller, which isolates the one
+    artist (log + continue) instead of failing the tick. musicbrainzngs'
+    process-wide 1 req/s rate limiter provides the MB throttle."""
+    result = musicbrainzngs.search_release_groups(
+        query=f"arid:{mbid} AND firstreleasedate:[{date_from} TO {date_to}]",
+        limit=100,
+    )
+    return result.get("release-group-list", [])

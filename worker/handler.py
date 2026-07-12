@@ -92,6 +92,31 @@ def _run_spotify_member_poll() -> None:
     )
 
 
+def _run_release_upcoming_poll(mode: str) -> None:
+    """Multi-source upcoming-release poller (FEAT-release-calendar Step 4).
+    Triggered by two EventBridge schedules, one per source ({"job":
+    "release_upcoming_poll","mode":"musicbrainz"|"itunes"}) so one source
+    lagging never delays the other. Stateless time-bucket rotation over the
+    pop≥50 watchlist; upserts 'announced' rows on UNIQUE(source, source_key).
+    Deliberately EventBridge-only — never the blogSQS queue (an MB/iTunes
+    outage must not clog album sync, same boundary as the alias fill)."""
+    from worker.service.release_upcoming_service import run_release_upcoming_poll
+
+    if mode == "musicbrainz":
+        from worker.clients.musicbrainz_client import search_upcoming_release_groups
+
+        run_release_upcoming_poll(
+            SessionLocal, mode="musicbrainz", mb_search=search_upcoming_release_groups
+        )
+        return
+    if mode == "itunes":
+        from worker.clients.itunes_client import itunes
+
+        run_release_upcoming_poll(SessionLocal, mode="itunes", itunes_client=itunes)
+        return
+    logger.warning("release_upcoming_poll: unknown mode %r — skipping", mode)
+
+
 def _process_single(album_id: str, market: str) -> None:
     logger.info("Processing single album_id=%s market=%s DRY_RUN=%s", album_id, market, settings.DRY_RUN)
     if settings.DRY_RUN:
@@ -244,6 +269,15 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     if event.get("job") == "lastfm_recent_tracks":
         logger.info("EventBridge trigger: running Last.fm recent-tracks sync")
         _run_lastfm_sync()
+        return {}
+
+    # EventBridge crons — multi-source upcoming-release poller (constant input,
+    # no "source"; FEAT-release-calendar Step 4). One rule per source, routed on
+    # event["mode"] (saved_tracks pattern), before the alias source check.
+    if event.get("job") == "release_upcoming_poll":
+        mode = event.get("mode", "musicbrainz")
+        logger.info("EventBridge trigger: running upcoming-release poll (mode=%s)", mode)
+        _run_release_upcoming_poll(mode)
         return {}
 
     # EventBridge cron — per-user Spotify listening poll (constant input, no
