@@ -147,6 +147,7 @@ def test_happy_path_filters_known_and_gates_low_pop(monkeypatch):
         "eligible": 2, "swept": 2, "discovered": 4, "fresh": 3,
         "novel": 2, "passed_gate": 1, "enqueued": 1,
         "confirm_candidates": 0, "confirm_flipped": 0, "confirm_inserted": 0,
+        "confirm_gate_skipped": 0,
     }
     # non-watchlist artists keep the full-length-only sweep (OQ5 scope bound)
     assert all(g == "album" for _, g in catalog.artist_calls)
@@ -298,12 +299,15 @@ def test_never_announced_watchlist_release_inserts_spotify_released_row(monkeypa
     catalog = _FakeCatalog(
         {"watchA": [{"id": "day0-album", "name": "Fresh Drop",
                      "album_type": "album", "release_date": "2026-07-13"}]},
-        {},
+        {"day0-album": 55},  # clears ALBUM_POP_MIN — insert gate passes
     )
     counters, _ = _run(session, catalog)
 
     assert counters["confirm_candidates"] == 1
     assert counters["confirm_inserted"] == 1 and counters["confirm_flipped"] == 0
+    assert counters["confirm_gate_skipped"] == 0
+    # already-known candidate wasn't in the novel probe → gate fetches it
+    assert catalog.albums_calls == [["day0-album"]]
     (sql, params), = session.sql_of(
         lambda s: "INSERT INTO artist_release_events" in s
     )
@@ -311,6 +315,26 @@ def test_never_announced_watchlist_release_inserts_spotify_released_row(monkeypa
     assert params["spotify_album_id"] == "day0-album"
     assert params["artist_id"] == "watchA-id"
     assert "'spotify'" in sql and "'released'" in sql
+
+
+@pytest.mark.unit
+def test_below_gate_never_announced_candidate_skipped(monkeypatch):
+    """Owner 2026-07-13: credit-farm compilations (watchlist artist credited as
+    primary, low album popularity) must not reach the calendar via the confirm
+    insert path — first live tick put 103 ungated rows in."""
+    monkeypatch.setattr(ais.settings, "INGEST_SINCE", "2026-06-10")
+    session = _FakeSession(eligible=[("watchA", True)], known={"comp-farm"})
+    catalog = _FakeCatalog(
+        {"watchA": [{"id": "comp-farm", "name": "065 Piano Essentials",
+                     "album_type": "album", "release_date": "2026-07-01"}]},
+        {"comp-farm": 2},  # below ALBUM_POP_MIN
+    )
+    counters, _ = _run(session, catalog)
+
+    assert counters["confirm_candidates"] == 1
+    assert counters["confirm_inserted"] == 0
+    assert counters["confirm_gate_skipped"] == 1
+    assert not session.sql_of(lambda s: "INSERT INTO artist_release_events" in s)
 
 
 @pytest.mark.unit

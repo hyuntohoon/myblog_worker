@@ -173,6 +173,13 @@ def confirm_release_events(
                     "spotify_album_id": cand["spotify_album_id"],
                 }
             )
+        elif not cand.get("passes_gate", False):
+            # Never-announced AND below the catalog quality bar — do not put it
+            # on the calendar (owner 2026-07-13; fail-closed when the caller
+            # didn't annotate). Flips above are deliberately exempt.
+            counters["confirm_gate_skipped"] = (
+                counters.get("confirm_gate_skipped", 0) + 1
+            )
         else:
             inserts.append(
                 {
