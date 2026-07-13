@@ -66,12 +66,15 @@ class _FakeSession:
 
 
 def _cand(**kw):
+    # passes_gate defaults True: most cases exercise the flip/insert machinery,
+    # not the insert quality gate (tested explicitly in TestConfirmInsertGate).
     return {
         "artist_id": "artist-1",
         "spotify_album_id": "sp-1",
         "title": "Blue Album",
         "release_type": "album",
         "release_date": "2026-07-13",
+        "passes_gate": True,
         **kw,
     }
 
@@ -172,7 +175,7 @@ class TestConfirmReleaseEvents:
             "release_type": "album",
             "release_date": "2026-07-13",
             "spotify_album_id": "sp-1",
-        }
+        }  # passes_gate is consumed by the gate, never sent to SQL
         # the confirm upsert is the ONLY path allowed to set status on conflict,
         # and its guard keeps re-encounters rowcount-silent
         assert "'released'" in sql and "IS DISTINCT FROM" in sql
@@ -211,6 +214,40 @@ class TestConfirmReleaseEvents:
         ])
         assert counters["confirm_flipped"] == 1
         assert counters["confirm_inserted"] == 1
+
+
+class TestConfirmInsertGate:
+    """Owner 2026-07-13 (first-live-tick finding): never-announced inserts must
+    clear ALBUM_POP_MIN; flips are exempt (MB/iTunes observation = curation)."""
+
+    def _run(self, session, candidates):
+        counters = {"confirm_candidates": 0, "confirm_flipped": 0, "confirm_inserted": 0}
+        confirm_release_events(lambda: session, candidates, counters)
+        return counters
+
+    def test_below_gate_never_announced_is_skipped_not_inserted(self):
+        session = _FakeSession(events=[])
+        counters = self._run(session, [_cand(passes_gate=False)])
+        assert counters["confirm_inserted"] == 0
+        assert counters["confirm_gate_skipped"] == 1
+        assert session.sql_of(lambda s: "INSERT INTO" in s) == []
+
+    def test_missing_annotation_fails_closed(self):
+        session = _FakeSession(events=[])
+        cand = _cand()
+        del cand["passes_gate"]
+        counters = self._run(session, [cand])
+        assert counters["confirm_inserted"] == 0
+        assert counters["confirm_gate_skipped"] == 1
+
+    def test_below_gate_still_flips_matched_announced_rows(self):
+        session = _FakeSession(events=[
+            _Row(id="ev-1", artist_id="artist-1", title="Blue Album",
+                 release_date=date(2026, 7, 13), status="announced", spotify_album_id=None),
+        ])
+        counters = self._run(session, [_cand(passes_gate=False)])
+        assert counters["confirm_flipped"] == 1
+        assert counters.get("confirm_gate_skipped", 0) == 0
 
 
 @pytest.mark.unit

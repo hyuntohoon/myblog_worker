@@ -111,6 +111,7 @@ def run_album_ingest(
         "eligible": 0, "swept": 0, "discovered": 0, "fresh": 0,
         "novel": 0, "passed_gate": 0, "enqueued": 0,
         "confirm_candidates": 0, "confirm_flipped": 0, "confirm_inserted": 0,
+        "confirm_gate_skipped": 0,
     }
 
     # Read the catalog cap + eligible-artist list in a short session, then CLOSE
@@ -181,8 +182,12 @@ def run_album_ingest(
     counters["novel"] = len(novel_ids)
 
     passed: List[str] = []
+    pop_by_id: Dict[str, int] = {}
     if novel_ids:
         full_albums: List[Dict[str, Any]] = catalog_client.get_albums(novel_ids)
+        for a in full_albums:
+            if a and a.get("id"):
+                pop_by_id[a["id"]] = a.get("popularity") or 0
         passed = [
             a["id"]
             for a in full_albums
@@ -195,6 +200,28 @@ def run_album_ingest(
         enqueue(to_enqueue)
     counters["enqueued"] = len(to_enqueue)
 
+    # Confirm-insert gate (owner 2026-07-13, first-live-tick finding): a
+    # never-announced insert must clear the same ALBUM_POP_MIN bar as the
+    # catalog enqueue — without it the confirm path floods the calendar with
+    # credit-farm compilations that list a watchlist artist as primary
+    # (Schubert-class noise). Flips stay ungated: an announced row was already
+    # curated by an MB/iTunes observation. Missing popularity ⇒ gate fails
+    # (fail-closed; the artist re-sweeps next rotation). Ids already fetched
+    # for the novel gate are reused, so the extra Spotify cost is only the
+    # already-known candidate albums.
+    if confirm_candidates:
+        need = sorted(
+            {c["spotify_album_id"] for c in confirm_candidates} - set(pop_by_id)
+        )
+        if need:
+            for a in catalog_client.get_albums(need):
+                if a and a.get("id"):
+                    pop_by_id[a["id"]] = a.get("popularity") or 0
+        for c in confirm_candidates:
+            c["passes_gate"] = (
+                pop_by_id.get(c["spotify_album_id"], 0) >= settings.ALBUM_POP_MIN
+            )
+
     # Step-5 release-day confirm (DB-only; external loop already over).
     confirm_release_events(session_factory, confirm_candidates, counters)
 
@@ -204,7 +231,8 @@ def run_album_ingest(
         "passed_gate=%(passed_gate)d enqueued=%(enqueued)d "
         "confirm_candidates=%(confirm_candidates)d "
         "confirm_flipped=%(confirm_flipped)d "
-        "confirm_inserted=%(confirm_inserted)d",
+        "confirm_inserted=%(confirm_inserted)d "
+        "confirm_gate_skipped=%(confirm_gate_skipped)d",
         counters,
     )
     return counters
