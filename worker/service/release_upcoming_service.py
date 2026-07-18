@@ -57,11 +57,15 @@ ITUNES_ID_NOT_FOUND = "not_found"
 # one-time ops DELETE clears the no-UPC ones (Step 5 PR body).
 RESOLVED_VIA_NO_UPC = "no_upc"
 
+# Poll scope = popularity watchlist ∪ user-tracked artists (FEAT-personal-
+# release-tracking Step 4a): an artist a member tracks must get upcoming
+# discovery even below the popularity floor. Both source passes share this rule.
 _SELECT_MB_WATCHLIST = text(
     """
     SELECT id AS artist_id, musicbrainz_id
       FROM artists
-     WHERE popularity >= :pop_min
+     WHERE (popularity >= :pop_min
+            OR EXISTS (SELECT 1 FROM user_artist_tracks t WHERE t.artist_id = artists.id))
        AND musicbrainz_id IS NOT NULL
        AND musicbrainz_id <> 'not_found'
      ORDER BY spotify_id
@@ -77,7 +81,8 @@ _SELECT_ITUNES_WATCHLIST = text(
       FROM artists a
       LEFT JOIN artist_source_ids asi
         ON asi.artist_id = a.id AND asi.source = 'itunes'
-     WHERE a.popularity >= :pop_min
+     WHERE (a.popularity >= :pop_min
+            OR EXISTS (SELECT 1 FROM user_artist_tracks t WHERE t.artist_id = a.id))
      ORDER BY a.spotify_id
     """
 )
