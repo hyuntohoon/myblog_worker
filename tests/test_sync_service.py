@@ -7,7 +7,26 @@ from unittest.mock import patch, MagicMock
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+import worker.service.artist_enrich_service as artist_enrich_service
+import worker.service.sync_service as sync_service
 from worker.service.sync_service import AlbumSyncService, generate_and_save_aliases
+
+
+class _EnrichSpotifyProxy:
+    """The enrich step moved into artist_enrich_service (BUG-artist-image-backfill),
+    which holds its own `spotify` reference — so the module-level
+    @patch("worker.service.sync_service.spotify") these tests use no longer covers
+    the enrich call, and the real client would hit the Spotify token endpoint.
+    Forward attribute access to sync_service.spotify (lazily, so the per-test
+    mock is picked up) to keep one patch target for the whole sync flow."""
+
+    def __getattr__(self, name):
+        return getattr(sync_service.spotify, name)
+
+
+@pytest.fixture(autouse=True)
+def _route_enrich_through_sync_spotify(monkeypatch):
+    monkeypatch.setattr(artist_enrich_service, "spotify", _EnrichSpotifyProxy())
 
 
 @pytest.mark.integration
