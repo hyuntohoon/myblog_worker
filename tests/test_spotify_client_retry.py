@@ -76,6 +76,44 @@ def test_get_artists_retries_5xx_then_succeeds(monkeypatch):
 
 
 @pytest.mark.unit
+def test_get_artists_batch_403_falls_back_to_individual_gets(monkeypatch):
+    calls, sleeps = _patch_requests(monkeypatch, [
+        _resp(403),
+        _resp(200, json_body={"id": "ar1"}),
+        _resp(200, json_body={"id": "ar2"}),
+    ])
+
+    out = _client_with_token().get_artists(["ar1", "ar2"])
+
+    assert [artist["id"] for artist in out] == ["ar1", "ar2"]
+    assert calls == [
+        ("GET", f"{suc.settings.SPOTIFY_API_BASE}/artists"),
+        ("GET", f"{suc.settings.SPOTIFY_API_BASE}/artists/ar1"),
+        ("GET", f"{suc.settings.SPOTIFY_API_BASE}/artists/ar2"),
+    ]
+    assert sleeps == []
+
+
+@pytest.mark.unit
+def test_get_artists_individual_404_is_skipped_during_fallback(monkeypatch):
+    calls, _ = _patch_requests(monkeypatch, [
+        _resp(403),
+        _resp(200, json_body={"id": "ar1"}),
+        _resp(404),
+        _resp(200, json_body={"id": "ar3"}),
+    ])
+
+    out = _client_with_token().get_artists(["ar1", "missing", "ar3"])
+
+    assert [artist["id"] for artist in out] == ["ar1", "ar3"]
+    assert calls[-3:] == [
+        ("GET", f"{suc.settings.SPOTIFY_API_BASE}/artists/ar1"),
+        ("GET", f"{suc.settings.SPOTIFY_API_BASE}/artists/missing"),
+        ("GET", f"{suc.settings.SPOTIFY_API_BASE}/artists/ar3"),
+    ]
+
+
+@pytest.mark.unit
 def test_get_albums_exhausted_429_still_raises(monkeypatch):
     # failure contract preserved: after max tries the last response surfaces via
     # raise_for_status, so the SQS path still redelivers/DLQs a persistent outage

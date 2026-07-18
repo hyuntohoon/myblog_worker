@@ -167,6 +167,16 @@ def _run_isrc_backfill(limit: int = 1000) -> None:
         logger.info("ISRC backfill metrics: %s", metrics)
 
 
+def _run_artist_photo_backfill(limit: int | None = None) -> None:
+    """One-shot backlog + weekly EventBridge sweep (BUG-artist-image-backfill).
+    EventBridge/SQS triggered and failure-isolated so it must not block album sync.
+    """
+    from worker.service.artist_enrich_service import run_artist_photo_backfill
+
+    metrics = run_artist_photo_backfill(SessionLocal, limit=limit)
+    logger.info("Artist photo backfill metrics: %s", metrics)
+
+
 def _run_lyrics_incremental(limit: int | None = None) -> None:
     """Periodic incremental lyrics collection (FEAT-lyrics-corpus Step 3). Alias-fill
     pattern: select recently-added tracks lacking a track_lyrics row, evaluate each via
@@ -243,6 +253,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         limit = event.get("limit", 1000)
         logger.info("EventBridge/SQS trigger: running ISRC backfill (limit=%s)", limit)
         _run_isrc_backfill(limit=limit)
+        return {}
+
+    # EventBridge/SQS trigger — one-shot backlog + weekly artist-photo sweep.
+    if event.get("job") == "artist_photo_backfill":
+        limit = event.get("limit")
+        logger.info("EventBridge/SQS trigger: running artist photo backfill (limit=%s)", limit)
+        _run_artist_photo_backfill(limit=limit)
         return {}
 
     # EventBridge/SQS trigger — incremental lyrics collection (FEAT-lyrics-corpus Step 3).
@@ -332,6 +349,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             # near-real-time chain below relies on it).
             if body.get("job") == "lyrics_incremental":
                 _run_lyrics_incremental(limit=body.get("limit"))
+                continue
+
+            if body.get("job") == "artist_photo_backfill":
+                _run_artist_photo_backfill(limit=body.get("limit"))
                 continue
 
             if body.get("job") == "lyrics_reassessment":
