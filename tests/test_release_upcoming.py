@@ -143,6 +143,30 @@ class TestDedupSort:
         assert out[1]["artist_id"] == 1  # first observation kept
 
 
+class TestPollScope:
+    """Poll scope = popularity watchlist ∪ user-tracked artists (personal-release-
+    tracking Step 4a). Guard the EXISTS clause in BOTH source eligibility queries
+    — losing it silently drops tracked long-tail artists from discovery."""
+
+    def test_mb_watchlist_query_includes_tracked_artists(self):
+        session = _FakeSession()
+        run_release_upcoming_poll(
+            lambda: session, mode="musicbrainz", mb_search=lambda *a: [],
+            tick_index=0, today=TODAY,
+        )
+        (sql, _), = session.sql_of(lambda s: "FROM artists" in s and "musicbrainz_id" in s)
+        assert "EXISTS (SELECT 1 FROM user_artist_tracks" in sql
+
+    def test_itunes_watchlist_query_includes_tracked_artists(self):
+        session = _FakeSession()
+        run_release_upcoming_poll(
+            lambda: session, mode="itunes", itunes_client=object(),
+            tick_index=0, today=TODAY,
+        )
+        (sql, _), = session.sql_of(lambda s: "LEFT JOIN artist_source_ids" in s)
+        assert "EXISTS (SELECT 1 FROM user_artist_tracks" in sql
+
+
 def _rg(rgid="rg-1", title="Next", first="2026-08-01", ptype="Album"):
     return {"id": rgid, "title": title, "first-release-date": first, "primary-type": ptype}
 
