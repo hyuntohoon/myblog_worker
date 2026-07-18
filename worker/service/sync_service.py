@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from myblog_shared_db.genre_mapping import attachable_slugs
 from worker.clients.spotify_client import spotify
 from worker.clients.musicbrainz_client import fetch_artist_mbid_and_aliases
+from worker.service.artist_enrich_service import enrich_artists
 
 logger = logging.getLogger(__name__)
 
@@ -240,7 +241,7 @@ class AlbumSyncService:
                 text("""
                     SELECT spotify_id FROM artists
                     WHERE spotify_id = ANY(:ids)
-                      AND (photo_url IS NULL OR photo_url = '')
+                      AND photo_url IS NULL
                 """),
                 dict(ids=list(all_artist_ids)),
             ).fetchall()
@@ -248,38 +249,9 @@ class AlbumSyncService:
             missing_ids = [r[0] for r in rows]
 
             if missing_ids:
-                for chunk in [missing_ids[i:i + 50] for i in range(0, len(missing_ids), 50)]:
-                    detail_list = spotify.get_artists_batch(chunk)
-
-                    enrich_data = []
-                    for art in detail_list:
-                        imgs = art.get("images") or []
-                        photo = imgs[0].get("url") if imgs else None
-                        followers = art.get("followers") or {}
-                        if isinstance(followers, dict):
-                            followers = followers.get("total")
-
-                        enrich_data.append(dict(
-                            sid=art["id"],
-                            photo=photo,
-                            genres=json.dumps(art.get("genres") or []),
-                            followers=followers,
-                            popularity=art.get("popularity"),
-                        ))
-
-                    if enrich_data:
-                        self.conn.execute(
-                            text("""
-                                UPDATE artists SET
-                                    photo_url  = :photo,
-                                    genres     = CAST(:genres AS jsonb),
-                                    followers  = :followers,
-                                    popularity = :popularity
-                                WHERE spotify_id = :sid
-                            """),
-                            enrich_data,
-                        )
-                        logger.info("artists enriched: %d", len(enrich_data))
+                enriched = enrich_artists(self.conn, missing_ids)
+                if enriched:
+                    logger.info("artists enriched: %d", enriched)
 
         # 5) S1 genre mapping (FEAT-genre-system Step 2): deterministic
         #    artists.genres → tier-0 attach for the batch's albums. Runs after

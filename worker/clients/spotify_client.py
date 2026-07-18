@@ -2,6 +2,9 @@
 # Auth logic (_get_token/_headers) must stay in sync. See docs/decisions/ADR-0004.
 import base64, logging, time
 from typing import Optional, Dict, Any, List
+
+import httpx
+
 from worker.core.config import settings
 
 # Shared transient-retry helper (429 Retry-After + 5xx/transport backoff). Lives in
@@ -107,10 +110,26 @@ class SpotifyClient:
 
             logger.debug("GET /artists chunk=%d size=%d", i // _MAX_ARTISTS + 1, len(chunk))
 
-            r = _request_with_retry(
-                "GET", base_url, headers=self._headers(), params=params, timeout=20
-            )
-            r.raise_for_status()
+            try:
+                r = _request_with_retry(
+                    "GET", base_url, headers=self._headers(), params=params, timeout=20
+                )
+                r.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status not in (403, 404, 410):
+                    raise
+                logger.warning(
+                    "Spotify batch GET /artists unavailable (status=%d); "
+                    "falling back to %d individual requests",
+                    status,
+                    len(chunk),
+                )
+                for artist_id in chunk:
+                    artist = self.get_artist(artist_id)
+                    if artist:
+                        out.append(artist)
+                continue
 
             artists = r.json().get("artists") or []
             logger.debug("Retrieved %d artists", len(artists))
@@ -118,6 +137,30 @@ class SpotifyClient:
             out.extend(artists)
 
         return out
+
+    def get_artist(self, artist_id: str) -> dict | None:
+        """GET one artist, tolerating an unknown or unavailable catalog ID."""
+        url = f"{settings.SPOTIFY_API_BASE}/artists/{artist_id}"
+        try:
+            r = _request_with_retry(
+                "GET",
+                url,
+                headers=self._headers(),
+                params={"locale": "ko_KR"},
+                timeout=20,
+            )
+            r.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status not in (403, 404, 410):
+                raise
+            logger.warning(
+                "Spotify artist unavailable: id=%s status=%d",
+                artist_id,
+                status,
+            )
+            return None
+        return r.json()
 
     def get_artists_batch(self, ids: list[str]) -> list[dict[str, Any]]:
         """호환용 thin wrapper."""
