@@ -44,6 +44,72 @@ def enqueue_album_sync(album_ids: List[str]) -> None:
     logger.info("enqueued %d unknown recently-played albums for catalog sync", len(album_ids))
 
 
+# Follow-ingest messages carry catalog-artist ids to expand into album-sync jobs.
+# ≤10 artists per message bounds one invocation at ~10 get_artist_albums calls +
+# their album-sync sends, well inside the 120s Lambda budget.
+_FOLLOW_INGEST_CHUNK = 10
+
+# One SQS-delay cycle (the 900s API maximum) before the snapshot re-import that
+# attaches artists ingested by the fan-out above.
+FOLLOW_RERUN_DELAY_SECONDS = 900
+
+
+def enqueue_follow_ingest(artist_sids: List[str]) -> int:
+    """Fan out {"job": "spotify_follow_ingest", "artist_sids": [...]} messages for
+    followed artists missing from the catalog (FEAT-for-you-releases Step 2, OQ1 =
+    catalog-ingest). Chunked so each consuming invocation stays bounded. Returns the
+    artist count enqueued; no-op (0) when no queue URL is configured."""
+    sids = sorted({s for s in (artist_sids or []) if s})
+    if not sids:
+        return 0
+    if not settings.SQS_QUEUE_URL:
+        logger.info("SQS_QUEUE_URL unset; skipping follow-ingest of %d artists", len(sids))
+        return 0
+
+    import boto3
+
+    sqs = boto3.client(
+        "sqs",
+        region_name=settings.AWS_DEFAULT_REGION,
+        endpoint_url=(settings.LOCALSTACK_ENDPOINT or None),
+    )
+    for i in range(0, len(sids), _FOLLOW_INGEST_CHUNK):
+        body = json.dumps(
+            {"job": "spotify_follow_ingest", "artist_sids": sids[i : i + _FOLLOW_INGEST_CHUNK]}
+        )
+        sqs.send_message(QueueUrl=settings.SQS_QUEUE_URL, MessageBody=body)
+    logger.info("enqueued follow-ingest for %d uncatalogued followed artists", len(sids))
+    return len(sids)
+
+
+def enqueue_follow_import_rerun(user_id: str) -> bool:
+    """Chain ONE delayed snapshot re-import ({"job": "spotify_follow_import",
+    "rerun": true}) after a follow-ingest fan-out, so artists the fan-out catalogs
+    get their tracked edge without a second button press. rerun=true stops the
+    consumer from fanning out again — a lost message only means those artists wait
+    for the owner's next manual import. No-op (False) when no queue is configured."""
+    if not settings.SQS_QUEUE_URL:
+        logger.info("SQS_QUEUE_URL unset; skipping follow-import rerun chain")
+        return False
+
+    import boto3
+
+    sqs = boto3.client(
+        "sqs",
+        region_name=settings.AWS_DEFAULT_REGION,
+        endpoint_url=(settings.LOCALSTACK_ENDPOINT or None),
+    )
+    sqs.send_message(
+        QueueUrl=settings.SQS_QUEUE_URL,
+        MessageBody=json.dumps(
+            {"job": "spotify_follow_import", "user_id": user_id, "rerun": True}
+        ),
+        DelaySeconds=FOLLOW_RERUN_DELAY_SECONDS,
+    )
+    logger.info("chained delayed follow-import rerun (%ds)", FOLLOW_RERUN_DELAY_SECONDS)
+    return True
+
+
 def enqueue_lyrics_incremental() -> None:
     """Chain a near-real-time incremental lyrics pass after an album sync lands new
     tracks (consumed by the handler's SQS branch as {"job": "lyrics_incremental"}).
