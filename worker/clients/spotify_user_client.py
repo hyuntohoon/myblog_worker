@@ -9,7 +9,8 @@
 #
 # Scopes: user-read-recently-played, user-read-currently-playing (listening reads),
 # user-library-read + user-library-modify (Spotify Library two-way sync,
-# FEAT-spotify-library-sync — the only write scopes, per D11 follow-up).
+# FEAT-spotify-library-sync — the only write scopes, per D11 follow-up),
+# user-follow-read (followed-artists import, FEAT-for-you-releases Step 2).
 from __future__ import annotations
 
 import base64
@@ -41,6 +42,8 @@ MAX_BACKOFF_SECONDS = 8.0
 # at 50 per page (LIBRARY_PAGE_LIMIT below).
 LIBRARY_IDS_CHUNK = 20
 LIBRARY_PAGE_LIMIT = 50
+# GET /me/following pages by cursor (after=<last artist id>), also capped at 50.
+FOLLOW_PAGE_LIMIT = 50
 
 
 def _parse_added_at(value: str) -> datetime:
@@ -412,6 +415,38 @@ class SpotifyUserClient:
             if isinstance(total, int) and offset >= total:
                 break
         return tracks
+
+    # ---------- followed artists (FEAT-for-you-releases Step 2) ----------
+    def get_followed_artists(self) -> List[Dict[str, Any]]:
+        """GET /me/following?type=artist — cursor-paged (after=<last id>, ≤50/page).
+
+        Returns the raw Spotify artist objects (callers read .id / .name). A 403
+        means the stored token predates the user-follow-read scope → raise
+        SpotifyScopeError so the import maps it to "재인증 필요" instead of
+        retrying (the owner must re-run the bootstrap to re-consent)."""
+        url = f"{settings.SPOTIFY_API_BASE}/me/following"
+        artists: List[Dict[str, Any]] = []
+        after: Optional[str] = None
+        while True:
+            params: Dict[str, Any] = {"type": "artist", "limit": FOLLOW_PAGE_LIMIT}
+            if after:
+                params["after"] = after
+            r = _request_with_retry(
+                "GET", url, headers=self._headers(), params=params, timeout=20
+            )
+            if r.status_code == 403:
+                raise SpotifyScopeError(
+                    "Spotify GET /me/following returned 403 (missing user-follow-read "
+                    "scope) — re-run scripts/spotify_bootstrap_token.py --write to re-consent"
+                )
+            r.raise_for_status()
+            block = (r.json() or {}).get("artists") or {}
+            items = block.get("items") or []
+            artists.extend(it for it in items if it and it.get("id"))
+            after = (block.get("cursors") or {}).get("after")
+            if not items or not after:
+                break
+        return artists
 
     def check_saved_albums(self, spotify_ids: List[str]) -> Dict[str, bool]:
         """GET /me/albums/contains?ids= (chunked ≤ 20) → {spotify_id: is_saved}.

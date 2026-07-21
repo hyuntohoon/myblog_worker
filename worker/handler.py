@@ -92,6 +92,38 @@ def _run_spotify_member_poll() -> None:
     )
 
 
+def _run_follow_import(user_id: Any, rerun: bool = False) -> None:
+    """Owner followed-artists snapshot import (FEAT-for-you-releases Step 2).
+    Triggered by the backend's owner-gated POST /api/me/tracked-artists/spotify-import
+    enqueue ({"job": "spotify_follow_import", "user_id": ...}) plus one self-chained
+    delayed rerun (rule #9: the endpoint only enqueues; the worker reads Spotify)."""
+    from worker.clients.spotify_user_client import spotify_user
+    from worker.clients.sqs_producer import (
+        enqueue_follow_import_rerun,
+        enqueue_follow_ingest,
+    )
+    from worker.service.follow_import_service import run_follow_import
+
+    run_follow_import(
+        SessionLocal,
+        spotify_user,
+        enqueue_ingest=enqueue_follow_ingest,
+        enqueue_rerun=enqueue_follow_import_rerun,
+        user_id=user_id,
+        rerun=rerun,
+    )
+
+
+def _run_follow_ingest(artist_sids: List[str]) -> None:
+    """Expand uncatalogued followed artists onto the album-sync SQS pipeline
+    (FEAT-for-you-releases Step 2, OQ1 = catalog-ingest). Fan-out messages are
+    produced by _run_follow_import; artists are created downstream by album sync."""
+    from worker.clients.sqs_producer import enqueue_album_sync
+    from worker.service.follow_import_service import run_follow_ingest
+
+    run_follow_ingest(spotify, enqueue_album_sync, artist_sids)
+
+
 def _run_release_upcoming_poll(mode: str) -> None:
     """Multi-source upcoming-release poller (FEAT-release-calendar Step 4).
     Triggered by two EventBridge schedules, one per source ({"job":
@@ -340,6 +372,20 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             # mode ∈ {incremental, full}; full reconciles + prunes un-likes.
             if body.get("job") == "spotify_saved_tracks_sync":
                 _run_saved_tracks_sync(body.get("mode", "incremental"))
+                continue
+
+            # Owner followed-artists snapshot import (FEAT-for-you-releases Step 2).
+            # Enqueued by the backend POST /api/me/tracked-artists/spotify-import
+            # (owner-gated; rule #9: the endpoint only enqueues) — plus one
+            # self-chained delayed rerun (rerun=true never fans out again).
+            if body.get("job") == "spotify_follow_import":
+                _run_follow_import(body.get("user_id"), rerun=bool(body.get("rerun")))
+                continue
+
+            # Follow-import fan-out: catalog-ingest a chunk of followed artists
+            # missing from the catalog (albums ride the normal album-sync path).
+            if body.get("job") == "spotify_follow_ingest":
+                _run_follow_ingest(body.get("artist_sids") or [])
                 continue
 
             # Lyrics jobs via SQS. The EventBridge constant-input path hits the
