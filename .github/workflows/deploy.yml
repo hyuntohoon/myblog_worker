@@ -4,6 +4,8 @@ name: Deploy Worker Lambda
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 # Least privilege: default GITHUB_TOKEN is too broad; this workflow only needs to read the repo.
