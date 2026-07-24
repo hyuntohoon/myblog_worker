@@ -107,7 +107,10 @@ jobs:
           AWS_DEFAULT_REGION: ap-northeast-2
           FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME || 'blogWorkerLambda' }}
         run: |
-          aws lambda wait function-updated --function-name "$FUNCTION_NAME"
+          # function-updated-v2 polls GetFunction (already granted to the deploy
+          # user); the v1 waiter polls GetFunctionConfiguration, which the
+          # least-privilege lambda-deploy-only policy does not allow.
+          aws lambda wait function-updated-v2 --function-name "$FUNCTION_NAME"
           aws lambda invoke \
             --function-name "$FUNCTION_NAME" \
             --cli-binary-format raw-in-base64-out \
