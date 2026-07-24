@@ -92,3 +92,31 @@ jobs:
             --function-name "$FUNCTION_NAME" \
             --zip-file fileb://bundle.zip \
             --architectures arm64
+
+      # OPS-delivery-safety-gates Step 3 — post-deploy health smoke. The worker has
+      # no HTTP surface, so health = wait for the new code to go live, then invoke
+      # with an empty event. An empty `{}` matches no job/source/Records branch, so
+      # the handler returns {"batchItemFailures": []} as a pure no-op (no DB, no
+      # external calls) — a FunctionError here means the deployed bundle fails to
+      # import/enter, i.e. roll back. Code is already live, so this is
+      # detect-and-alert-fast + rollback trigger, not a pre-cutover gate.
+      - name: Post-deploy smoke (health invoke)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ap-northeast-2
+          FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME || 'blogWorkerLambda' }}
+        run: |
+          aws lambda wait function-updated --function-name "$FUNCTION_NAME"
+          aws lambda invoke \
+            --function-name "$FUNCTION_NAME" \
+            --cli-binary-format raw-in-base64-out \
+            --payload '{}' \
+            /tmp/worker-out.json > /tmp/worker-invoke.json
+          echo "invoke metadata:"; cat /tmp/worker-invoke.json; echo
+          echo "payload response:"; cat /tmp/worker-out.json; echo
+          if grep -q '"FunctionError"' /tmp/worker-invoke.json; then
+            echo "::error::Worker health invoke returned a FunctionError — the deployed bundle is broken (import/entry failure). Roll back the deploy."
+            exit 1
+          fi
+          echo "Worker health OK (empty-event invoke, no FunctionError)."
