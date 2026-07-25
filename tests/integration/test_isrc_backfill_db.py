@@ -118,9 +118,13 @@ def test_isrc_backfill_fetches_tracks_without_isrc(session_factory):
                 },
             )
 
-        # Fetch tracks without ISRC (service now owns the session, not a raw conn)
+        # Fetch tracks without ISRC (service now owns the session, not a raw conn).
+        # The limit must exceed the branch's whole eligible pool: the selection is now
+        # `ORDER BY spotify_id`, and the `test_track_*` prefix sorts AFTER every real
+        # Spotify id, so a small LIMIT would page these seeds out and fail spuriously
+        # on any branch holding more than that many unmarked NULL-isrc rows.
         svc = IsrcBackfillService(session)
-        tracks = svc._fetch_tracks_without_isrc(limit=100)
+        tracks = svc._fetch_tracks_without_isrc(limit=1_000_000)
 
         # Should get only track1 (track2 has ISRC already)
         track_ids = [t["id"] for t in tracks]
@@ -190,13 +194,19 @@ def test_isrc_backfill_writes_isrc(mock_spotify, session_factory):
         svc = IsrcBackfillService(session)
         metrics = svc.backfill_isrc(limit=100)
 
-        # Verify ISRC was written
+        # Verify ISRC was written to the column AND mirrored into ext_refs (so the
+        # genre CLI, which reads ext_refs->>'isrc' as "already fetched", stops asking).
         with session.begin():
             result = session.execute(
-                text("SELECT isrc FROM tracks WHERE id = CAST(:id AS UUID)"),
+                text(
+                    "SELECT isrc, ext_refs->>'isrc', ext_refs->>'isrc_status' "
+                    "FROM tracks WHERE id = CAST(:id AS UUID)"
+                ),
                 {"id": track_id},
             ).first()
             assert result[0] == "USRC12345678"
+            assert result[1] == "USRC12345678"
+            assert result[2] is None, "a matched row must carry no miss marker"
 
         assert metrics["matched"] >= 1
 
@@ -216,7 +226,14 @@ def test_isrc_backfill_writes_isrc(mock_spotify, session_factory):
 
 @patch("worker.service.isrc_backfill_service.spotify")
 def test_isrc_backfill_writes_sentinel_on_miss(mock_spotify, session_factory):
-    """Service writes sentinel when Spotify returns no ISRC."""
+    """Service marks the miss in ext_refs and leaves the isrc COLUMN NULL.
+
+    Regression for the sentinel defect: the miss marker used to be written straight
+    into ``tracks.isrc`` as the string ``"no_isrc"``, which would have broken every
+    ``isrc IS NOT NULL`` predicate the day the job was first scheduled. The column must
+    now only ever hold a real ISRC. The marker also must NOT land under the ``isrc``
+    ext_refs key — that key means "a real ISRC" to ``backfill_genres.py``.
+    """
     Session = session_factory
     session = Session()
     try:
@@ -264,15 +281,24 @@ def test_isrc_backfill_writes_sentinel_on_miss(mock_spotify, session_factory):
         svc = IsrcBackfillService(session)
         metrics = svc.backfill_isrc(limit=100)
 
-        # Verify sentinel was written
+        # Verify the marker went to ext_refs and the column stayed clean
         with session.begin():
             result = session.execute(
-                text("SELECT isrc FROM tracks WHERE id = CAST(:id AS UUID)"),
+                text(
+                    "SELECT isrc, ext_refs->>'isrc_status', ext_refs->>'isrc' "
+                    "FROM tracks WHERE id = CAST(:id AS UUID)"
+                ),
                 {"id": track_id},
             ).first()
-            assert result[0] == "no_isrc"
+            assert result[0] is None, "isrc column must never hold a miss marker"
+            assert result[1] == "no_isrc"
+            assert result[2] is None, "miss must not occupy the real-ISRC ext_refs key"
 
         assert metrics["sentinel_written"] >= 1
+
+        # And the marked row drops out of the selection pool (no infinite re-fetch).
+        svc2 = IsrcBackfillService(session)
+        assert track_id not in [t["id"] for t in svc2._fetch_tracks_without_isrc(limit=1000)]
 
     finally:
         # Cleanup

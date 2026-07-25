@@ -141,6 +141,14 @@ class Settings(BaseSettings):
     LYRICS_REASSESS_CONCURRENCY: int = 20
     LYRICS_REASSESS_TIME_BUDGET_SEC: float = 90.0
 
+    # ISRC backfill (FEAT-lyrics-corpus Step 1b, worker EventBridge job). Bounded like every
+    # other scheduled job so a run always finishes inside the 120s Lambda timeout: 500 tracks
+    # is 10 Spotify chunks of 50, and the budget stops the loop rather than letting a 429
+    # burst (retry backoff caps at 8s/attempt, 3 attempts) run past the timeout mid-batch.
+    # Committed batches survive a cut-off; the remainder is simply re-selected next run.
+    ISRC_BACKFILL_BATCH_LIMIT: int = 500
+    ISRC_BACKFILL_TIME_BUDGET_SEC: float = 90.0
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     SQS_MAX_MESSAGES: int = 1

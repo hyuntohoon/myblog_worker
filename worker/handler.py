@@ -182,11 +182,12 @@ def _process_batch(album_ids: List[str], market: str) -> None:
         logger.info("Batch synced to DB: %d albums", len(album_ids))
 
 
-def _run_isrc_backfill(limit: int = 1000) -> None:
+def _run_isrc_backfill(limit: int | None = None) -> None:
     """Bounded ISRC backfill for FEAT-lyrics-corpus Step 1b. Fetches up to `limit`
-    tracks lacking ISRC from the DB, enriches from Spotify GET /v1/tracks, writes
-    ISRC or sentinel. Follows alias-fill failure-isolation pattern (one batch failure
-    doesn't block the job)."""
+    tracks lacking ISRC from the DB, enriches from Spotify GET /v1/tracks, writes the
+    ISRC to the column or a miss marker to ``ext_refs.isrc_status``. Follows alias-fill
+    failure-isolation pattern (one batch failure doesn't block the job). ``limit``
+    defaults to ``settings.ISRC_BACKFILL_BATCH_LIMIT``."""
     from worker.service.isrc_backfill_service import IsrcBackfillService
 
     # No handler-owned session.begin(): the service commits per batch via the
@@ -196,7 +197,10 @@ def _run_isrc_backfill(limit: int = 1000) -> None:
     with SessionLocal() as session:
         svc = IsrcBackfillService(session)
         metrics = svc.backfill_isrc(limit=limit)
-        logger.info("ISRC backfill metrics: %s", metrics)
+        # WARNING, not INFO: prod Lambdas run LOG_LEVEL=WARNING, so an INFO line never
+        # reaches CloudWatch and a scheduled run would be unobservable (album_ingest
+        # logs its counters at WARNING for the same reason).
+        logger.warning("ISRC backfill metrics: %s", metrics)
 
 
 def _run_artist_photo_backfill(limit: int | None = None) -> None:
@@ -280,9 +284,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return {}
 
     # EventBridge/SQS trigger — ISRC backfill (FEAT-lyrics-corpus Step 1b).
-    # Bounded backfill: fetch tracks without ISRC, enrich from Spotify, write ISRC or sentinel.
+    # Bounded backfill: fetch tracks without an ISRC and without a prior attempt, enrich
+    # from Spotify, write the ISRC to tracks.isrc or a miss marker to ext_refs.isrc_status.
     if event.get("job") == "isrc_backfill":
-        limit = event.get("limit", 1000)
+        limit = event.get("limit")  # None ⇒ settings.ISRC_BACKFILL_BATCH_LIMIT
         logger.info("EventBridge/SQS trigger: running ISRC backfill (limit=%s)", limit)
         _run_isrc_backfill(limit=limit)
         return {}
