@@ -370,9 +370,12 @@ def test_isrc_backfill_txn_boundary_and_batch_isolation(session_factory):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("simulated Spotify outage on batch 1")
+            # Must be REAL-shaped ISRCs (2 alpha + 3 alnum + 7 digits): normalize_isrc
+            # rejects anything else and records it as a miss, which would leave the
+            # column NULL and silently break the matched==10 / non_null==10 assertions.
             return [
-                {"id": sid, "external_ids": {"isrc": f"US{sid[-8:].upper()}"}}
-                for sid in ids
+                {"id": sid, "external_ids": {"isrc": f"USRC1{i:07d}"}}
+                for i, sid in enumerate(ids)
             ]
 
         # Drive the service exactly like worker.handler._run_isrc_backfill does now:

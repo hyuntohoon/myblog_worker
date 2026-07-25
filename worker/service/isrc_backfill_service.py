@@ -21,6 +21,7 @@ genre CLI stops re-fetching a track this job has already resolved.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -38,6 +39,30 @@ STATUS_NOT_FOUND = "not_found"   # Spotify returned no object for this id
 STATUS_NO_ISRC = "no_isrc"       # object exists but carries no external_ids.isrc
 
 _CHUNK = 50  # Spotify GET /v1/tracks id limit
+
+# Canonical ISRC: 2 country + 3 registrant + 2 year + 5 designation, no separators.
+_ISRC_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$")
+
+
+def normalize_isrc(raw: Any) -> Optional[str]:
+    """Canonical compact uppercase ISRC, or None if the value is not one.
+
+    Spotify does NOT return a consistent format. The first 500-track run alone wrote
+    ``GB-SMU-41-19063`` (hyphenated display form) into the column, and the genre CLI's
+    corpus carries 32 lowercase values. Stored as-is, those never match a
+    ``WHERE isrc = :code`` lookup against a compact code — the same class of silent
+    breakage as the string sentinels this service was fixed to stop writing, just
+    quieter: the column looks populated and simply fails to join.
+
+    Hyphens are display formatting, so the standard storage form is the 12-character
+    compact one. Anything that does not reduce to a valid ISRC returns None and is
+    recorded as a ``no_isrc`` miss rather than poisoning the column (prod holds exactly
+    one such value: the literal ``"-"``).
+    """
+    if not raw:
+        return None
+    compact = re.sub(r"[^A-Za-z0-9]", "", str(raw)).upper()
+    return compact if _ISRC_RE.match(compact) else None
 
 
 class IsrcBackfillService:
@@ -161,7 +186,9 @@ class IsrcBackfillService:
                         logger.debug(f"Miss: track {spotify_id} not found in Spotify")
                         continue
 
-                    isrc = (spotify_track.get("external_ids") or {}).get("isrc")
+                    isrc = normalize_isrc(
+                        (spotify_track.get("external_ids") or {}).get("isrc")
+                    )
                     if isrc:
                         matched.append({"track_id": track_id, "isrc": isrc})
                         logger.debug(f"Matched: track {spotify_id} → ISRC {isrc}")
