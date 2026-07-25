@@ -30,7 +30,7 @@ from sqlalchemy.orm import Session
 
 from worker.clients.lrclib_client import LrclibClient
 from worker.core.config import settings
-from worker.service.lyrics_eval_core import run_eval_batch
+from worker.service.lyrics_eval_core import PRIMARY_ARTIST_NAMES_LATERAL, run_eval_batch
 from worker.service.lyrics_matcher import (
     STATUS_AMBIGUOUS,
     STATUS_MATCHED,
@@ -136,9 +136,9 @@ class LyricsReassessmentService:
         """
         rows = self.session.execute(
             text(
-                """
+                f"""
                 SELECT t.id, t.title, t.duration_sec,
-                       ARRAY_REMOVE(ARRAY_AGG(DISTINCT a.name), NULL)   AS artist_names,
+                       primary_artists.artist_names                     AS artist_names,
                        ARRAY_REMOVE(ARRAY_AGG(DISTINCT al.alias), NULL) AS aliases,
                        tl.match_status                     AS existing_status,
                        (tl.evidence ->> 'match_basis')     AS existing_basis
@@ -147,11 +147,13 @@ class LyricsReassessmentService:
                 JOIN track_artists ta ON ta.track_id = t.id
                 JOIN artists a        ON a.id = ta.artist_id
                 LEFT JOIN LATERAL jsonb_array_elements_text(a.aliases) AS al(alias) ON true
+{PRIMARY_ARTIST_NAMES_LATERAL}
                 WHERE tl.match_status IN ('not_found', 'ambiguous', 'review_required')
                    OR (tl.match_status = 'matched'
                        AND tl.evidence ->> 'match_basis' LIKE 'best-of-%')
                 GROUP BY t.id, t.title, t.duration_sec,
-                         tl.match_status, (tl.evidence ->> 'match_basis'), tl.updated_at
+                         tl.match_status, (tl.evidence ->> 'match_basis'), tl.updated_at,
+                         primary_artists.artist_names
                 ORDER BY
                     CASE WHEN tl.match_status IN ('not_found', 'ambiguous', 'review_required')
                          THEN 0 ELSE 1 END,

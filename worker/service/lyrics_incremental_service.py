@@ -31,7 +31,7 @@ from sqlalchemy.orm import Session
 
 from worker.clients.lrclib_client import LrclibClient
 from worker.core.config import settings
-from worker.service.lyrics_eval_core import run_eval_batch
+from worker.service.lyrics_eval_core import PRIMARY_ARTIST_NAMES_LATERAL, run_eval_batch
 
 logger = logging.getLogger(__name__)
 
@@ -93,20 +93,26 @@ class LyricsIncrementalService:
         Newest-first so a fresh ingest is corpus-covered promptly; the ``tl IS NULL`` gate
         is the sentinel filter (a written row — including ``not_found`` — drops the track
         from this pool). Query shape mirrors ``tools/lyrics_batch_api.fetch_catalog_tracks``.
+
+        ``artist_names`` is primary-artist-first via ``PRIMARY_ARTIST_NAMES_LATERAL`` (the
+        LRCLIB search uses element 0); the surviving ``track_artists``/``artists`` join is
+        what requires >=1 credit and feeds the alias expansion.
         """
         rows = self.session.execute(
             text(
-                """
+                f"""
                 SELECT t.id, t.title, t.duration_sec,
-                       ARRAY_REMOVE(ARRAY_AGG(DISTINCT a.name), NULL)   AS artist_names,
+                       primary_artists.artist_names                     AS artist_names,
                        ARRAY_REMOVE(ARRAY_AGG(DISTINCT al.alias), NULL) AS aliases
                 FROM tracks t
                 JOIN track_artists ta ON ta.track_id = t.id
                 JOIN artists a        ON a.id = ta.artist_id
                 LEFT JOIN LATERAL jsonb_array_elements_text(a.aliases) AS al(alias) ON true
                 LEFT JOIN track_lyrics tl ON tl.track_id = t.id
+{PRIMARY_ARTIST_NAMES_LATERAL}
                 WHERE tl.track_id IS NULL
-                GROUP BY t.id, t.title, t.duration_sec, t.created_at
+                GROUP BY t.id, t.title, t.duration_sec, t.created_at,
+                         primary_artists.artist_names
                 ORDER BY t.created_at DESC
                 LIMIT :limit
                 """

@@ -38,6 +38,56 @@ logger = logging.getLogger(__name__)
 # should_write(row, outcome) -> bool. ``row`` may carry 'existing_status'/'existing_basis'.
 WriteGate = Callable[[Dict[str, Any], MatchOutcome], bool]
 
+# ── Primary-artist selection (shared by every selection query that feeds this loop) ────
+#
+# ``fetch_one`` below searches LRCLIB with ``artist_names[0]`` — LRCLIB's ``/api/search``
+# takes a single ``artist_name``, so element 0 IS the search artist. The original queries
+# built ``artist_names`` with ``ARRAY_AGG(DISTINCT a.name)``, which sorts ALPHABETICALLY,
+# so on a multi-credit track a featured guest silently became the search artist:
+# *"Ariana Grande — I Don't Do Drugs (feat. Ariana Grande)"*. 62% of the parked
+# ``not_found`` pool has >=2 credits, so this was a large, invisible miss source.
+#
+# There is no stored credit order to fix it with: ``track_artists.role`` is NULL on all
+# 44,568 rows and Spotify's artist order is not captured at sync time. The primary is
+# therefore DERIVED, cheapest signal first:
+#   1. a credit that also credits the track's ALBUM (``album_artists``) — the album artist
+#      is the primary; this is what separates the主 artist from a more famous guest
+#      (*"Private Landing (feat. Justin Bieber & Future)"* -> Don Toliver, not Bieber),
+#   2. then highest ``artists.popularity`` (100% populated; myblog_music's
+#      ``_sort_artists_by_popularity`` BUG-19 Q1a precedent),
+#   3. then name — a deterministic tiebreak, so the pick never flickers between runs.
+#
+# Postgres rejects ``ARRAY_AGG(DISTINCT x ORDER BY y)`` when y is not x ("in an aggregate
+# with DISTINCT, ORDER BY expressions must appear in argument list"), hence the LATERAL.
+# ``DISTINCT ON (a2.name)`` preserves the old dedupe-by-name contract.
+#
+# This is RETRIEVAL-only: ``decide_match`` consumes ``artist_names`` as an unordered
+# identity set, so reordering can change which candidates LRCLIB returns but never how a
+# candidate is judged, and it rewrites no stored row.
+#
+# The caller must alias ``tracks`` as ``t`` (the block reads ``t.id`` / ``t.album_id``),
+# select ``primary_artists.artist_names``, and add that column to its GROUP BY.
+# TWIN: the same block is duplicated in the workspace repo's ``tools/lyrics_*.py`` batch
+# tools, which cannot import from this repo — change both together.
+PRIMARY_ARTIST_NAMES_LATERAL = """
+                JOIN LATERAL (
+                    SELECT ARRAY_AGG(c.name ORDER BY c.is_album_artist DESC,
+                                                     c.popularity DESC NULLS LAST,
+                                                     c.name) AS artist_names
+                    FROM (
+                        SELECT DISTINCT ON (a2.name)
+                               a2.name, a2.popularity,
+                               (aa.artist_id IS NOT NULL) AS is_album_artist
+                        FROM track_artists ta2
+                        JOIN artists a2 ON a2.id = ta2.artist_id
+                        LEFT JOIN album_artists aa
+                               ON aa.album_id = t.album_id AND aa.artist_id = a2.id
+                        WHERE ta2.track_id = t.id
+                        ORDER BY a2.name, (aa.artist_id IS NOT NULL) DESC,
+                                 a2.popularity DESC NULLS LAST
+                    ) c
+                ) primary_artists ON true"""
+
 # The conservative matcher's exact-title/fuzzy bases, whose ``matched`` rows must carry
 # version agreement (a ``matched`` + ``version_agrees=False`` is a matcher bug). Best-of
 # bases (FEAT-lyrics-best-of-promotion) are validated by the presence of an
