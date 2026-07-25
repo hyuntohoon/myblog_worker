@@ -66,13 +66,19 @@ class IsrcBackfillService:
         without the rollback the first failure poisons the tx and every subsequent
         batch fails with InFailedSqlTransaction).
 
-        ``market`` defaults to **None** (no market param). Passing a market activates
-        Spotify Track Relinking, which can return an object whose ``id`` differs from
-        the one requested (the requested id moves to ``linked_from.id``); keyed naively
-        that reads as "Spotify has no such track" and would write a *permanent* miss
-        marker on a perfectly live track. ISRC is market-independent, so the safest
-        thing is not to ask for a market at all — and the lookup below also accepts
-        ``linked_from.id`` so an explicit market stays correct.
+        **A market is always sent, so Track Relinking is always live.** Passing
+        ``market=None`` here does NOT disable it: ``SpotifyClient._default_market`` is
+        ``market or settings.SPOTIFY_DEFAULT_MARKET`` and that setting is ``"KR"``, so
+        the request carries ``market=KR`` either way. Relinking can return an object
+        whose ``id`` differs from the one requested (the requested id moves to
+        ``linked_from.id``); keyed naively that reads as "Spotify has no such track" and
+        would write a *permanent* miss marker on a perfectly live track — permanent
+        because a marked row leaves the selection pool for good.
+
+        The defence is therefore the lookup below, which indexes each response object
+        under BOTH its own id and its ``linked_from.id``. That is correct regardless of
+        which market is in play, which is why this is not fixed by trying to suppress
+        the market param (doing so would mean editing the shared Spotify client).
 
         Returns metrics: {fetched, matched, sentinel_written, errors, skipped_budget}.
         """
@@ -237,6 +243,12 @@ class IsrcBackfillService:
         consistent order (the bulk-write deadlock rule). A matched row also mirrors the
         ISRC into ``ext_refs.isrc`` so ``backfill_genres.py`` — which treats that key as
         "already fetched" — stops re-requesting the track.
+
+        **Every bound parameter inside ``jsonb_build_object`` needs an explicit CAST.**
+        Postgres cannot infer the type of an untyped placeholder in that position and
+        raises ``IndeterminateDatatype: could not determine data type of parameter $1``;
+        the statement fails at execute time, not at import, so it looks fine until the
+        first real write. ``test_json_bound_params_are_explicitly_cast`` pins this.
         """
         if matched:
             self.session.execute(
@@ -252,7 +264,7 @@ class IsrcBackfillService:
             self.session.execute(
                 text("""
                     UPDATE tracks
-                    SET ext_refs = ext_refs || jsonb_build_object('isrc_status', :status)
+                    SET ext_refs = ext_refs || jsonb_build_object('isrc_status', CAST(:status AS text))
                     WHERE id = CAST(:track_id AS UUID)
                 """),
                 sorted(missed, key=lambda r: r["track_id"]),

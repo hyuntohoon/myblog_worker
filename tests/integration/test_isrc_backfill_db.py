@@ -118,9 +118,13 @@ def test_isrc_backfill_fetches_tracks_without_isrc(session_factory):
                 },
             )
 
-        # Fetch tracks without ISRC (service now owns the session, not a raw conn)
+        # Fetch tracks without ISRC (service now owns the session, not a raw conn).
+        # The limit must exceed the branch's whole eligible pool: the selection is now
+        # `ORDER BY spotify_id`, and the `test_track_*` prefix sorts AFTER every real
+        # Spotify id, so a small LIMIT would page these seeds out and fail spuriously
+        # on any branch holding more than that many unmarked NULL-isrc rows.
         svc = IsrcBackfillService(session)
-        tracks = svc._fetch_tracks_without_isrc(limit=100)
+        tracks = svc._fetch_tracks_without_isrc(limit=1_000_000)
 
         # Should get only track1 (track2 has ISRC already)
         track_ids = [t["id"] for t in tracks]

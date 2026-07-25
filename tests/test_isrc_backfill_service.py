@@ -138,13 +138,41 @@ def test_relinked_track_resolves_instead_of_being_permanently_marked():
     assert metrics["matched"] == 1 and metrics["sentinel_written"] == 0
 
 
-def test_default_call_sends_no_market_so_relinking_never_engages():
+def test_json_bound_params_are_explicitly_cast():
+    """Every :param inside jsonb_build_object must carry an explicit CAST.
+
+    Postgres cannot infer the type of an untyped placeholder there and raises
+    `IndeterminateDatatype: could not determine data type of parameter $1` — at EXECUTE
+    time, so the statement looks fine until the first real write. This shipped broken
+    once: the miss path used `jsonb_build_object('isrc_status', :status)` and every
+    DB-backed test that would have caught it was skipping (the Neon test branch has no
+    `tracks.isrc`, so the V34 guard fired), while these unit tests passed because a
+    FakeSession never binds to a real driver. This assertion is the DB-free backstop.
+    """
+    import re
+
     session = WriteCapturingSession()
-    svc = _svc(session, [{"id": "t-1", "spotify_id": "sp-1"}])
+    svc = _svc(session, [
+        {"id": "t-1", "spotify_id": "sp-1"},
+        {"id": "t-2", "spotify_id": "sp-2"},
+    ])
     with patch("worker.service.isrc_backfill_service.spotify") as mock_spotify:
-        mock_spotify.get_tracks.return_value = [{"id": "sp-1", "external_ids": {}}]
+        mock_spotify.get_tracks.return_value = [
+            {"id": "sp-1", "external_ids": {"isrc": "USRC12345678"}},   # matched path
+            {"id": "sp-2", "external_ids": {}},                          # missed path
+        ]
         svc.backfill_isrc()
-    assert mock_spotify.get_tracks.call_args.kwargs["market"] is None
+
+    writes = session.writes()
+    assert len(writes) == 2, "expected both the matched and the missed statement"
+    for sql, _ in writes:
+        for call in re.findall(r"jsonb_build_object\([^)]*\)", sql):
+            bare = re.findall(r"(?<!AS )(?<!CAST\()\B:(\w+)", call)
+            assert not bare, (
+                f"bound param(s) {bare} inside {call!r} lack an explicit CAST — "
+                "this raises IndeterminateDatatype against a real Postgres driver"
+            )
+            assert "CAST(" in call, f"no CAST in {call!r}"
 
 
 def test_both_write_lists_are_sorted_by_track_id():
