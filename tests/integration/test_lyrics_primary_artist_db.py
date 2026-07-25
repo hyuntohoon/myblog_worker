@@ -17,11 +17,23 @@ runner-up rule:
     album artist : "Zulu Primary"  popularity 10   (alphabetically LAST, least popular)
     guest        : "Alpha Guest"   popularity 99   (alphabetically FIRST, most popular)
 
-  alphabetical (old)  -> "Alpha Guest"   ✗
-  popularity only     -> "Alpha Guest"   ✗
-  album-artist first  -> "Zulu Primary"  ✓
+  alphabetical (old)  -> "Alpha Guest"   x
+  popularity only     -> "Alpha Guest"   x
+  album-artist first  -> "Zulu Primary"  ok
 
 so a regression to either rule fails loudly rather than passing by luck.
+
+**Two tiers, deliberately.** The ordering rule lives in one shared SQL constant,
+``PRIMARY_ARTIST_NAMES_LATERAL``, and the first tier exercises that constant directly —
+it needs only ``tracks`` / ``artists`` / ``track_artists`` / ``album_artists``, so it
+runs on the test branch as it exists today and is the real regression gate.
+
+The second tier drives the two selection queries end-to-end, which additionally requires
+``track_lyrics``. That table is NOT on the Neon test branch yet (the branch lags prod on
+the FEAT-lyrics-corpus migration), so those are guarded and will start running by
+themselves once the branch catches up — the same schema-drift guard style as
+``test_isrc_backfill_db.factory``'s V34 check. Do not delete the guard without checking
+the branch; do not assume tier 2 is protecting you today.
 
 Guarded by TEST_DB_URL; skipped when unset.
 """
@@ -34,6 +46,7 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from worker.service.lyrics_eval_core import PRIMARY_ARTIST_NAMES_LATERAL
 from worker.service.lyrics_incremental_service import LyricsIncrementalService
 from worker.service.lyrics_reassessment_service import LyricsReassessmentService
 
@@ -46,11 +59,31 @@ pytestmark = pytest.mark.skipif(
 
 _PREFIX = "lyr_primary_"
 
+# The fragment under test, run standalone against `tracks t`.
+_LATERAL_PROBE_SQL = f"""
+    SELECT primary_artists.artist_names
+    FROM tracks t
+{PRIMARY_ARTIST_NAMES_LATERAL}
+    WHERE t.id = CAST(:tid AS UUID)
+"""
+
 
 @pytest.fixture(scope="module")
 def factory():
     eng = create_engine(_TEST_DB_URL, pool_pre_ping=True, future=True)
     return sessionmaker(bind=eng)
+
+
+@pytest.fixture(scope="module")
+def has_track_lyrics(factory):
+    """Schema-drift guard — track_lyrics is not on the test branch yet."""
+    with factory() as s:
+        return s.execute(
+            text(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_name = 'track_lyrics'"
+            )
+        ).first() is not None
 
 
 def _seed(session, *, tag: str, album_artist_name: str | None, credits):
@@ -94,11 +127,25 @@ def _seed(session, *, tag: str, album_artist_name: str | None, credits):
     return track_id
 
 
-def _cleanup(Session):
+def _cleanup(Session, has_track_lyrics=False):
     with Session() as s, s.begin():
+        if has_track_lyrics:
+            s.execute(
+                text(
+                    "DELETE FROM track_lyrics WHERE track_id IN "
+                    "(SELECT id FROM tracks WHERE spotify_id LIKE :p)"
+                ),
+                {"p": f"{_PREFIX}%"},
+            )
         s.execute(text("DELETE FROM tracks WHERE spotify_id LIKE :p"), {"p": f"{_PREFIX}%"})
         s.execute(text("DELETE FROM albums WHERE spotify_id LIKE :p"), {"p": f"{_PREFIX}%"})
         s.execute(text("DELETE FROM artists WHERE spotify_id LIKE :p"), {"p": f"{_PREFIX}%"})
+
+
+def _probe(session, track_id):
+    return list(
+        session.execute(text(_LATERAL_PROBE_SQL), {"tid": track_id}).scalar_one() or []
+    )
 
 
 def _row_for(rows, track_id):
@@ -107,8 +154,92 @@ def _row_for(rows, track_id):
     return match[0]
 
 
-def test_incremental_selection_puts_the_album_artist_first(factory):
+# ── Tier 1: the shared ordering constant, standalone (no track_lyrics needed) ──────
+
+
+def test_lateral_puts_the_album_artist_first(factory):
     """Beats BOTH the alphabetical old behaviour and a popularity-only rule."""
+    Session = factory
+    try:
+        with Session() as s:
+            with s.begin():
+                track_id = _seed(
+                    s,
+                    tag="lat",
+                    album_artist_name="Zulu Primary",
+                    credits=[("Alpha Guest", 99), ("Zulu Primary", 10)],
+                )
+            names = _probe(s, track_id)
+
+        assert names[0] == "Zulu Primary", (
+            f"LRCLIB would be searched with {names[0]!r}; the album artist must win over "
+            "both the alphabetically-first and the more-popular credit"
+        )
+        assert sorted(names) == ["Alpha Guest", "Zulu Primary"], "no credit may be dropped"
+    finally:
+        _cleanup(Session)
+
+
+def test_lateral_falls_back_to_popularity_without_an_album_artist(factory):
+    """Singles/compilations with no album_artists row fall back to popularity."""
+    Session = factory
+    try:
+        with Session() as s:
+            with s.begin():
+                track_id = _seed(
+                    s,
+                    tag="latpop",
+                    album_artist_name=None,
+                    credits=[("Alpha Quiet", 5), ("Zulu Loud", 90)],
+                )
+            names = _probe(s, track_id)
+
+        assert names[0] == "Zulu Loud", f"expected the popular credit first, got {names}"
+    finally:
+        _cleanup(Session)
+
+
+def test_lateral_single_credit_is_unaffected(factory):
+    """The single-credit majority of the pool must behave exactly as before."""
+    Session = factory
+    try:
+        with Session() as s:
+            with s.begin():
+                track_id = _seed(
+                    s, tag="latsolo", album_artist_name="Solo Act", credits=[("Solo Act", 50)]
+                )
+            names = _probe(s, track_id)
+
+        assert names == ["Solo Act"]
+    finally:
+        _cleanup(Session)
+
+
+def test_lateral_dedupes_by_name(factory):
+    """Preserves the ARRAY_AGG(DISTINCT a.name) contract the rewrite replaced."""
+    Session = factory
+    try:
+        with Session() as s:
+            with s.begin():
+                track_id = _seed(
+                    s,
+                    tag="latdup",
+                    album_artist_name=None,
+                    credits=[("Same Name", 10), ("Same Name", 80)],
+                )
+            names = _probe(s, track_id)
+
+        assert names == ["Same Name"], f"duplicate credit names must collapse, got {names}"
+    finally:
+        _cleanup(Session)
+
+
+# ── Tier 2: the two selection queries end-to-end (needs track_lyrics) ──────────────
+
+
+def test_incremental_selection_puts_the_album_artist_first(factory, has_track_lyrics):
+    if not has_track_lyrics:
+        pytest.skip("track_lyrics not on the test branch yet (FEAT-lyrics-corpus migration)")
     Session = factory
     try:
         with Session() as s:
@@ -119,40 +250,17 @@ def test_incremental_selection_puts_the_album_artist_first(factory):
                     album_artist_name="Zulu Primary",
                     credits=[("Alpha Guest", 99), ("Zulu Primary", 10)],
                 )
-            rows = LyricsIncrementalService(s)._fetch_uncorpused_tracks(limit=2000)
+            rows = LyricsIncrementalService(s)._fetch_uncorpused_tracks(limit=5000)
 
-        names = _row_for(rows, track_id)["artist_names"]
-        assert names[0] == "Zulu Primary", (
-            f"LRCLIB would be searched with {names[0]!r}; the album artist must win over "
-            "both the alphabetically-first and the more-popular credit"
-        )
-        assert sorted(names) == ["Alpha Guest", "Zulu Primary"], "no credit may be dropped"
+        assert _row_for(rows, track_id)["artist_names"][0] == "Zulu Primary"
     finally:
-        _cleanup(Session)
+        _cleanup(Session, has_track_lyrics)
 
 
-def test_popularity_breaks_the_tie_when_no_credit_is_an_album_artist(factory):
-    """Singles/compilations with no album_artists row fall back to popularity."""
-    Session = factory
-    try:
-        with Session() as s:
-            with s.begin():
-                track_id = _seed(
-                    s,
-                    tag="pop",
-                    album_artist_name=None,
-                    credits=[("Alpha Quiet", 5), ("Zulu Loud", 90)],
-                )
-            rows = LyricsIncrementalService(s)._fetch_uncorpused_tracks(limit=2000)
-
-        names = _row_for(rows, track_id)["artist_names"]
-        assert names[0] == "Zulu Loud", f"expected the popular credit first, got {names}"
-    finally:
-        _cleanup(Session)
-
-
-def test_reassessment_selection_uses_the_same_ordering(factory):
+def test_reassessment_selection_uses_the_same_ordering(factory, has_track_lyrics):
     """The twin query must not drift from the incremental one."""
+    if not has_track_lyrics:
+        pytest.skip("track_lyrics not on the test branch yet (FEAT-lyrics-corpus migration)")
     Session = factory
     try:
         with Session() as s:
@@ -163,7 +271,6 @@ def test_reassessment_selection_uses_the_same_ordering(factory):
                     album_artist_name="Zulu Primary",
                     credits=[("Alpha Guest", 99), ("Zulu Primary", 10)],
                 )
-                # Park it so the reassessment pool selects it.
                 s.execute(
                     text(
                         "INSERT INTO track_lyrics (track_id, match_status, evidence) "
@@ -172,33 +279,8 @@ def test_reassessment_selection_uses_the_same_ordering(factory):
                     ),
                     {"t": track_id},
                 )
-            rows = LyricsReassessmentService(s)._fetch_unresolved_tracks(limit=20000)
+            rows = LyricsReassessmentService(s)._fetch_unresolved_tracks(limit=50000)
 
-        names = _row_for(rows, track_id)["artist_names"]
-        assert names[0] == "Zulu Primary", f"reassessment drifted: {names}"
+        assert _row_for(rows, track_id)["artist_names"][0] == "Zulu Primary"
     finally:
-        with Session() as s, s.begin():
-            s.execute(
-                text(
-                    "DELETE FROM track_lyrics WHERE track_id IN "
-                    "(SELECT id FROM tracks WHERE spotify_id LIKE :p)"
-                ),
-                {"p": f"{_PREFIX}%"},
-            )
-        _cleanup(Session)
-
-
-def test_single_credit_track_is_unaffected(factory):
-    """The 38% of the pool with one credit must behave exactly as before."""
-    Session = factory
-    try:
-        with Session() as s:
-            with s.begin():
-                track_id = _seed(
-                    s, tag="solo", album_artist_name="Solo Act", credits=[("Solo Act", 50)]
-                )
-            rows = LyricsIncrementalService(s)._fetch_uncorpused_tracks(limit=2000)
-
-        assert _row_for(rows, track_id)["artist_names"] == ["Solo Act"]
-    finally:
-        _cleanup(Session)
+        _cleanup(Session, has_track_lyrics)
