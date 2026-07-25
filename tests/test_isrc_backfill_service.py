@@ -25,6 +25,7 @@ from worker.service.isrc_backfill_service import (
     STATUS_NO_ISRC,
     STATUS_NOT_FOUND,
     IsrcBackfillService,
+    normalize_isrc,
 )
 
 
@@ -232,7 +233,12 @@ def test_batch_failure_rolls_back_and_later_batch_still_commits():
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("simulated Spotify outage on batch 1")
-        return [{"id": sid, "external_ids": {"isrc": f"US{sid}"}} for sid in ids]
+        # Must be REAL-shaped ISRCs: normalize_isrc rejects anything else, which would
+        # turn these into misses and silently invalidate the matched==10 assertion.
+        return [
+            {"id": sid, "external_ids": {"isrc": f"USRC1{i:07d}"}}
+            for i, sid in enumerate(ids)
+        ]
 
     with patch("worker.service.isrc_backfill_service.spotify") as mock_spotify:
         mock_spotify.get_tracks.side_effect = side_effect
@@ -289,6 +295,54 @@ def test_read_transaction_is_closed_before_the_first_spotify_call():
         svc.backfill_isrc()
 
     assert order[:3] == ["select", "commit", "spotify"], order
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("USRC12345678", "USRC12345678"),      # already canonical
+        ("GB-SMU-41-19063", "GBSMU4119063"),   # hyphenated — seen in prod, run 1
+        ("ushm80468049", "USHM80468049"),      # lowercase — 32 such rows in prod
+        ("PHo010500012", "PHO010500012"),      # mixed case
+        (" USRC12345678 ", "USRC12345678"),    # stray whitespace
+        ("-", None),                            # the one unsalvageable prod value
+        ("", None),
+        (None, None),
+        ("NOTANISRC", None),
+        ("USRC1234567", None),                 # 11 chars — too short
+        ("USRC123456789", None),               # 13 chars — too long
+        ("12RC12345678", None),                # country code must be alphabetic
+    ],
+)
+def test_normalize_isrc(raw, expected):
+    assert normalize_isrc(raw) == expected
+
+
+def test_hyphenated_isrc_is_stored_canonically_not_verbatim():
+    """Regression: run 1 wrote 'GB-SMU-41-19063' into the column verbatim.
+
+    A mixed-format column silently fails `WHERE isrc = :code` — the column looks
+    populated and simply never joins.
+    """
+    session, metrics = _run(
+        [{"id": "t-1", "spotify_id": "sp-1"}],
+        [{"id": "sp-1", "external_ids": {"isrc": "GB-SMU-41-19063"}}],
+    )
+    _, params = session.writes()[0]
+    assert params == [{"track_id": "t-1", "isrc": "GBSMU4119063"}]
+    assert metrics["matched"] == 1
+
+
+def test_unparseable_isrc_is_a_miss_not_a_poisoned_column():
+    """Spotify's literal '-' must never reach the column."""
+    session, metrics = _run(
+        [{"id": "t-1", "spotify_id": "sp-1"}],
+        [{"id": "sp-1", "external_ids": {"isrc": "-"}}],
+    )
+    sql, params = session.writes()[0]
+    assert "SET isrc" not in sql
+    assert params == [{"track_id": "t-1", "status": STATUS_NO_ISRC}]
+    assert metrics["matched"] == 0 and metrics["sentinel_written"] == 1
 
 
 def test_empty_pool_is_a_cheap_no_op():
