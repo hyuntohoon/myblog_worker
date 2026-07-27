@@ -31,6 +31,27 @@ class Settings(BaseSettings):
     # Per-tick user bound so the 120s Lambda always finishes.
     LASTFM_MAX_USERS_PER_TICK: int = 50
 
+    # Genius annotations (FEAT-lyrics-annotations Thread 1). Client access token
+    # only — the Client ID/Secret are unused for reads. Lives in the SSM
+    # /myblog/worker blob (no new IAM). OPTIONAL: unset ⇒ the job no-ops rather
+    # than failing boot, exactly like the Last.fm key.
+    GENIUS_ACCESS_TOKEN: str = ""
+    GENIUS_API_BASE: str = "https://api.genius.com"
+    # Tracks per invocation. Each costs 3 API calls (~0.3s apart) plus paging, so
+    # this is sized to finish well inside the Lambda budget.
+    GENIUS_FETCH_BATCH_LIMIT: int = 25
+    # Below this blended title+artist similarity the match is `ambiguous` and its
+    # annotations are NOT written — §6.2's wrong match (로꼬's "2025" resolved to
+    # another artist's song) blends to 0.40 and is rejected here.
+    GENIUS_MIN_CONFIDENCE: float = 0.62
+    # The title must clear its OWN floor, because the blend leans on the artist and
+    # therefore cannot catch the mirror failure: right artist, wrong song. Measured
+    # live — our "GUIZ CORLEONE" resolved to Freeze Corleone's "Braquage" at title
+    # 0.19 / artist 1.0 / blend 0.676, cleared the threshold above, and wrote 18
+    # annotations from a different song. Correct matches score 1.0; a remix or
+    # feat-suffixed variant still lands well above 0.5.
+    GENIUS_MIN_TITLE_SIMILARITY: float = 0.5
+
     # Spotify user-scoped player reads (FEAT-member-dashboard Step 3).
     # Refresh token + client creds live in Secrets Manager myblog/spotify (Q17);
     # SPOTIFY_REFRESH_TOKEN is an env fallback for local dev / tests only.
@@ -190,6 +211,11 @@ def get_settings() -> Settings:
         # Last.fm key is OPTIONAL — absent ⇒ the poll no-ops; do NOT add to `missing`.
         if secrets.get("LASTFM_API_KEY"):
             s.LASTFM_API_KEY = secrets["LASTFM_API_KEY"]
+        # Genius token is OPTIONAL on the same terms — absent ⇒ the fetch job
+        # no-ops. It must never join `missing`, or every other job in this Lambda
+        # dies at import time because one optional integration is unconfigured.
+        if secrets.get("GENIUS_ACCESS_TOKEN"):
+            s.GENIUS_ACCESS_TOKEN = secrets["GENIUS_ACCESS_TOKEN"]
         missing = [k for k, v in {
             "DATABASE_URL": s.DATABASE_URL,
             "SPOTIFY_CLIENT_ID": s.SPOTIFY_CLIENT_ID,
