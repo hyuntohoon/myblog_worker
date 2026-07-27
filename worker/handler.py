@@ -182,6 +182,27 @@ def _process_batch(album_ids: List[str], market: str) -> None:
         logger.info("Batch synced to DB: %d albums", len(album_ids))
 
 
+def _run_genius_fetch(limit: int | None = None) -> None:
+    """Bounded Genius annotation fetch (FEAT-lyrics-annotations Thread 1).
+
+    Passes ``SessionLocal`` itself, not a session: the service opens the read,
+    closes it BEFORE the first HTTP call, then opens one short write transaction
+    per track. Handing it an open session would put a Neon connection
+    idle-in-transaction across ~3 API round trips per track — the failure this
+    codebase has already hit (ProtocolViolation).
+
+    ``limit`` defaults to ``settings.GENIUS_FETCH_BATCH_LIMIT``. Unset token ⇒
+    the service no-ops and says so; it is never a boot failure.
+    """
+    from worker.clients.genius_client import genius
+    from worker.service.genius_fetch_service import run_genius_fetch
+
+    metrics = run_genius_fetch(SessionLocal, genius, limit=limit)
+    # WARNING, not INFO — prod Lambdas run LOG_LEVEL=WARNING, so an INFO line never
+    # reaches CloudWatch and a scheduled run would be unobservable.
+    logger.warning("Genius fetch metrics: %s", metrics)
+
+
 def _run_isrc_backfill(limit: int | None = None) -> None:
     """Bounded ISRC backfill for FEAT-lyrics-corpus Step 1b. Fetches up to `limit`
     tracks lacking ISRC from the DB, enriches from Spotify GET /v1/tracks, writes the
@@ -290,6 +311,17 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         limit = event.get("limit")  # None ⇒ settings.ISRC_BACKFILL_BATCH_LIMIT
         logger.info("EventBridge/SQS trigger: running ISRC backfill (limit=%s)", limit)
         _run_isrc_backfill(limit=limit)
+        return {}
+
+    # EventBridge/SQS trigger — Genius annotation fetch (FEAT-lyrics-annotations).
+    # Bounded: tracks with matched lyrics and no Genius row yet. Writes the songs
+    # row and its annotations in ONE transaction — the read path gates the
+    # annotation query on the parent row, so the reverse order would make the
+    # annotations invisible rather than merely late.
+    if event.get("job") == "genius_fetch":
+        limit = event.get("limit")  # None ⇒ settings.GENIUS_FETCH_BATCH_LIMIT
+        logger.info("EventBridge/SQS trigger: running Genius fetch (limit=%s)", limit)
+        _run_genius_fetch(limit=limit)
         return {}
 
     # EventBridge/SQS trigger — one-shot backlog + weekly artist-photo sweep.
