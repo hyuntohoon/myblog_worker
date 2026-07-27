@@ -37,9 +37,12 @@ class Settings(BaseSettings):
     # than failing boot, exactly like the Last.fm key.
     GENIUS_ACCESS_TOKEN: str = ""
     GENIUS_API_BASE: str = "https://api.genius.com"
-    # Tracks per invocation. Each costs 3 API calls (~0.3s apart) plus paging, so
-    # this is sized to finish well inside the Lambda budget.
-    GENIUS_FETCH_BATCH_LIMIT: int = 25
+    # Tracks per invocation, sized from the WORST measured pass, not the average.
+    # Per-track cost swings with how many referent pages a song has: a light batch
+    # measured 2.32 s/track, an annotation-heavy one 4.55 s/track. The Lambda budget
+    # is 120s, so 15 × 4.55 ≈ 68s leaves real headroom, while the 25 this started at
+    # would have been ~114s and timed out on any heavy batch.
+    GENIUS_FETCH_BATCH_LIMIT: int = 15
     # Below this blended title+artist similarity the match is `ambiguous` and its
     # annotations are NOT written — §6.2's wrong match (로꼬's "2025" resolved to
     # another artist's song) blends to 0.40 and is rejected here.

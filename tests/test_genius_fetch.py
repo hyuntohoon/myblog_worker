@@ -30,7 +30,7 @@ from worker.service.genius_fetch_service import GeniusFetchService
 
 
 TRACK = {"track_id": "11111111-1111-1111-1111-111111111111",
-         "title": "Berghain", "album": "LUX", "artist": "ROSALÍA"}
+         "title": "Berghain", "album": "LUX", "artists": ["ROSALÍA"]}
 
 
 class _Session:
@@ -135,7 +135,7 @@ def test_right_artist_wrong_song_clears_the_blend_and_must_be_caught_elsewhere()
 
 def test_wrong_song_is_rejected_by_the_title_floor():
     log = []
-    factory = _factory(log, [(TRACK["track_id"], "a", "al", "ar")])
+    factory = _factory(log, [(TRACK["track_id"], "a", "al", ["ar"])])
     bad = GeniusSong(song_id=7, title="Braquage", artist="Freeze Corleone",
                      url="u", confidence=0.676, title_score=0.19, artist_score=1.0)
     client = _client(song=bad, annotations=[_anno(1)])
@@ -149,11 +149,11 @@ def test_wrong_song_is_rejected_by_the_title_floor():
 
 def test_read_session_is_closed_before_any_http_call():
     log = []
-    factory = _factory(log, [(TRACK["track_id"], "Berghain", "LUX", "ROSALÍA")])
+    factory = _factory(log, [(TRACK["track_id"], "Berghain", "LUX", ["ROSALÍA"])])
     client = _client(song=_song(), annotations=[_anno(1)])
 
     calls = []
-    client.find_song.side_effect = lambda t, a: (calls.append(list(log)), _song())[1]
+    client.find_song.side_effect = lambda t, artists: (calls.append(list(log)), _song())[1]
 
     GeniusFetchService(factory, client).run(limit=1)
 
@@ -163,7 +163,7 @@ def test_read_session_is_closed_before_any_http_call():
 
 def test_each_track_gets_its_own_short_write_session():
     log = []
-    rows = [(TRACK["track_id"], "a", "al", "ar"), ("22222222-2222-2222-2222-222222222222", "b", "al", "ar")]
+    rows = [(TRACK["track_id"], "a", "al", ["ar"]), ("22222222-2222-2222-2222-222222222222", "b", "al", ["ar"])]
     factory = _factory(log, rows)
     GeniusFetchService(factory, _client(song=_song(), annotations=[_anno(1)])).run(limit=2)
     # 1 read + 2 writes, all closed.
@@ -175,7 +175,7 @@ def test_each_track_gets_its_own_short_write_session():
 
 def test_songs_row_is_written_before_its_annotations():
     log = []
-    factory = _factory(log, [(TRACK["track_id"], "a", "al", "ar")])
+    factory = _factory(log, [(TRACK["track_id"], "a", "al", ["ar"])])
     GeniusFetchService(factory, _client(song=_song(), annotations=[_anno(9), _anno(3)])).run(limit=1)
     kinds = [k for k, _ in log if k in ("song", "anno")]
     assert kinds[0] == "song", "annotations without a parent row are invisible to the read path"
@@ -184,7 +184,7 @@ def test_songs_row_is_written_before_its_annotations():
 
 def test_song_and_annotations_share_one_transaction():
     log = []
-    factory = _factory(log, [(TRACK["track_id"], "a", "al", "ar")])
+    factory = _factory(log, [(TRACK["track_id"], "a", "al", ["ar"])])
     GeniusFetchService(factory, _client(song=_song(), annotations=[_anno(1)])).run(limit=1)
     seq = [k for k, _ in log]
     first_commit = seq.index("commit")
@@ -194,7 +194,7 @@ def test_song_and_annotations_share_one_transaction():
 
 def test_annotation_upserts_are_sorted_by_the_conflict_key():
     log = []
-    factory = _factory(log, [(TRACK["track_id"], "a", "al", "ar")])
+    factory = _factory(log, [(TRACK["track_id"], "a", "al", ["ar"])])
     GeniusFetchService(factory, _client(song=_song(), annotations=[_anno(30), _anno(7), _anno(19)])).run(limit=1)
     ids = [v for k, v in log if k == "anno"]
     assert ids == sorted(ids), "unsorted bulk upserts deadlock under concurrency"
@@ -204,7 +204,7 @@ def test_annotation_upserts_are_sorted_by_the_conflict_key():
 
 def test_weak_match_is_recorded_but_its_annotations_are_not_written():
     log = []
-    factory = _factory(log, [(TRACK["track_id"], "a", "al", "ar")])
+    factory = _factory(log, [(TRACK["track_id"], "a", "al", ["ar"])])
     client = _client(song=_song(conf=0.10), annotations=[_anno(1)])
     metrics = GeniusFetchService(factory, client).run(limit=1)
     assert metrics["ambiguous"] == 1
@@ -215,7 +215,7 @@ def test_weak_match_is_recorded_but_its_annotations_are_not_written():
 
 def test_no_search_hit_parks_the_track_as_not_found():
     log = []
-    factory = _factory(log, [(TRACK["track_id"], "a", "al", "ar")])
+    factory = _factory(log, [(TRACK["track_id"], "a", "al", ["ar"])])
     metrics = GeniusFetchService(factory, _client(song=None)).run(limit=1)
     assert metrics["not_found"] == 1
     assert ("song", TRACK["track_id"]) in log
@@ -225,7 +225,7 @@ def test_no_search_hit_parks_the_track_as_not_found():
 
 def test_transient_failure_leaves_the_row_unwritten_so_it_retries():
     log = []
-    factory = _factory(log, [(TRACK["track_id"], "a", "al", "ar")])
+    factory = _factory(log, [(TRACK["track_id"], "a", "al", ["ar"])])
     client = _client(find_raises=GeniusTransientError("boom"))
     metrics = GeniusFetchService(factory, client).run(limit=1)
     assert metrics["errors"] == 1
@@ -235,7 +235,7 @@ def test_transient_failure_leaves_the_row_unwritten_so_it_retries():
 
 def test_auth_failure_stops_the_run_instead_of_hammering():
     log = []
-    rows = [(f"{i}" * 8, "a", "al", "ar") for i in range(3)]
+    rows = [(f"{i}" * 8, "a", "al", ["ar"]) for i in range(3)]
     factory = _factory(log, rows)
     client = _client(find_raises=GeniusAuthError("401"))
     metrics = GeniusFetchService(factory, client).run(limit=3)
@@ -244,7 +244,7 @@ def test_auth_failure_stops_the_run_instead_of_hammering():
 
 def test_missing_token_no_ops_rather_than_raising():
     log = []
-    factory = _factory(log, [(TRACK["track_id"], "a", "al", "ar")])
+    factory = _factory(log, [(TRACK["track_id"], "a", "al", ["ar"])])
     metrics = GeniusFetchService(factory, _client(enabled=False)).run(limit=1)
     assert metrics == {"considered": 0, "matched": 0, "ambiguous": 0,
                        "not_found": 0, "annotations": 0, "errors": 0}
@@ -254,7 +254,7 @@ def test_missing_token_no_ops_rather_than_raising():
 def test_limit_zero_is_a_no_op_not_a_full_batch():
     """`limit or settings.X` would read 0 as "unset" and run the default batch."""
     log = []
-    factory = _factory(log, [(TRACK["track_id"], "a", "al", "ar")])
+    factory = _factory(log, [(TRACK["track_id"], "a", "al", ["ar"])])
     metrics = GeniusFetchService(factory, _client(song=_song())).run(limit=0)
     assert metrics["considered"] == 0
     assert log == []
@@ -266,3 +266,20 @@ def test_empty_pool_does_no_write_work():
     metrics = GeniusFetchService(factory, _client(song=_song())).run(limit=5)
     assert metrics["considered"] == 0
     assert [k for k, _ in log if k in ("song", "anno")] == []
+
+
+def test_artist_score_takes_the_best_credit_not_the_most_popular():
+    """Genius names a collaboration by its own primary credit, not ours.
+
+    Live: our "Entertain" credits WILLOW first while Genius says THE ANXIETY (the
+    project name), and "YO MA" credits 식케이 first while Genius says Leellamarz.
+    Scoring against only the top credit rejected both, with the right name sitting
+    second and third in our own list.
+    """
+    top_only = match_scores("Entertain", "WILLOW", "Entertain", "THE ANXIETY")[2]
+    best_of = max(
+        match_scores("Entertain", n, "Entertain", "THE ANXIETY")[2]
+        for n in ["WILLOW", "THE ANXIETY", "Tyler Cole"]
+    )
+    assert top_only < 0.62, "the top credit alone reads as a wrong artist"
+    assert best_of > 0.99, "the right credit is in our list and must win"

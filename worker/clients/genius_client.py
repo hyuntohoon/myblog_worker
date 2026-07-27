@@ -30,7 +30,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 
@@ -168,21 +168,33 @@ class GeniusClient:
 
     # ── the three calls ─────────────────────────────────────────────────────
 
-    def find_song(self, title: str, artist: str) -> Optional[GeniusSong]:
+    def find_song(self, title: str, artists: Sequence[str]) -> Optional[GeniusSong]:
         """Best ``/search`` hit for one track, scored. None when nothing comes back.
+
+        ``artists`` is EVERY credited artist, most prominent first — not one.
+        Genius names a collaboration by whichever credit it considers primary, and
+        that is routinely not ours: our "Entertain" credits WILLOW while Genius says
+        THE ANXIETY (the project name), and our "YO MA" credits 식케이 first while
+        Genius says Leellamarz. Scoring against only the most popular credit rejected
+        both as wrong-artist, when the right name was sitting second and third in our
+        own list. The artist score is therefore the BEST match across all credits.
 
         Returns the best candidate WITHOUT applying a threshold — the caller decides
         what to do with a weak match, because "ambiguous" and "not_found" are
         different states and only the caller knows the policy.
         """
-        resp = self._get("/search", {"q": f"{title} {artist}", "per_page": 5})
+        names = [a for a in artists if a] or [""]
+        resp = self._get("/search", {"q": f"{title} {names[0]}", "per_page": 5})
         hits = [h for h in (resp.get("hits") or []) if h.get("type") == "song"]
         best: Optional[GeniusSong] = None
         for h in hits:
             res = h.get("result") or {}
             got_title = res.get("title") or ""
             got_artist = (res.get("primary_artist") or {}).get("name") or ""
-            ts, as_, conf = match_scores(title, artist, got_title, got_artist)
+            ts, as_, conf = max(
+                (match_scores(title, n, got_title, got_artist) for n in names),
+                key=lambda s: s[2],
+            )
             if best is None or conf > best.confidence:
                 best = GeniusSong(
                     song_id=int(res.get("id")),

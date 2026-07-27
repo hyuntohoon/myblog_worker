@@ -67,12 +67,11 @@ MATCH_NOT_FOUND = "not_found"
 _SELECT_WORK = text("""
     SELECT t.id, t.title, COALESCE(a.title, '') AS album,
            COALESCE((
-             SELECT ar.name FROM track_artists ta
-             JOIN artists ar ON ar.id = ta.artist_id
-             WHERE ta.track_id = t.id
-             ORDER BY ar.popularity DESC NULLS LAST, ar.name
-             LIMIT 1
-           ), '') AS artist
+             SELECT array_agg(ar.name ORDER BY ar.popularity DESC NULLS LAST, ar.name)
+               FROM track_artists ta
+               JOIN artists ar ON ar.id = ta.artist_id
+              WHERE ta.track_id = t.id
+           ), ARRAY[]::text[]) AS artists
       FROM tracks t
       JOIN track_lyrics tl ON tl.track_id = t.id
       LEFT JOIN albums a ON a.id = t.album_id
@@ -151,7 +150,8 @@ class GeniusFetchService:
         try:
             rows = session.execute(_SELECT_WORK, {"limit": limit}).fetchall()
             return [
-                {"track_id": str(r[0]), "title": r[1] or "", "album": r[2], "artist": r[3]}
+                {"track_id": str(r[0]), "title": r[1] or "", "album": r[2],
+                 "artists": list(r[3] or [])}
                 for r in rows
             ]
         finally:
@@ -268,7 +268,10 @@ class GeniusFetchService:
     def _fetch_one(
         self, item: Dict[str, Any]
     ) -> Tuple[Optional[GeniusSong], str, List[GeniusAnnotation]]:
-        song = self._client.find_song(item["title"], item["artist"])
+        # EVERY credited artist, not just the most popular one — Genius names a
+        # collaboration by its own idea of the primary credit, which is routinely
+        # not ours. See GeniusClient.find_song.
+        song = self._client.find_song(item["title"], item["artists"])
         if song is None:
             return None, MATCH_NOT_FOUND, []
         # TWO gates, not one. The blend leans on the artist, so it cannot catch the
