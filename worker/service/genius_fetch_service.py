@@ -78,7 +78,12 @@ _SELECT_WORK = text("""
       LEFT JOIN track_genius_songs g ON g.track_id = t.id
      WHERE tl.match_status = 'matched'
        AND g.track_id IS NULL
-     ORDER BY t.id
+     -- Bucketed albums first. The lyrics sheet opens from a bucket's album modal,
+     -- so those are the tracks that actually get read: 635 of the 11,747 eligible.
+     -- Oldest-first would spend a month of runs before touching one of them.
+     ORDER BY EXISTS (
+       SELECT 1 FROM review_bucket_items bi WHERE bi.album_id = t.album_id
+     ) DESC, t.id
      LIMIT :limit
 """)
 
