@@ -61,7 +61,12 @@ def test_handler_unknown_format(mock_session_local, mock_svc_class):
 @patch("worker.handler.SessionLocal")
 def test_handler_error_returns_true(mock_session_local, mock_svc_class):
     """처리 중 에러가 나면 해당 record를 batchItemFailures에 추가하는지 확인."""
-    mock_session_local.side_effect = Exception("DB connection failed")
+    # The handler no longer opens a session itself — it hands SessionLocal to the
+    # service, which owns its own short transactions (FIX-worker-txn-across-http).
+    # So the failure has to come from the sync call.
+    mock_svc_class.return_value.sync_albums_batch.side_effect = Exception(
+        "DB connection failed"
+    )
 
     event = {
         "Records": [{

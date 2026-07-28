@@ -31,11 +31,11 @@ def _route_enrich_through_sync_spotify(monkeypatch):
 
 @pytest.mark.integration
 @patch("worker.service.sync_service.spotify")
-def test_sync_albums_batch_inserts_artist(mock_spotify, db_connection, sample_spotify_album):
+def test_sync_albums_batch_inserts_artist(mock_spotify, db_connection, db_session_factory, sample_spotify_album):
     """앨범 동기화 시 아티스트가 DB에 저장되는지 확인."""
     mock_spotify.get_albums.return_value = [sample_spotify_album]
 
-    svc = AlbumSyncService(db_connection)
+    svc = AlbumSyncService(db_session_factory)
     svc.sync_albums_batch(["test_album_001"], "KR")
 
     result = db_connection.execute(
@@ -49,11 +49,11 @@ def test_sync_albums_batch_inserts_artist(mock_spotify, db_connection, sample_sp
 
 @pytest.mark.integration
 @patch("worker.service.sync_service.spotify")
-def test_sync_albums_batch_inserts_album(mock_spotify, db_connection, sample_spotify_album):
+def test_sync_albums_batch_inserts_album(mock_spotify, db_connection, db_session_factory, sample_spotify_album):
     """앨범 데이터가 DB에 저장되는지 확인."""
     mock_spotify.get_albums.return_value = [sample_spotify_album]
 
-    svc = AlbumSyncService(db_connection)
+    svc = AlbumSyncService(db_session_factory)
     svc.sync_albums_batch(["test_album_001"], "KR")
 
     result = db_connection.execute(
@@ -69,11 +69,11 @@ def test_sync_albums_batch_inserts_album(mock_spotify, db_connection, sample_spo
 
 @pytest.mark.integration
 @patch("worker.service.sync_service.spotify")
-def test_sync_albums_batch_inserts_tracks(mock_spotify, db_connection, sample_spotify_album):
+def test_sync_albums_batch_inserts_tracks(mock_spotify, db_connection, db_session_factory, sample_spotify_album):
     """트랙이 DB에 저장되는지 확인."""
     mock_spotify.get_albums.return_value = [sample_spotify_album]
 
-    svc = AlbumSyncService(db_connection)
+    svc = AlbumSyncService(db_session_factory)
     svc.sync_albums_batch(["test_album_001"], "KR")
 
     result = db_connection.execute(
@@ -85,11 +85,11 @@ def test_sync_albums_batch_inserts_tracks(mock_spotify, db_connection, sample_sp
 
 @pytest.mark.integration
 @patch("worker.service.sync_service.spotify")
-def test_sync_albums_batch_links_album_artists(mock_spotify, db_connection, sample_spotify_album):
+def test_sync_albums_batch_links_album_artists(mock_spotify, db_connection, db_session_factory, sample_spotify_album):
     """album_artists 관계가 생성되는지 확인."""
     mock_spotify.get_albums.return_value = [sample_spotify_album]
 
-    svc = AlbumSyncService(db_connection)
+    svc = AlbumSyncService(db_session_factory)
     svc.sync_albums_batch(["test_album_001"], "KR")
 
     result = db_connection.execute(
@@ -107,11 +107,11 @@ def test_sync_albums_batch_links_album_artists(mock_spotify, db_connection, samp
 
 @pytest.mark.integration
 @patch("worker.service.sync_service.spotify")
-def test_sync_albums_batch_links_track_artists(mock_spotify, db_connection, sample_spotify_album):
+def test_sync_albums_batch_links_track_artists(mock_spotify, db_connection, db_session_factory, sample_spotify_album):
     """track_artists 관계가 생성되는지 확인."""
     mock_spotify.get_albums.return_value = [sample_spotify_album]
 
-    svc = AlbumSyncService(db_connection)
+    svc = AlbumSyncService(db_session_factory)
     svc.sync_albums_batch(["test_album_001"], "KR")
 
     result = db_connection.execute(
@@ -127,11 +127,11 @@ def test_sync_albums_batch_links_track_artists(mock_spotify, db_connection, samp
 
 @pytest.mark.integration
 @patch("worker.service.sync_service.spotify")
-def test_sync_albums_batch_upsert_idempotent(mock_spotify, db_connection, sample_spotify_album):
+def test_sync_albums_batch_upsert_idempotent(mock_spotify, db_connection, db_session_factory, sample_spotify_album):
     """같은 데이터를 두 번 동기화해도 중복 없이 정상 동작하는지 확인 (멱등성)."""
     mock_spotify.get_albums.return_value = [sample_spotify_album]
 
-    svc = AlbumSyncService(db_connection)
+    svc = AlbumSyncService(db_session_factory)
     svc.sync_albums_batch(["test_album_001"], "KR")
     svc.sync_albums_batch(["test_album_001"], "KR")  # 두 번째 실행
 
@@ -149,11 +149,11 @@ def test_sync_albums_batch_upsert_idempotent(mock_spotify, db_connection, sample
 
 @pytest.mark.integration
 @patch("worker.service.sync_service.spotify")
-def test_sync_albums_batch_multiple_albums(mock_spotify, db_connection, sample_spotify_albums):
+def test_sync_albums_batch_multiple_albums(mock_spotify, db_connection, db_session_factory, sample_spotify_albums):
     """여러 앨범을 한번에 동기화할 수 있는지 확인."""
     mock_spotify.get_albums.return_value = sample_spotify_albums
 
-    svc = AlbumSyncService(db_connection)
+    svc = AlbumSyncService(db_session_factory)
     svc.sync_albums_batch(["test_album_001", "test_album_002"], "KR")
 
     album_count = db_connection.execute(
@@ -169,13 +169,13 @@ def test_sync_albums_batch_multiple_albums(mock_spotify, db_connection, sample_s
 
 
 @patch("worker.service.sync_service.spotify")
-def test_sync_albums_batch_skips_null_album(mock_spotify, db_connection, sample_spotify_album):
+def test_sync_albums_batch_skips_null_album(mock_spotify, db_connection, db_session_factory, sample_spotify_album):
     """Spotify가 배치 응답에 null 원소(알 수 없는 id)를 섞어 보내도 한 건이
     전체 레코드를 죽이지 않고, 유효한 앨범은 정상 동기화된다 (B1)."""
     # GET /v1/albums?ids= 는 알 수 없는 id 위치에 null 을 넣어 반환한다.
     mock_spotify.get_albums.return_value = [None, sample_spotify_album]
 
-    svc = AlbumSyncService(db_connection)
+    svc = AlbumSyncService(db_session_factory)
     # null 원소에서 TypeError 없이 완주해야 한다.
     svc.sync_albums_batch(["bogus_id", "test_album_001"], "KR")
 
@@ -187,9 +187,9 @@ def test_sync_albums_batch_skips_null_album(mock_spotify, db_connection, sample_
 
 @pytest.mark.integration
 @patch("worker.service.sync_service.spotify")
-def test_sync_albums_batch_empty_list(mock_spotify, db_connection):
+def test_sync_albums_batch_empty_list(mock_spotify, db_connection, db_session_factory):
     """빈 리스트를 넘겨도 에러 없이 동작하는지 확인."""
-    svc = AlbumSyncService(db_connection)
+    svc = AlbumSyncService(db_session_factory)
     svc.sync_albums_batch([], "KR")
 
     # Spotify 호출 자체가 안 일어나야 함
@@ -198,11 +198,11 @@ def test_sync_albums_batch_empty_list(mock_spotify, db_connection):
 
 @pytest.mark.integration
 @patch("worker.service.sync_service.spotify")
-def test_sync_albums_batch_track_duration(mock_spotify, db_connection, sample_spotify_album):
+def test_sync_albums_batch_track_duration(mock_spotify, db_connection, db_session_factory, sample_spotify_album):
     """트랙 duration_ms → duration_sec 변환이 정확한지 확인."""
     mock_spotify.get_albums.return_value = [sample_spotify_album]
 
-    svc = AlbumSyncService(db_connection)
+    svc = AlbumSyncService(db_session_factory)
     svc.sync_albums_batch(["test_album_001"], "KR")
 
     result = db_connection.execute(
@@ -252,11 +252,11 @@ def _artist_detail(art_sid: str, genres: list[str]) -> dict:
 
 @pytest.mark.integration
 @patch("worker.service.sync_service.spotify")
-def test_sync_albums_batch_stores_upc_in_ext_refs(mock_spotify, db_connection, sample_spotify_album):
+def test_sync_albums_batch_stores_upc_in_ext_refs(mock_spotify, db_connection, db_session_factory, sample_spotify_album):
     """GET /albums 응답의 external_ids.upc 가 albums.ext_refs.upc 로 저장된다."""
     mock_spotify.get_albums.return_value = [sample_spotify_album]
 
-    svc = AlbumSyncService(db_connection)
+    svc = AlbumSyncService(db_session_factory)
     svc.sync_albums_batch(["test_album_001"], "KR")
 
     row = db_connection.execute(
@@ -272,10 +272,10 @@ def test_sync_albums_batch_stores_upc_in_ext_refs(mock_spotify, db_connection, s
 
 @pytest.mark.integration
 @patch("worker.service.sync_service.spotify")
-def test_sync_albums_batch_ext_refs_merge_preserves_existing_keys(mock_spotify, db_connection):
+def test_sync_albums_batch_ext_refs_merge_preserves_existing_keys(mock_spotify, db_connection, db_session_factory):
     """external_ids 없는 재동기화가 백필된 upc 나 다른 키를 지우면 안 된다 (|| merge)."""
     alb_sid, art_sid = "genre_test_album_merge", "genre_test_artist_merge"
-    svc = AlbumSyncService(db_connection)
+    svc = AlbumSyncService(db_session_factory)
 
     mock_spotify.get_albums.return_value = [_genre_album(alb_sid, art_sid, with_upc=True)]
     svc.sync_albums_batch([alb_sid], "KR")
@@ -304,7 +304,7 @@ def test_sync_albums_batch_ext_refs_merge_preserves_existing_keys(mock_spotify, 
 
 @pytest.mark.integration
 @patch("worker.service.sync_service.spotify")
-def test_sync_albums_batch_attaches_mapped_genres(mock_spotify, db_connection):
+def test_sync_albums_batch_attaches_mapped_genres(mock_spotify, db_connection, db_session_factory):
     """아티스트 genre 문자열의 S1 매핑이 album_genres(source='mapping', confidence='low')
     로 붙고, 케이팝(arbitration-only)은 직접 attach 되지 않는다."""
     alb_sid, art_sid = "genre_test_album_s1", "genre_test_artist_s1"
@@ -313,7 +313,7 @@ def test_sync_albums_batch_attaches_mapped_genres(mock_spotify, db_connection):
         _artist_detail(art_sid, ["한국 랩", "케이팝"])
     ]
 
-    svc = AlbumSyncService(db_connection)
+    svc = AlbumSyncService(db_session_factory)
     svc.sync_albums_batch([alb_sid], "KR")
 
     rows = db_connection.execute(
@@ -333,7 +333,7 @@ def test_sync_albums_batch_attaches_mapped_genres(mock_spotify, db_connection):
 
 @pytest.mark.integration
 @patch("worker.service.sync_service.spotify")
-def test_sync_albums_batch_genre_mapping_idempotent(mock_spotify, db_connection):
+def test_sync_albums_batch_genre_mapping_idempotent(mock_spotify, db_connection, db_session_factory):
     """같은 앨범을 두 번 동기화해도 album_genres 가 중복되지 않는다."""
     alb_sid, art_sid = "genre_test_album_idem", "genre_test_artist_idem"
     mock_spotify.get_albums.return_value = [_genre_album(alb_sid, art_sid)]
@@ -341,7 +341,7 @@ def test_sync_albums_batch_genre_mapping_idempotent(mock_spotify, db_connection)
         _artist_detail(art_sid, ["한국 록"])
     ]
 
-    svc = AlbumSyncService(db_connection)
+    svc = AlbumSyncService(db_session_factory)
     svc.sync_albums_batch([alb_sid], "KR")
     svc.sync_albums_batch([alb_sid], "KR")
 
@@ -359,14 +359,14 @@ def test_sync_albums_batch_genre_mapping_idempotent(mock_spotify, db_connection)
 
 @pytest.mark.integration
 @patch("worker.service.sync_service.spotify")
-def test_sync_albums_batch_no_genre_strings_no_rows(mock_spotify, db_connection):
+def test_sync_albums_batch_no_genre_strings_no_rows(mock_spotify, db_connection, db_session_factory):
     """genre 문자열이 없는 아티스트만 있으면 album_genres 행을 만들지 않는다
     (zero-signal 앨범은 Step 3 iTunes/LLM 패스 몫 — S1 이 World-Other 를 강제하지 않음)."""
     alb_sid, art_sid = "genre_test_album_zero", "genre_test_artist_zero"
     mock_spotify.get_albums.return_value = [_genre_album(alb_sid, art_sid)]
     mock_spotify.get_artists_batch.return_value = [_artist_detail(art_sid, [])]
 
-    svc = AlbumSyncService(db_connection)
+    svc = AlbumSyncService(db_session_factory)
     svc.sync_albums_batch([alb_sid], "KR")
 
     count = db_connection.execute(

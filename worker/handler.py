@@ -158,10 +158,13 @@ def _process_single(album_id: str, market: str) -> None:
         logger.info("[DRY_RUN] album='%s'", albums[0].get("name") if albums else None)
         return
 
-    with SessionLocal() as session, session.begin():
-        svc = AlbumSyncService(session.connection())
-        svc.sync_albums_batch([album_id], market)
-        logger.info("Album synced to DB: %s", album_id)
+    # Pass the factory, not an open session: AlbumSyncService opens its own short
+    # write transactions around the Spotify calls (FIX-worker-txn-across-http).
+    # Handing it `session.connection()` inside `session.begin()` held artists/
+    # albums/tracks row locks across the enrich loop's outbound HTTP.
+    svc = AlbumSyncService(SessionLocal)
+    svc.sync_albums_batch([album_id], market)
+    logger.info("Album synced to DB: %s", album_id)
 
 
 def _process_batch(album_ids: List[str], market: str) -> None:
@@ -176,10 +179,10 @@ def _process_batch(album_ids: List[str], market: str) -> None:
         logger.info("[DRY_RUN] fetched=%d (batch)", len(albums))
         return
 
-    with SessionLocal() as session, session.begin():
-        svc = AlbumSyncService(session.connection())
-        svc.sync_albums_batch(album_ids, market)
-        logger.info("Batch synced to DB: %d albums", len(album_ids))
+    # Factory, not an open session — see _process_single.
+    svc = AlbumSyncService(SessionLocal)
+    svc.sync_albums_batch(album_ids, market)
+    logger.info("Batch synced to DB: %d albums", len(album_ids))
 
 
 def _run_genius_fetch(limit: int | None = None) -> None:
