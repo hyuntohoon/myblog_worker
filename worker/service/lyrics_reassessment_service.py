@@ -127,6 +127,114 @@ class LyricsReassessmentService:
         metrics["exclusions"] = exclusions
         return metrics
 
+    def reassess_album(
+        self,
+        album_id: str,
+        limit: Optional[int] = None,
+        cooldown_sec: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Expedite one album: re-check its unresolved tracks NOW, out of turn.
+
+        The periodic pass rotates stalest-first across a five-figure pool, so a just-released
+        album whose lyrics DO exist on LRCLIB can sit months behind the queue head. This is the
+        same evaluation under the same replacement guard, scoped to one album — nothing here
+        can promote a row the daily job would not have promoted eventually.
+
+        Two deliberate differences from ``reassess``:
+
+        * **The label-yield exclusion is bypassed** (the selection below omits the
+          ``excluded_by`` filter). An excluded row is one the pool decided not to spend a
+          scheduled re-check on; an explicit request for THIS album overrides that, and a
+          promotion here is also the strongest possible evidence that the exclusion was wrong.
+        * **No ``sync_exclusions``.** That is pool-wide maintenance the daily pass owns; running
+          it on a single-album request would add two writes and a lock for no benefit, since
+          this path ignores the marks anyway.
+
+        ``cooldown_sec`` is the idempotency bound: rows re-checked within the window are not
+        selected. SQS delivers at least once and the writer's ``ON CONFLICT`` sets
+        ``updated_at = NOW()``, so the cooldown is what makes a double-fire cheap instead of a
+        second full LRCLIB sweep. Pass ``0`` to force an immediate re-run (``None`` ⇒ setting).
+
+        Only tracks that already have a ``track_lyrics`` row are candidates; a brand-new album
+        whose tracks have never been evaluated belongs to the incremental collector (Step 3),
+        which the album-sync path chains automatically.
+        """
+        limit = limit if limit is not None else settings.LYRICS_REASSESS_BATCH_LIMIT
+        cooldown_sec = (
+            cooldown_sec if cooldown_sec is not None else settings.LYRICS_EXPEDITE_COOLDOWN_SEC
+        )
+        tracks = self._fetch_album_tracks(album_id, limit, cooldown_sec)
+        metrics = run_eval_batch(
+            self.session, tracks,
+            concurrency=self.concurrency,
+            time_budget_sec=self.time_budget_sec,
+            client=self._client,
+            should_write=should_replace,
+            log_prefix=f"Lyrics expedite (album {album_id})",
+        )
+        metrics["album_id"] = str(album_id)
+        return metrics
+
+    def _fetch_album_tracks(
+        self, album_id: str, limit: int, cooldown_sec: float
+    ) -> List[Dict[str, Any]]:
+        """Expedite targets: one album's unresolved (+ best-of) rows, exclusion bypassed.
+
+        Deliberately a near-copy of ``_fetch_unresolved_tracks``: same status arms, same
+        projection, same shared LATERAL — so the expedite evaluates exactly what the scheduled
+        pass would, and the two cannot drift into disagreeing about what "unresolved" means.
+        The two differences are the point of the method: the album filter, and the **absence**
+        of the ``NOT (tl.evidence ? 'excluded_by')`` guard.
+
+        ``make_interval(secs => :cooldown_sec)`` rather than ``:cooldown_sec * INTERVAL '1 s'``:
+        the function signature pins the bind parameter to ``double precision``, where the
+        multiplication form leaves Postgres to infer a bare parameter's type and fail with
+        "could not determine data type" (the workspace #84 → #85 failure, verbatim).
+        """
+        rows = self.session.execute(
+            text(
+                f"""
+                SELECT t.id, t.title, t.duration_sec,
+                       primary_artists.artist_names                     AS artist_names,
+                       ARRAY_REMOVE(ARRAY_AGG(DISTINCT al.alias), NULL) AS aliases,
+                       tl.match_status                     AS existing_status,
+                       (tl.evidence ->> 'match_basis')     AS existing_basis
+                FROM track_lyrics tl
+                JOIN tracks t         ON t.id = tl.track_id
+                JOIN track_artists ta ON ta.track_id = t.id
+                JOIN artists a        ON a.id = ta.artist_id
+                LEFT JOIN LATERAL jsonb_array_elements_text(a.aliases) AS al(alias) ON true
+{PRIMARY_ARTIST_NAMES_LATERAL}
+                WHERE t.album_id = :album_id
+                  AND tl.updated_at < NOW() - make_interval(secs => :cooldown_sec)
+                  AND (tl.match_status IN ('not_found', 'ambiguous', 'review_required')
+                       OR (tl.match_status = 'matched'
+                           AND tl.evidence ->> 'match_basis' LIKE 'best-of-%'))
+                GROUP BY t.id, t.title, t.duration_sec,
+                         tl.match_status, (tl.evidence ->> 'match_basis'), tl.updated_at,
+                         primary_artists.artist_names
+                ORDER BY
+                    CASE WHEN tl.match_status IN ('not_found', 'ambiguous', 'review_required')
+                         THEN 0 ELSE 1 END,
+                    tl.updated_at ASC
+                LIMIT :limit
+                """
+            ),
+            {"album_id": album_id, "cooldown_sec": cooldown_sec, "limit": limit},
+        ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "title": r[1],
+                "duration_sec": r[2],
+                "artist_names": list(r[3] or []),
+                "aliases": list(r[4] or []),
+                "existing_status": r[5],
+                "existing_basis": r[6],
+            }
+            for r in rows
+        ]
+
     def _fetch_unresolved_tracks(self, limit: int) -> List[Dict[str, Any]]:
         """Reassessment targets: unresolved rows + best-of-* matched rows (stalest first).
 

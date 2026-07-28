@@ -195,7 +195,7 @@ def test_handler_lyrics_incremental_honors_limit_override(mock_lyrics):
 def test_handler_eventbridge_lyrics_reassessment_job(mock_alias, mock_incr, mock_reassess):
     """{"job": "lyrics_reassessment"} → reassessment only; must NOT hit incremental or alias."""
     result = lambda_handler({"job": "lyrics_reassessment"}, None)
-    mock_reassess.assert_called_once_with(limit=None)
+    mock_reassess.assert_called_once_with(limit=None, album_id=None, cooldown_sec=None)
     mock_incr.assert_not_called()
     mock_alias.assert_not_called()
     assert result == {}
@@ -206,8 +206,32 @@ def test_handler_eventbridge_lyrics_reassessment_job(mock_alias, mock_incr, mock
 def test_handler_lyrics_reassessment_honors_limit_override(mock_reassess):
     """An explicit "limit" is passed through to the reassessment job."""
     result = lambda_handler({"job": "lyrics_reassessment", "limit": 40}, None)
-    mock_reassess.assert_called_once_with(limit=40)
+    mock_reassess.assert_called_once_with(limit=40, album_id=None, cooldown_sec=None)
     assert result == {}
+
+
+# ── DATA-catalog-noise Step 4: album-scoped expedite routing ─────────────────────
+
+@pytest.mark.unit
+@patch("worker.handler._run_lyrics_reassessment")
+def test_handler_lyrics_reassessment_routes_album_expedite(mock_reassess):
+    """"album_id" on the same job switches it to the album-scoped expedite."""
+    result = lambda_handler(
+        {"job": "lyrics_reassessment", "album_id": "62bc17c7-962d-4ebd-9fc6-f0f5488487b2"}, None
+    )
+    mock_reassess.assert_called_once_with(
+        limit=None, album_id="62bc17c7-962d-4ebd-9fc6-f0f5488487b2", cooldown_sec=None
+    )
+    assert result == {}
+
+
+@pytest.mark.unit
+@patch("worker.handler._run_lyrics_reassessment")
+def test_handler_expedite_forwards_zero_cooldown(mock_reassess):
+    """cooldown_sec=0 (force a re-fire inside the window) must survive routing, not be
+    swallowed as falsy — the service, not the handler, owns the None ⇒ default decision."""
+    lambda_handler({"job": "lyrics_reassessment", "album_id": "abc", "cooldown_sec": 0}, None)
+    mock_reassess.assert_called_once_with(limit=None, album_id="abc", cooldown_sec=0)
 
 
 # --------------------------------------------------------------------------
@@ -288,4 +312,19 @@ def test_sqs_lyrics_reassessment_routed_in_record_loop(mock_run):
     event = {"Records": [{"body": json.dumps({"job": "lyrics_reassessment"})}]}
     results = lambda_handler(event, None)
     assert results == {"batchItemFailures": []}
-    mock_run.assert_called_once_with(limit=None)
+    mock_run.assert_called_once_with(limit=None, album_id=None, cooldown_sec=None)
+
+
+@pytest.mark.unit
+@patch("worker.handler._run_lyrics_reassessment")
+def test_sqs_album_expedite_routed_in_record_loop(mock_run):
+    """The documented fire path is one `aws sqs send-message`, so the record loop — not just
+    the EventBridge branch — has to carry album_id through."""
+    event = {"Records": [{"body": json.dumps(
+        {"job": "lyrics_reassessment", "album_id": "62bc17c7-962d-4ebd-9fc6-f0f5488487b2"}
+    )}]}
+    results = lambda_handler(event, None)
+    assert results == {"batchItemFailures": []}
+    mock_run.assert_called_once_with(
+        limit=None, album_id="62bc17c7-962d-4ebd-9fc6-f0f5488487b2", cooldown_sec=None
+    )
