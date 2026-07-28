@@ -29,8 +29,13 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TEST_DB_URL: ${{ secrets.TEST_DB_URL }}
-      APPLY: "false"
-      EXPECTED_MISSING: ""
+      APPLY: "true"
+      # Push-1 probe result (run 30405751056): every file except V4 ran clean in
+      # the cumulative rolled-back transaction. Idempotent (IF NOT EXISTS) files
+      # that are already applied also run clean, so "MISSING" here means "safe to
+      # (re)apply", not "definitely absent" — reapplication is a no-op for them.
+      # V4 errored 42701 duplicate_column = already applied, excluded.
+      EXPECTED_MISSING: "V2__add_artists_musicbrainz_id.sql V3__partial_unique_excl_not_found.sql V5__widen_posts_rating_scale.sql V6__review_buckets.sql V7__library_items.sql V8__album_to_listen_items.sql V9__spotify_listening_cache.sql V10__spotify_play_events.sql V11__review_buckets_parent_id.sql V12__pg_trgm_search_indexes.sql V13__section_rename_and_seed.sql V14__spotify_recent_tracks.sql V15__spotify_library_sync.sql V16__album_research.sql V17__genres.sql V18__review_buckets_is_public.sql V19__spotify_track_play_events.sql V20__genre_subgenres.sql V21__genre_deepen.sql V22__review_bucket_items_prep_tonight.sql V23__genre_definitions.sql V24__spotify_saved_tracks.sql V25__genre_backfill_requests.sql V26__add_saved_track_duration.sql V27__spotify_stream_history.sql V28__review_bucket_items_generalize.sql V29__bucket_item_snapshots.sql V30__review_bucket_items_relax.sql V31__fold_album_to_listen_items.sql V32__my_buckit_artist.sql V33__track_lyrics_store.sql V34__track_isrc.sql V35__track_lyrics_translations.sql V36__users.sql V37__post_recommended_tracks_composite_pk.sql V38__album_reviews.sql V39__daily_picks.sql V40__bucket_user_id.sql V41__user_integrations_lastfm.sql V42__bucket_user_id_notnull.sql V43__llm_usage.sql V44__artist_release_events.sql V45__spotify_member_listening.sql V46__stream_history_user_id.sql V47__user_artist_tracks.sql V48__daily_pick_queue.sql V49__track_genius_annotations.sql"
     steps:
       - uses: actions/checkout@v4
 
@@ -65,14 +70,40 @@ jobs:
             psql "$URL" -v ON_ERROR_STOP=1 -f "/tmp/shared_db/migrations/$f"
           done
 
-      - name: Re-probe (verify nothing missing)
+      # A re-probe cannot verify success: idempotent already-applied files run
+      # clean and would read as "MISSING" forever. Verify by decisive signature
+      # objects instead — one per structural era, including the non-idempotent
+      # V13 rename (sections present, categories gone).
+      - name: Verify signature objects (post-apply)
         if: env.APPLY == 'true'
         run: |
-          python .github/scripts/probe_migrations.py /tmp/shared_db/migrations | tee /tmp/probe2.txt
-          if ! grep -q '^MISSING_LIST=$' /tmp/probe2.txt; then
-            echo "::error::migrations still missing after apply"
-            exit 1
-          fi
+          URL=$(python -c "import os; print(os.environ['TEST_DB_URL'].replace('postgresql+psycopg', 'postgresql'))")
+          psql "$URL" -v ON_ERROR_STOP=1 -Atc "
+            SELECT CASE WHEN bool_and(ok) THEN 'SIGNATURES-OK' ELSE 'SIGNATURES-FAIL' END
+            FROM (VALUES
+              ('sections',                to_regclass('public.sections') IS NOT NULL),
+              ('categories-gone',         to_regclass('public.categories') IS NULL),
+              ('review_buckets',          to_regclass('public.review_buckets') IS NOT NULL),
+              ('spotify_stream_history',  to_regclass('public.spotify_stream_history') IS NOT NULL),
+              ('bucket_item_snapshots',   to_regclass('public.bucket_item_snapshots') IS NOT NULL),
+              ('track_lyrics',            to_regclass('public.track_lyrics') IS NOT NULL),
+              ('track_lyrics_translations', to_regclass('public.track_lyrics_translations') IS NOT NULL),
+              ('users',                   to_regclass('public.users') IS NOT NULL),
+              ('album_reviews',           to_regclass('public.album_reviews') IS NOT NULL),
+              ('daily_picks',             to_regclass('public.daily_picks') IS NOT NULL),
+              ('user_integrations',       to_regclass('public.user_integrations') IS NOT NULL),
+              ('llm_usage',               to_regclass('public.llm_usage') IS NOT NULL),
+              ('artist_release_events',   to_regclass('public.artist_release_events') IS NOT NULL),
+              ('spotify_member_now_playing', to_regclass('public.spotify_member_now_playing') IS NOT NULL),
+              ('user_artist_tracks',      to_regclass('public.user_artist_tracks') IS NOT NULL),
+              ('daily_pick_queue',        to_regclass('public.daily_pick_queue') IS NOT NULL),
+              ('track_genius_annotations', to_regclass('public.track_genius_annotations') IS NOT NULL),
+              ('tracks.isrc',             EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tracks' AND column_name='isrc')),
+              ('stream_history.user_id',  EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='spotify_stream_history' AND column_name='user_id')),
+              ('uq_rbi_album-index',      EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='uq_review_bucket_items_album'))
+            ) AS t(name, ok);
+          " | tee /tmp/sig.txt
+          grep -q 'SIGNATURES-OK' /tmp/sig.txt
 
       - name: Backend integration suite (report-only)
         if: env.APPLY == 'true'
