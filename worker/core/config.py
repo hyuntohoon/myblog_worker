@@ -165,6 +165,13 @@ class Settings(BaseSettings):
     LYRICS_REASSESS_CONCURRENCY: int = 20
     LYRICS_REASSESS_TIME_BUDGET_SEC: float = 90.0
 
+    # Album-scoped expedite (DATA-catalog-noise Step 4): re-check ONE album out of turn, fired
+    # by an SQS message carrying "album_id". The cooldown is the idempotency bound — SQS is
+    # at-least-once and the writer bumps updated_at, so without it a redelivered message would
+    # re-run the whole album against LRCLIB. 600s comfortably covers redelivery (visibility
+    # timeout is minutes) while still letting a human re-fire the same album within the hour.
+    LYRICS_EXPEDITE_COOLDOWN_SEC: float = 600.0
+
     # ISRC backfill (FEAT-lyrics-corpus Step 1b, worker EventBridge job). Bounded like every
     # other scheduled job so a run always finishes inside the 120s Lambda timeout: 500 tracks
     # is 10 Spotify chunks of 50, and the budget stops the loop rather than letting a 429

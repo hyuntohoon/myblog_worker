@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from worker.core.config import settings
 from worker.service.lyrics_matcher import (
     STATUS_MATCHED,
     Candidate,
@@ -227,6 +228,90 @@ def test_best_of_row_not_downgraded_when_recheck_fails():
 # --------------------------------------------------------------------------
 # Widened selection SQL (Step 2): best-of rows re-selected, unresolved keeps priority
 # --------------------------------------------------------------------------
+def _album_service(client, tracks):
+    session = MagicMock()
+    svc = LyricsReassessmentService(session, client=client)
+    svc._fetch_album_tracks = MagicMock(return_value=tracks)
+    return svc, session
+
+
+class TestReassessAlbum:
+    """DATA-catalog-noise Step 4 — album-scoped expedite (orchestration)."""
+
+    def test_promotes_and_writes_under_the_same_guard(self):
+        client = _FakeClient(result=[_matching_candidate()])
+        svc, session = _album_service(client, [_unresolved_row("not_found")])
+        metrics = svc.reassess_album("album-1")
+        assert metrics[STATUS_MATCHED] == 1
+        assert metrics["evaluated"] == 1
+        assert metrics["album_id"] == "album-1"
+        assert session.execute.call_count == 1
+
+    def test_good_match_still_protected(self):
+        # The expedite bypasses the exclusion, NOT the replacement guard.
+        client = _FakeClient(result=[_matching_candidate()])
+        row = {"id": uuid.uuid4(), "title": "Hello", "duration_sec": 295,
+               "artist_names": ["Adele"], "aliases": [],
+               "existing_status": "matched", "existing_basis": "exact-title"}
+        svc, session = _album_service(client, [row])
+        metrics = svc.reassess_album("album-1")
+        assert metrics["guard_kept"] == 1
+        session.execute.assert_not_called()
+
+    def test_does_not_run_pool_wide_exclusion_sync(self, monkeypatch):
+        """`reassess` recomputes exclusions before selecting; the expedite must not. It is a
+        single-album request that ignores the marks anyway, so syncing them would only add
+        two writes and a lock to an interactive path."""
+        calls = []
+        monkeypatch.setattr(
+            "worker.service.lyrics_reassessment_service.sync_exclusions",
+            lambda session: calls.append(1) or {},
+        )
+        svc, _ = _album_service(_FakeClient(), [])
+        svc.reassess_album("album-1")
+        assert calls == []
+
+    def test_defaults_come_from_settings_but_zero_cooldown_is_honoured(self):
+        """`0` means "no cooldown, re-run now" and must not collapse into the default the way
+        `cooldown_sec or SETTING` would."""
+        svc, _ = _album_service(_FakeClient(), [])
+        svc.reassess_album("album-1")
+        assert svc._fetch_album_tracks.call_args[0][2] == settings.LYRICS_EXPEDITE_COOLDOWN_SEC
+
+        svc.reassess_album("album-1", limit=5, cooldown_sec=0)
+        album_id, limit, cooldown = svc._fetch_album_tracks.call_args[0]
+        assert (limit, cooldown) == (5, 0)
+
+
+class TestAlbumSelectionSQL:
+    """The expedite's selection differs from the scheduled one in exactly two ways."""
+
+    def _sql_and_params(self, cooldown_sec=600.0):
+        session = MagicMock()
+        session.execute.return_value.fetchall.return_value = []
+        svc = LyricsReassessmentService(session, client=_FakeClient())
+        svc._fetch_album_tracks("album-1", 150, cooldown_sec)
+        return str(session.execute.call_args[0][0]), session.execute.call_args[0][1]
+
+    def test_scoped_to_the_album_with_a_cooldown(self):
+        sql, params = self._sql_and_params()
+        assert "t.album_id = :album_id" in sql
+        assert "tl.updated_at < NOW() - make_interval(secs => :cooldown_sec)" in sql
+        assert params == {"album_id": "album-1", "cooldown_sec": 600.0, "limit": 150}
+
+    def test_label_yield_exclusion_is_bypassed(self):
+        """The whole point of the expedite: an explicitly requested album is re-checked even
+        if pool hygiene had excluded its rows. If this assertion ever starts failing, the
+        expedite has silently become a no-op for exactly the albums it exists to rescue."""
+        sql, _ = self._sql_and_params()
+        assert "excluded_by" not in sql
+
+    def test_otherwise_selects_what_the_scheduled_pass_selects(self):
+        sql, _ = self._sql_and_params()
+        assert "tl.match_status IN ('not_found', 'ambiguous', 'review_required')" in sql
+        assert "tl.evidence ->> 'match_basis' LIKE 'best-of-%'" in sql
+
+
 def test_selection_sql_reselects_best_of_with_unresolved_priority():
     """The selection is otherwise DB-only (stubbed in the tests above); assert the SQL
     carries the two Step-2 arms: the best-of re-select and the unresolved-first ORDER BY.
