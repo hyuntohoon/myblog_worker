@@ -48,7 +48,8 @@ class _Result:
 
 class _FakeSession:
     def __init__(self, album_count=0, eligible=(), known=(), events=()):
-        # eligible: (spotify_id, watch) pairs — artist_id derived as f"{sid}-id"
+        # eligible: (spotify_id, watch, classical=False, holdout=False), with
+        # artist_id derived as f"{sid}-id". Two-tuples keep older tests concise.
         self.album_count = album_count
         self.eligible = list(eligible)
         self.known = set(known)          # album spotify_ids already in DB
@@ -65,9 +66,12 @@ class _FakeSession:
         if "FROM artists" in sql:
             assert (params or {}).get("pop_min") is not None
             assert (params or {}).get("watch_min") is not None
-            return _Result(
-                rows=[_Row(sid, f"{sid}-id", watch) for sid, watch in self.eligible]
-            )
+            assert (params or {}).get("holdout_mod") is not None
+            rows = []
+            for sid, watch, *classification in self.eligible:
+                classical, holdout = [*classification, False, False][:2]
+                rows.append(_Row(sid, f"{sid}-id", watch, classical, holdout))
+            return _Result(rows=rows)
         if "FROM albums WHERE spotify_id = ANY" in sql:
             sids = params["sids"]
             return _Result(rows=[_Row(s) for s in sids if s in self.known])
@@ -146,6 +150,7 @@ def test_happy_path_filters_known_and_gates_low_pop(monkeypatch):
     assert counters == {
         "eligible": 2, "swept": 2, "discovered": 4, "fresh": 3,
         "novel": 2, "passed_gate": 1, "enqueued": 1,
+        "classical_excluded": 0, "classical_holdout": 0,
         "confirm_candidates": 0, "confirm_flipped": 0, "confirm_inserted": 0,
         "confirm_gate_skipped": 0,
     }
@@ -155,6 +160,72 @@ def test_happy_path_filters_known_and_gates_low_pop(monkeypatch):
     assert catalog.albums_calls == [["new-hot", "new-flop-variant"]]
     # no confirm traffic for non-watchlist artists
     assert not session.sql_of(lambda s: "artist_release_events" in s)
+
+
+@pytest.mark.unit
+def test_classical_non_holdout_artist_is_excluded(caplog):
+    session = _FakeSession(
+        eligible=[
+            ("classicalA", False, True, False),
+            ("plainB", False, False, False),
+        ]
+    )
+    catalog = _FakeCatalog({}, {})
+    counters, _ = _run(session, catalog)
+
+    assert catalog.artist_calls == [("plainB", "album")]
+    assert counters["classical_excluded"] == 1
+    assert counters["classical_holdout"] == 0
+    assert any(
+        "classical_excluded=1 classical_holdout=0" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.unit
+def test_classical_holdout_artist_is_swept():
+    session = _FakeSession(eligible=[("classicalA", False, True, True)])
+    catalog = _FakeCatalog({}, {})
+    counters, _ = _run(session, catalog)
+
+    assert catalog.artist_calls == [("classicalA", "album")]
+    assert counters["classical_excluded"] == 0
+    assert counters["classical_holdout"] == 1
+
+
+@pytest.mark.unit
+def test_allowlisted_classical_artist_is_swept(monkeypatch):
+    monkeypatch.setattr(ais.settings, "INGEST_CLASSICAL_ALLOWLIST", ["classicalA"])
+    session = _FakeSession(eligible=[("classicalA", False, True, False)])
+    catalog = _FakeCatalog({}, {})
+    counters, _ = _run(session, catalog)
+
+    assert catalog.artist_calls == [("classicalA", "album")]
+    assert counters["classical_excluded"] == 0
+    assert counters["classical_holdout"] == 0
+
+
+@pytest.mark.unit
+def test_disabled_classical_filter_sweeps_artist(monkeypatch):
+    monkeypatch.setattr(ais.settings, "INGEST_EXCLUDE_CLASSICAL", False)
+    session = _FakeSession(eligible=[("classicalA", False, True, False)])
+    catalog = _FakeCatalog({}, {})
+    counters, _ = _run(session, catalog)
+
+    assert catalog.artist_calls == [("classicalA", "album")]
+    assert counters["classical_excluded"] == 0
+    assert counters["classical_holdout"] == 0
+
+
+@pytest.mark.unit
+def test_eligible_artist_sql_classifies_decoys_and_deterministic_holdout():
+    sql = str(ais._SELECT_ELIGIBLE)
+
+    assert "g NOT IN ('클래식 록'" in sql
+    assert "g ~ '클래식|바로크|오페라" in sql
+    assert "hashtext(spotify_id)" in sql and ":holdout_mod" in sql
+    assert "ORDER BY spotify_id" in sql
+    assert ":pop_min" in sql
 
 
 @pytest.mark.unit
