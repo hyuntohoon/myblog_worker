@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session
 from worker.clients.lrclib_client import LrclibClient
 from worker.core.config import settings
 from worker.service.lyrics_eval_core import PRIMARY_ARTIST_NAMES_LATERAL, run_eval_batch
+from worker.service.lyrics_label_yield import sync_exclusions
 from worker.service.lyrics_matcher import (
     STATUS_AMBIGUOUS,
     STATUS_MATCHED,
@@ -109,8 +110,13 @@ class LyricsReassessmentService:
         any (defensively passed) resolved row from being overwritten.
         """
         limit = limit or settings.LYRICS_REASSESS_BATCH_LIMIT
+        # Recompute label-yield exclusions before selecting. This is what makes rule F
+        # self-correcting: a label that starts matching releases its own rows here, in
+        # the same pass that a newly-dead label claims its rows. It also repairs marks
+        # that the matcher's `ON CONFLICT ... evidence = EXCLUDED.evidence` overwrote.
+        exclusions = sync_exclusions(self.session)
         tracks = self._fetch_unresolved_tracks(limit)
-        return run_eval_batch(
+        metrics = run_eval_batch(
             self.session, tracks,
             concurrency=self.concurrency,
             time_budget_sec=self.time_budget_sec,
@@ -118,6 +124,8 @@ class LyricsReassessmentService:
             should_write=should_replace,
             log_prefix="Lyrics reassessment",
         )
+        metrics["exclusions"] = exclusions
+        return metrics
 
     def _fetch_unresolved_tracks(self, limit: int) -> List[Dict[str, Any]]:
         """Reassessment targets: unresolved rows + best-of-* matched rows (stalest first).
@@ -148,9 +156,10 @@ class LyricsReassessmentService:
                 JOIN artists a        ON a.id = ta.artist_id
                 LEFT JOIN LATERAL jsonb_array_elements_text(a.aliases) AS al(alias) ON true
 {PRIMARY_ARTIST_NAMES_LATERAL}
-                WHERE tl.match_status IN ('not_found', 'ambiguous', 'review_required')
-                   OR (tl.match_status = 'matched'
-                       AND tl.evidence ->> 'match_basis' LIKE 'best-of-%')
+                WHERE NOT (tl.evidence ? 'excluded_by')
+                  AND (tl.match_status IN ('not_found', 'ambiguous', 'review_required')
+                       OR (tl.match_status = 'matched'
+                           AND tl.evidence ->> 'match_basis' LIKE 'best-of-%'))
                 GROUP BY t.id, t.title, t.duration_sec,
                          tl.match_status, (tl.evidence ->> 'match_basis'), tl.updated_at,
                          primary_artists.artist_names

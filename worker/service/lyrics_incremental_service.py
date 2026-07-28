@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 from worker.clients.lrclib_client import LrclibClient
 from worker.core.config import settings
 from worker.service.lyrics_eval_core import PRIMARY_ARTIST_NAMES_LATERAL, run_eval_batch
+from worker.service.lyrics_label_yield import DEAD_LABELS_CTE, holdout_predicate
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,7 @@ class LyricsIncrementalService:
         rows = self.session.execute(
             text(
                 f"""
+                WITH {DEAD_LABELS_CTE}
                 SELECT t.id, t.title, t.duration_sec,
                        primary_artists.artist_names                     AS artist_names,
                        ARRAY_REMOVE(ARRAY_AGG(DISTINCT al.alias), NULL) AS aliases
@@ -109,8 +111,15 @@ class LyricsIncrementalService:
                 JOIN artists a        ON a.id = ta.artist_id
                 LEFT JOIN LATERAL jsonb_array_elements_text(a.aliases) AS al(alias) ON true
                 LEFT JOIN track_lyrics tl ON tl.track_id = t.id
+                LEFT JOIN albums alb      ON alb.id = t.album_id
 {PRIMARY_ARTIST_NAMES_LATERAL}
                 WHERE tl.track_id IS NULL
+                  -- Rule F at intake: a dead-source label never spends an LRCLIB call.
+                  -- 52% of the last 10 days' new rows came from these labels. The holdout
+                  -- arm still flows so the misclassification signal keeps accruing.
+                  AND (alb.label IS NULL
+                       OR alb.label NOT IN (SELECT label FROM dead_labels)
+                       OR {holdout_predicate('t.id')})
                 GROUP BY t.id, t.title, t.duration_sec, t.created_at,
                          primary_artists.artist_names
                 ORDER BY t.created_at DESC
