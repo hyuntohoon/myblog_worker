@@ -16,6 +16,8 @@ from __future__ import annotations
 import uuid
 from unittest.mock import MagicMock
 
+import pytest
+
 from worker.service.lyrics_matcher import (
     STATUS_MATCHED,
     Candidate,
@@ -25,6 +27,27 @@ from worker.service.lyrics_reassessment_service import (
     LyricsReassessmentService,
     should_replace,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_exclusion_sync(monkeypatch):
+    """Neutralise the label-yield exclusion sync for the guard tests.
+
+    `reassess()` recomputes exclusions before selecting, which costs two extra
+    `session.execute` calls. These tests assert the replacement guard writes the row
+    EXACTLY once, so counting total executes would either break or, worse, have to be
+    bumped to 3 — turning a meaningful assertion into a number nobody can read. The
+    exclusion rule has its own coverage; here it is noise.
+
+    Patched at the point of USE, not at its definition: `lyrics_reassessment_service`
+    imported the symbol, so rebinding it in `lyrics_label_yield` would leave this
+    module still holding the real function.
+    """
+    monkeypatch.setattr(
+        "worker.service.lyrics_reassessment_service.sync_exclusions",
+        lambda session: {"marked": 0, "unmarked": 0, "rule": "test-noop"},
+    )
+
 
 
 # --------------------------------------------------------------------------
