@@ -1,0 +1,88 @@
+# TEMPORARY — Neon test-branch schema sync (DO NOT MERGE).
+# Exists only on the chore/test-branch-migration-sync PR branch so the sync can
+# run where secrets.TEST_DB_URL already lives, without the credential ever
+# leaving CI. Two-push flow:
+#   push 1: APPLY=false — probe only (read-only, rolled back), prints the
+#           applied/MISSING classification per V-file.
+#   push 2: APPLY=true + EXPECTED_MISSING pinned to the reviewed push-1 result —
+#           re-probes, aborts on any drift from the pinned list, then applies
+#           the missing files in V order (each file's own BEGIN/COMMIT intact,
+#           ON_ERROR_STOP), re-probes to verify, and runs the backend
+#           integration suite report-only.
+# The PR is closed unmerged afterwards; this file never reaches main.
+name: Neon test-branch schema sync
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-db-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.head_ref == 'chore/test-branch-migration-sync'
+    runs-on: ubuntu-latest
+    env:
+      TEST_DB_URL: ${{ secrets.TEST_DB_URL }}
+      APPLY: "false"
+      EXPECTED_MISSING: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Clone shared_db (migration files)
+        env:
+          SHARED_DB_PAT: ${{ secrets.SHARED_DB_PAT }}
+        run: git clone --depth 1 "https://${SHARED_DB_PAT}@github.com/hyuntohoon/myblog_shared_db.git" /tmp/shared_db
+
+      - name: Install psycopg
+        run: pip install "psycopg[binary]"
+
+      - name: Probe applied vs missing (read-only, rolled back)
+        run: python .github/scripts/probe_migrations.py /tmp/shared_db/migrations | tee /tmp/probe.txt
+
+      - name: Apply missing migrations (APPLY=true only)
+        if: env.APPLY == 'true'
+        run: |
+          ACTUAL=$(grep '^MISSING_LIST=' /tmp/probe.txt | cut -d= -f2-)
+          if [ "$ACTUAL" != "$EXPECTED_MISSING" ]; then
+            echo "::error::probe result differs from the pinned EXPECTED_MISSING — refusing to apply"
+            echo "pinned: $EXPECTED_MISSING"
+            echo "actual: $ACTUAL"
+            exit 1
+          fi
+          URL=$(python -c "import os; print(os.environ['TEST_DB_URL'].replace('postgresql+psycopg', 'postgresql'))")
+          for f in $ACTUAL; do
+            echo "=== applying $f ==="
+            psql "$URL" -v ON_ERROR_STOP=1 -f "/tmp/shared_db/migrations/$f"
+          done
+
+      - name: Re-probe (verify nothing missing)
+        if: env.APPLY == 'true'
+        run: |
+          python .github/scripts/probe_migrations.py /tmp/shared_db/migrations | tee /tmp/probe2.txt
+          if ! grep -q '^MISSING_LIST=$' /tmp/probe2.txt; then
+            echo "::error::migrations still missing after apply"
+            exit 1
+          fi
+
+      - name: Backend integration suite (report-only)
+        if: env.APPLY == 'true'
+        continue-on-error: true
+        env:
+          SHARED_DB_PAT: ${{ secrets.SHARED_DB_PAT }}
+          DATABASE_URL: "postgresql+psycopg://x:x@localhost/x"
+        run: |
+          git config --global url."https://${SHARED_DB_PAT}@github.com/".insteadOf "https://github.com/"
+          git clone --depth 1 https://github.com/hyuntohoon/myblog_backend.git /tmp/backend
+          cd /tmp/backend
+          pip install -r requirements.txt -r requirements-test.txt
+          pytest tests/integration -m integration -v -rs || true
