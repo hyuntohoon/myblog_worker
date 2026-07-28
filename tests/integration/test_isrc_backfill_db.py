@@ -128,9 +128,14 @@ def test_isrc_backfill_fetches_tracks_without_isrc(session_factory):
 
         # Should get only track1 (track2 has ISRC already)
         track_ids = [t["id"] for t in tracks]
-        assert track1_id in [t["id"] for t in tracks], f"Expected {track1_id} in {tracks}"
+        assert track1_id in track_ids, f"Expected {track1_id} in {tracks}"
 
     finally:
+        # The direct _fetch call above autobegins a transaction on the session and
+        # nothing closes it (in the service, run() commits after the fetch); the
+        # cleanup's session.begin() would raise "A transaction is already begun on
+        # this Session" without this rollback.
+        session.rollback()
         # Cleanup
         with session.begin():
             session.execute(
@@ -181,18 +186,20 @@ def test_isrc_backfill_writes_isrc(mock_spotify, session_factory):
                 },
             )
 
-        # Mock Spotify response
-        mock_spotify.get_tracks.return_value = [
-            {
-                "id": track_spotify_id,
-                "name": "Test Track",
-                "external_ids": {"isrc": "USRC12345678"},
-            }
-        ]
-
-        # Run backfill (service commits per batch via the session — no outer begin)
+        # Exercise the WRITE path directly (the DB semantics under test: the CAST
+        # inside jsonb_build_object binds, the column takes the real ISRC, and the
+        # ext_refs mirror lands). Running the full backfill_isrc() here is wrong on a
+        # shared branch: its selection is ORDER BY spotify_id LIMIT n over the WHOLE
+        # branch, `test_track_*` sorts after every real Spotify id, so the seed never
+        # enters the batch — and the mocked Spotify answer would mark every real row
+        # in the batch as a miss (branch pollution). The fetch→batch loop plumbing is
+        # covered by the unit tests; mock_spotify stays patched purely so no real
+        # HTTP could ever fire from this module.
         svc = IsrcBackfillService(session)
-        metrics = svc.backfill_isrc(limit=100)
+        svc._update_isrc_batch(
+            matched=[{"track_id": track_id, "isrc": "USRC12345678"}], missed=[]
+        )
+        session.commit()
 
         # Verify ISRC was written to the column AND mirrored into ext_refs (so the
         # genre CLI, which reads ext_refs->>'isrc' as "already fetched", stops asking).
@@ -207,8 +214,6 @@ def test_isrc_backfill_writes_isrc(mock_spotify, session_factory):
             assert result[0] == "USRC12345678"
             assert result[1] == "USRC12345678"
             assert result[2] is None, "a matched row must carry no miss marker"
-
-        assert metrics["matched"] >= 1
 
     finally:
         # Cleanup
@@ -268,18 +273,14 @@ def test_isrc_backfill_writes_sentinel_on_miss(mock_spotify, session_factory):
                 },
             )
 
-        # Mock Spotify response with no ISRC
-        mock_spotify.get_tracks.return_value = [
-            {
-                "id": track_spotify_id,
-                "name": "Test Track",
-                "external_ids": {},  # No ISRC
-            }
-        ]
-
-        # Run backfill (service commits per batch via the session — no outer begin)
+        # Exercise the WRITE path directly — same rationale as
+        # test_isrc_backfill_writes_isrc: backfill_isrc()'s branch-wide LIMIT never
+        # reaches the seed and would sentinel-pollute real rows under the mock.
         svc = IsrcBackfillService(session)
-        metrics = svc.backfill_isrc(limit=100)
+        svc._update_isrc_batch(
+            matched=[], missed=[{"track_id": track_id, "status": "no_isrc"}]
+        )
+        session.commit()
 
         # Verify the marker went to ext_refs and the column stayed clean
         with session.begin():
@@ -294,11 +295,14 @@ def test_isrc_backfill_writes_sentinel_on_miss(mock_spotify, session_factory):
             assert result[1] == "no_isrc"
             assert result[2] is None, "miss must not occupy the real-ISRC ext_refs key"
 
-        assert metrics["sentinel_written"] >= 1
-
         # And the marked row drops out of the selection pool (no infinite re-fetch).
+        # Full-pool limit for the same paging reason as the fetch test; rollback the
+        # autobegun read txn so the finally-cleanup's begin() can run.
         svc2 = IsrcBackfillService(session)
-        assert track_id not in [t["id"] for t in svc2._fetch_tracks_without_isrc(limit=1000)]
+        assert track_id not in [
+            t["id"] for t in svc2._fetch_tracks_without_isrc(limit=1_000_000)
+        ]
+        session.rollback()
 
     finally:
         # Cleanup
