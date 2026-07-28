@@ -111,7 +111,12 @@ def sync_exclusions(session: Session) -> Dict[str, Any]:
             WITH {DEAD_LABELS_CTE}
             UPDATE track_lyrics tl
                SET evidence = COALESCE(tl.evidence, '{{}}'::jsonb) || jsonb_build_object(
-                       'excluded_by',    :rule,
+                       -- CAST is load-bearing: inside jsonb_build_object Postgres has no
+                       -- context to infer a bind parameter's type and fails the whole
+                       -- statement with "could not determine data type of parameter $1".
+                       -- Mock-based tests never reach a real planner, so this only
+                       -- surfaced on a live invoke.
+                       'excluded_by',    CAST(:rule AS text),
                        'excluded_at',    to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SSZ'),
                        'excluded_label', al.label
                    ),
