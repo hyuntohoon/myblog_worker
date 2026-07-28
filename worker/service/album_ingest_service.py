@@ -40,10 +40,24 @@ logger = logging.getLogger(__name__)
 
 # Watchlist flag rides along so the OQ5 widening + confirm path stay
 # watchlist-scoped even if the two floors ever diverge again.
+# The NOT IN list is a decoy exclusion: '클래식' is a substring of '클래식 록'
+# (classic rock), '클래식 소울', '클래식 컨트리', '바로크 팝', and
+# '클래식 크로스오버'. A bare substring rule would nuke AC/DC, Led Zeppelin,
+# the Rolling Stones, etc.; the exclusions therefore use exact JSONB element
+# matches only. This key reads ARTIST genres because tracks do not exist yet at
+# ingest time. hashtext supplies a deterministic 1-in-:holdout_mod holdout so
+# the misclassification rate stays measurable forever.
 _SELECT_ELIGIBLE = text(
     """
-    SELECT spotify_id, id AS artist_id, (popularity >= :watch_min) AS watch
-      FROM artists
+    SELECT spotify_id, id AS artist_id, (popularity >= :watch_min) AS watch,
+           EXISTS (
+             SELECT 1 FROM jsonb_array_elements_text(a.genres) g
+              WHERE g NOT IN ('클래식 록','클래식 소울','클래식 컨트리','바로크 팝','클래식 크로스오버')
+                AND ( g ~ '클래식|바로크|오페라|오케스트라|협주곡|체임버|인상주의|낭만주의'
+                      OR g IN ('발레','합창') )
+           ) AS classical,
+           (abs(hashtext(spotify_id)) % :holdout_mod) = 0 AS holdout
+      FROM artists a
      WHERE popularity >= :pop_min
      ORDER BY spotify_id
     """
@@ -110,6 +124,7 @@ def run_album_ingest(
     counters = {
         "eligible": 0, "swept": 0, "discovered": 0, "fresh": 0,
         "novel": 0, "passed_gate": 0, "enqueued": 0,
+        "classical_excluded": 0, "classical_holdout": 0,
         "confirm_candidates": 0, "confirm_flipped": 0, "confirm_inserted": 0,
         "confirm_gate_skipped": 0,
     }
@@ -132,10 +147,24 @@ def run_album_ingest(
             {
                 "pop_min": settings.ARTIST_POP_MIN,
                 "watch_min": settings.RELEASE_POLL_POP_MIN,
+                "holdout_mod": settings.INGEST_CLASSICAL_HOLDOUT_MOD,
             },
         ).fetchall()
 
-    eligible = [(r[0], r[1], bool(r[2])) for r in rows]
+    classical_allowlist = set(settings.INGEST_CLASSICAL_ALLOWLIST)
+    eligible = []
+    for spotify_id, artist_id, watch, classical, holdout in rows:
+        if (
+            settings.INGEST_EXCLUDE_CLASSICAL
+            and classical
+            and spotify_id not in classical_allowlist
+        ):
+            if holdout:
+                counters["classical_holdout"] += 1
+            else:
+                counters["classical_excluded"] += 1
+                continue
+        eligible.append((spotify_id, artist_id, bool(watch)))
     counters["eligible"] = len(eligible)
     if not eligible:
         logger.warning("album_ingest: no artists clear ARTIST_POP_MIN=%d", settings.ARTIST_POP_MIN)
@@ -232,7 +261,9 @@ def run_album_ingest(
         "confirm_candidates=%(confirm_candidates)d "
         "confirm_flipped=%(confirm_flipped)d "
         "confirm_inserted=%(confirm_inserted)d "
-        "confirm_gate_skipped=%(confirm_gate_skipped)d",
+        "confirm_gate_skipped=%(confirm_gate_skipped)d "
+        "classical_excluded=%(classical_excluded)d "
+        "classical_holdout=%(classical_holdout)d",
         counters,
     )
     return counters

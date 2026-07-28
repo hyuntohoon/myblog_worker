@@ -105,6 +105,11 @@ class Settings(BaseSettings):
     SWEEP_ARTISTS_PER_TICK: int = 30
     MAX_ENQUEUE_PER_TICK: int = 60
     MAX_CATALOG_ALBUMS: int = 5000
+    # RFC DATA-catalog-noise-and-lyrics-coverage Step 2. Reversible by flipping
+    # this flag; the ingest filter deletes nothing from the catalog.
+    INGEST_EXCLUDE_CLASSICAL: bool = True
+    INGEST_CLASSICAL_HOLDOUT_MOD: int = 20  # 1-in-20 keeps flowing → misclassification rate stays measured
+    INGEST_CLASSICAL_ALLOWLIST: list[str] = []  # owner-opted-in classical artists (spotify_ids)
     INGEST_SINCE: str = "2026-06-10"
 
     # Multi-source upcoming-release poller (FEAT-release-calendar Step 4).
