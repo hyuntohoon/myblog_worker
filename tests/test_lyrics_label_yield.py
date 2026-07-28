@@ -63,7 +63,12 @@ def test_sync_unmarks_before_marking_and_commits():
     assert session.execute.call_count == 2
     first, second = (c.args[0].text for c in session.execute.call_args_list)
     assert "- 'excluded_by'" in first, "un-mark must run first"
-    assert "'excluded_by',    :rule" in second, "mark must run second"
+    assert "'excluded_by'" in second and ":rule" in second, "mark must run second"
+    # Regression guard for a bug a mock cannot reach: without the cast, Postgres
+    # cannot infer the bind parameter's type inside jsonb_build_object and rejects
+    # the whole statement. It planned fine in EXPLAIN (which only covered the two
+    # SELECTs) and only failed on a live Lambda invoke.
+    assert "CAST(:rule AS text)" in second, "bind parameter must be explicitly typed"
     session.commit.assert_called_once()
     assert result == {"marked": 7, "unmarked": 7, "rule": RULE_VERSION}
 
