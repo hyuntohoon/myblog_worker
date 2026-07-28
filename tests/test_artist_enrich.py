@@ -17,17 +17,38 @@ class _Result:
         return self._rows
 
 
-class _RecordingConnection:
-    def __init__(self, select_rows=()):
-        self.select_rows = list(select_rows)
-        self.calls = []
+class _EnrichSession:
+    """Write-only session double for `enrich_artists` (one per chunk)."""
+
+    def __init__(self, factory):
+        self.factory = factory
+        self.closed = False
+        self.commits = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.closed = True
+        return False
 
     def execute(self, statement, params=None):
-        sql = str(statement)
-        self.calls.append((sql, params))
-        if "SELECT spotify_id FROM artists" in sql and "photo_url" in sql:
-            return _Result(self.select_rows)
+        self.factory.write_rows.append([dict(row) for row in params])
         return _Result([])
+
+    def commit(self):
+        self.commits += 1
+
+
+class _EnrichSessionFactory:
+    def __init__(self):
+        self.sessions = []
+        self.write_rows = []
+
+    def __call__(self):
+        session = _EnrichSession(self)
+        self.sessions.append(session)
+        return session
 
 
 def _artist_detail(sid: str, *, has_image: bool = True) -> dict:
@@ -42,50 +63,38 @@ def _artist_detail(sid: str, *, has_image: bool = True) -> dict:
 
 @pytest.mark.unit
 def test_enrich_artists_writes_empty_photo_sentinel(monkeypatch):
-    conn = _RecordingConnection()
+    factory = _EnrichSessionFactory()
     monkeypatch.setattr(
         artist_enrich.spotify,
         "get_artists_batch",
         lambda ids: [_artist_detail(ids[0], has_image=False)],
     )
 
-    written = artist_enrich.enrich_artists(conn, ["artist-1"])
+    written = artist_enrich.enrich_artists(factory, ["artist-1"])
 
     assert written == 1
-    _, rows = conn.calls[-1]
+    rows = factory.write_rows[-1]
     assert rows[0]["photo"] == ""
     assert rows[0]["photo"] is not None
+    # FIX-worker-txn-across-http: the write owns a fresh short session that is
+    # committed and closed — it is not the caller's open transaction.
+    assert [session.commits for session in factory.sessions] == [1]
+    assert all(session.closed for session in factory.sessions)
 
 
 @pytest.mark.unit
-def test_sync_enrich_select_excludes_empty_photo_sentinel(monkeypatch):
-    album = {
-        "id": "album-1",
-        "name": "Album",
-        "artists": [{"id": "artist-1", "name": "Artist"}],
-        "images": [],
-        "release_date": "2026-01-01",
-        "tracks": {"items": []},
-    }
-    conn = _RecordingConnection(select_rows=[("artist-1",)])
-    artist_calls = []
-    monkeypatch.setattr(sync_service.spotify, "get_albums", lambda ids, market: [album])
+def test_sync_enrich_select_excludes_empty_photo_sentinel():
+    """'' is the durable "Spotify has no image" sentinel — only NULL rows stay
+    eligible, so the enrich SELECT must filter on IS NULL, never on = ''.
 
-    def get_artists(ids):
-        artist_calls.append(ids)
-        return [_artist_detail(ids[0], has_image=False)]
+    Asserted against the statement itself; the end-to-end behaviour (a ''-photo
+    artist is not re-fetched) is covered on a real engine in
+    tests/test_sync_txn_boundary.py.
+    """
+    select_sql = str(sync_service._MISSING_PHOTO_SQL)
 
-    monkeypatch.setattr(artist_enrich.spotify, "get_artists_batch", get_artists)
-
-    sync_service.AlbumSyncService(conn).sync_albums_batch(["album-1"], "KR")
-
-    select_sql = next(
-        sql for sql, _ in conn.calls
-        if "SELECT spotify_id FROM artists" in sql and "photo_url" in sql
-    )
     assert "photo_url IS NULL" in select_sql
     assert "photo_url = ''" not in select_sql
-    assert artist_calls == [["artist-1"]]
 
 
 class _Session:

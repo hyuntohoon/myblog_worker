@@ -30,24 +30,54 @@ def db_engine():
 
 
 @pytest.fixture(scope="function")
-def db_session(db_engine):
-    """매 테스트마다 새 세션 + 끝나면 롤백."""
+def db_bound_connection(db_engine):
+    """테스트 1건이 공유하는 커넥션 + 바깥 트랜잭션 (끝나면 통째로 롤백)."""
     connection = db_engine.connect()
     transaction = connection.begin()
-    Session = sessionmaker(bind=connection, autoflush=False, autocommit=False, future=True)
+
+    yield connection
+
+    if transaction.is_active:
+        transaction.rollback()
+    connection.close()
+
+
+@pytest.fixture(scope="function")
+def db_session(db_bound_connection):
+    """매 테스트마다 새 세션 + 끝나면 롤백."""
+    Session = sessionmaker(
+        bind=db_bound_connection, autoflush=False, autocommit=False, future=True,
+        # The service under test commits its own short transactions now
+        # (FIX-worker-txn-across-http). Joining via SAVEPOINT keeps those commits
+        # nested inside the fixture's outer transaction, so teardown still rolls
+        # the whole test back instead of leaving rows on the Neon test branch.
+        join_transaction_mode="create_savepoint",
+    )
     session = Session()
 
     yield session
 
     session.close()
-    transaction.rollback()
-    connection.close()
 
 
 @pytest.fixture(scope="function")
 def db_connection(db_session):
-    """sync_service에서 쓰는 connection 객체."""
+    """읽기 검증용 connection 객체 (테스트가 직접 SELECT 할 때)."""
     return db_session.connection()
+
+
+@pytest.fixture(scope="function")
+def db_session_factory(db_bound_connection):
+    """`AlbumSyncService` 가 받는 session factory.
+
+    Binds to the SAME connection as `db_session`/`db_connection`, so a test can
+    run the service and then assert on the rows through `db_connection`, while
+    every write stays inside the outer transaction that teardown rolls back.
+    """
+    return sessionmaker(
+        bind=db_bound_connection, autoflush=False, autocommit=False, future=True,
+        join_transaction_mode="create_savepoint",
+    )
 
 
 @pytest.fixture
