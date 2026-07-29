@@ -11,6 +11,9 @@ What these pin, in order of how badly the codebase has been burned by each:
   * a weak match is recorded as `ambiguous` and its annotations are NOT written
   * a transient failure leaves the row UNWRITTEN so it retries; only a real miss
     parks it as `not_found`
+  * eligibility is research demand (`album_research`), never lyrics status — the
+    catalog-wide matched-lyrics backlog is retired, and an `album_id` nudge
+    scopes a pass to one album
 """
 from __future__ import annotations
 
@@ -26,7 +29,11 @@ from worker.clients.genius_client import (
     match_confidence,
     match_scores,
 )
-from worker.service.genius_fetch_service import GeniusFetchService
+from worker.service.genius_fetch_service import (
+    _SELECT_ALBUM_WORK,
+    _SELECT_WORK,
+    GeniusFetchService,
+)
 
 
 TRACK = {"track_id": "11111111-1111-1111-1111-111111111111",
@@ -45,7 +52,7 @@ class _Session:
     def execute(self, stmt, params=None):
         sql = str(stmt)
         if "SELECT" in sql and "track_genius_songs g" in sql:
-            self._log.append(("select", None))
+            self._log.append(("select", (params or {}).get("album_id")))
             r = MagicMock()
             r.fetchall.return_value = self._rows
             return r
@@ -266,6 +273,53 @@ def test_empty_pool_does_no_write_work():
     metrics = GeniusFetchService(factory, _client(song=_song())).run(limit=5)
     assert metrics["considered"] == 0
     assert [k for k, _ in log if k in ("song", "anno")] == []
+
+
+# ── eligibility: research demand, not lyrics status ─────────────────────────
+
+def test_eligibility_is_research_demand_not_lyrics_status():
+    """Research requests are the trigger; lyrics matching must never gate Genius.
+
+    The original pool was every track with matched lyrics (~11.7k) — a backlog no
+    consumer read. If `track_lyrics` reappears here, the catalog-wide backlog is
+    back and albums without lyrics silently lose their credits/relationships.
+    """
+    sql = str(_SELECT_WORK)
+    assert "album_research" in sql, "research demand is the eligibility"
+    assert "track_lyrics" not in sql, "lyrics status must not gate collection"
+
+
+def test_active_research_requests_sort_before_done_backfill():
+    """A queued/failed/running request is what the research poller is waiting on;
+    albums researched long ago are backfill and must not starve it."""
+    sql = str(_SELECT_WORK)
+    # The status priority must live in the final ORDER BY (the demand ordering),
+    # not in WHERE — a WHERE placement would silently drop the done-album
+    # backfill. sql.index("ORDER BY") alone matches the artists array_agg's
+    # ORDER BY first and is vacuously true; anchor on the LAST one.
+    tail = sql[sql.rindex("ORDER BY"):]
+    assert "'queued', 'running', 'failed'" in tail
+
+
+def test_album_scoped_run_passes_the_album_bind():
+    """The poller's SQS nudge carries album_id; the bind must reach the SQL.
+
+    (The IndeterminateDatatype lesson from isrc_backfill: a bind that never runs
+    through a real driver hides type errors — the DB integration test covers the
+    CAST; this pins that the parameter is passed at all.)
+    """
+    log = []
+    album_id = "33333333-3333-3333-3333-333333333333"
+    factory = _factory(log, [(TRACK["track_id"], "a", "al", ["ar"])])
+    GeniusFetchService(factory, _client(song=_song())).run(limit=5, album_id=album_id)
+    assert ("select", album_id) in log
+
+
+def test_album_scope_is_unconditional_on_research_rows():
+    """An expedite names its album explicitly; it must not also require demand rows."""
+    sql = str(_SELECT_ALBUM_WORK)
+    assert "album_research" not in sql
+    assert "CAST(:album_id AS uuid)" in sql
 
 
 def test_artist_score_takes_the_best_credit_not_the_most_popular():

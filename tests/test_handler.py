@@ -333,3 +333,31 @@ def test_sqs_album_expedite_routed_in_record_loop(mock_run):
     mock_run.assert_called_once_with(
         limit=None, album_id="62bc17c7-962d-4ebd-9fc6-f0f5488487b2", cooldown_sec=None
     )
+
+
+# ── FEAT-lyrics-annotations: genius_fetch routing (EventBridge + SQS nudge) ─────
+
+@pytest.mark.unit
+@patch("worker.handler._run_genius_fetch")
+def test_handler_eventbridge_genius_fetch_job(mock_run):
+    """{"job": "genius_fetch"} (hourly cron constant input) routes with defaults."""
+    result = lambda_handler({"job": "genius_fetch"}, None)
+    mock_run.assert_called_once_with(limit=None, album_id=None)
+    assert result == {}
+
+
+@pytest.mark.unit
+@patch("worker.handler._run_genius_fetch")
+def test_sqs_genius_nudge_routed_in_record_loop(mock_run):
+    """The research poller's readiness nudge arrives as an SQS Records message —
+    NOT as EventBridge constant input — so the record loop is its only route.
+    Before this branch existed the nudge hit "Unknown message format" and was
+    ACKed away silently, making the whole R2 gate fall back to the hourly cron."""
+    event = {"Records": [{"body": json.dumps(
+        {"job": "genius_fetch", "album_id": "62bc17c7-962d-4ebd-9fc6-f0f5488487b2"}
+    )}]}
+    results = lambda_handler(event, None)
+    assert results == {"batchItemFailures": []}
+    mock_run.assert_called_once_with(
+        limit=None, album_id="62bc17c7-962d-4ebd-9fc6-f0f5488487b2"
+    )
