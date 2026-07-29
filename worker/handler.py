@@ -185,7 +185,7 @@ def _process_batch(album_ids: List[str], market: str) -> None:
     logger.info("Batch synced to DB: %d albums", len(album_ids))
 
 
-def _run_genius_fetch(limit: int | None = None) -> None:
+def _run_genius_fetch(limit: int | None = None, album_id: str | None = None) -> None:
     """Bounded Genius annotation fetch (FEAT-lyrics-annotations Thread 1).
 
     Passes ``SessionLocal`` itself, not a session: the service opens the read,
@@ -194,13 +194,14 @@ def _run_genius_fetch(limit: int | None = None) -> None:
     idle-in-transaction across ~3 API round trips per track — the failure this
     codebase has already hit (ProtocolViolation).
 
-    ``limit`` defaults to ``settings.GENIUS_FETCH_BATCH_LIMIT``. Unset token ⇒
-    the service no-ops and says so; it is never a boot failure.
+    ``limit`` defaults to ``settings.GENIUS_FETCH_BATCH_LIMIT``. With ``album_id``
+    the pass is scoped to one album — the research poller's readiness nudge.
+    Unset token ⇒ the service no-ops and says so; it is never a boot failure.
     """
     from worker.clients.genius_client import genius
     from worker.service.genius_fetch_service import run_genius_fetch
 
-    metrics = run_genius_fetch(SessionLocal, genius, limit=limit)
+    metrics = run_genius_fetch(SessionLocal, genius, limit=limit, album_id=album_id)
     # WARNING, not INFO — prod Lambdas run LOG_LEVEL=WARNING, so an INFO line never
     # reaches CloudWatch and a scheduled run would be unobservable.
     logger.warning("Genius fetch metrics: %s", metrics)
@@ -329,14 +330,20 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return {}
 
     # EventBridge/SQS trigger — Genius annotation fetch (FEAT-lyrics-annotations).
-    # Bounded: tracks with matched lyrics and no Genius row yet. Writes the songs
+    # Bounded: tracks of research-requested albums with no Genius row yet
+    # (lyrics status is deliberately not a condition). "album_id" scopes the pass
+    # to one album — the research poller's readiness nudge. Writes the songs
     # row and its annotations in ONE transaction — the read path gates the
     # annotation query on the parent row, so the reverse order would make the
     # annotations invisible rather than merely late.
     if event.get("job") == "genius_fetch":
         limit = event.get("limit")  # None ⇒ settings.GENIUS_FETCH_BATCH_LIMIT
-        logger.info("EventBridge/SQS trigger: running Genius fetch (limit=%s)", limit)
-        _run_genius_fetch(limit=limit)
+        album_id = event.get("album_id")
+        logger.info(
+            "EventBridge/SQS trigger: running Genius fetch (limit=%s, album_id=%s)",
+            limit, album_id,
+        )
+        _run_genius_fetch(limit=limit, album_id=album_id)
         return {}
 
     # EventBridge/SQS trigger — one-shot backlog + weekly artist-photo sweep.
@@ -470,6 +477,14 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     album_id=body.get("album_id"),
                     cooldown_sec=body.get("cooldown_sec"),
                 )
+                continue
+
+            # Genius fetch via SQS — the research poller's readiness nudge sends
+            # {"job":"genius_fetch","album_id":...} here, NOT through EventBridge,
+            # so this Records-loop branch is the nudge's only route. Without it the
+            # message hits "Unknown message format" and is ACKed away silently.
+            if body.get("job") == "genius_fetch":
+                _run_genius_fetch(limit=body.get("limit"), album_id=body.get("album_id"))
                 continue
 
             market = body.get("market", settings.SPOTIFY_DEFAULT_MARKET)

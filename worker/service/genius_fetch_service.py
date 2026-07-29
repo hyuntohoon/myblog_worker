@@ -27,10 +27,13 @@ Annotations written without a parent row are therefore invisible — not wrong, 
 logged, simply never read. Both writes share one transaction here so the order
 cannot be observed broken.
 
-**Scope.** Tracks that have matched lyrics and no Genius row yet, oldest first. The
-store is deliberately independent of lyrics (2 of 15 LUX tracks carry annotations
-and no synced lyrics), so this scope is a *bounded starting pool*, not a statement
-about the schema — widening it is a query change and nothing else.
+**Scope.** Tracks of albums the owner has requested research for (`album_research`
+rows), no Genius row yet, albums with an *active* request first. Research demand is
+the trigger; lyrics status is deliberately NOT a condition — credits, contributors
+and sample relationships are useful without lyrics (2 of 15 LUX tracks carry
+annotations and no synced lyrics). The earlier catalog-wide pool (every track with
+matched lyrics, ~11.7k) is retired: it was a backlog no consumer read, and the
+research prompt is the consumer this store exists for.
 
 Korean tracks are not filtered out. Genius prose coverage for Korean measured 1/8
 descriptions and 0/8 annotation sets, so they mostly resolve to a matched row with
@@ -67,23 +70,51 @@ MATCH_NOT_FOUND = "not_found"
 _SELECT_WORK = text("""
     SELECT t.id, t.title, COALESCE(a.title, '') AS album,
            COALESCE((
-             SELECT array_agg(ar.name ORDER BY ar.popularity DESC NULLS LAST, ar.name)
+             SELECT array_agg(art.name ORDER BY art.popularity DESC NULLS LAST, art.name)
                FROM track_artists ta
-               JOIN artists ar ON ar.id = ta.artist_id
+               JOIN artists art ON art.id = ta.artist_id
               WHERE ta.track_id = t.id
            ), ARRAY[]::text[]) AS artists
       FROM tracks t
-      JOIN track_lyrics tl ON tl.track_id = t.id
       LEFT JOIN albums a ON a.id = t.album_id
       LEFT JOIN track_genius_songs g ON g.track_id = t.id
-     WHERE tl.match_status = 'matched'
-       AND g.track_id IS NULL
-     -- Bucketed albums first. The lyrics sheet opens from a bucket's album modal,
-     -- so those are the tracks that actually get read: 635 of the 11,747 eligible.
-     -- Oldest-first would spend a month of runs before touching one of them.
+     WHERE g.track_id IS NULL
+       -- Research demand IS the eligibility. Deliberately no lyrics-table
+       -- condition: credits and sample relationships are useful without lyrics,
+       -- so lyrics matching must never gate collection.
+       AND EXISTS (
+         SELECT 1 FROM album_research ar WHERE ar.album_id = t.album_id
+       )
+     -- Albums with an ACTIVE request first: the research poller is waiting on
+     -- those. Done albums (historical requests) backfill behind them. Grouped by
+     -- album so whole albums reach readiness together instead of interleaving.
      ORDER BY EXISTS (
-       SELECT 1 FROM review_bucket_items bi WHERE bi.album_id = t.album_id
-     ) DESC, t.id
+       SELECT 1 FROM album_research ar
+        WHERE ar.album_id = t.album_id
+          AND ar.status IN ('queued', 'running', 'failed')
+     ) DESC, t.album_id, t.id
+     LIMIT :limit
+""")
+
+# Album-scoped expedite: the research poller nudges this via SQS
+# {"job": "genius_fetch", "album_id": ...} when a claimable research row is
+# waiting on Genius readiness, so collection starts in seconds rather than at
+# the next hourly cron. Same not-yet-fetched predicate — a redelivered or
+# duplicate nudge selects only what is still missing, so it is idempotent.
+_SELECT_ALBUM_WORK = text("""
+    SELECT t.id, t.title, COALESCE(a.title, '') AS album,
+           COALESCE((
+             SELECT array_agg(art.name ORDER BY art.popularity DESC NULLS LAST, art.name)
+               FROM track_artists ta
+               JOIN artists art ON art.id = ta.artist_id
+              WHERE ta.track_id = t.id
+           ), ARRAY[]::text[]) AS artists
+      FROM tracks t
+      LEFT JOIN albums a ON a.id = t.album_id
+      LEFT JOIN track_genius_songs g ON g.track_id = t.id
+     WHERE g.track_id IS NULL
+       AND t.album_id = CAST(:album_id AS uuid)
+     ORDER BY t.id
      LIMIT :limit
 """)
 
@@ -149,11 +180,16 @@ class GeniusFetchService:
 
     # ── work list ───────────────────────────────────────────────────────────
 
-    def _claim_work(self, limit: int) -> List[Dict[str, Any]]:
+    def _claim_work(self, limit: int, album_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Read the pool and CLOSE before the first Genius call. See rule 1."""
         session: Session = self._session_factory()
         try:
-            rows = session.execute(_SELECT_WORK, {"limit": limit}).fetchall()
+            if album_id:
+                rows = session.execute(
+                    _SELECT_ALBUM_WORK, {"limit": limit, "album_id": album_id}
+                ).fetchall()
+            else:
+                rows = session.execute(_SELECT_WORK, {"limit": limit}).fetchall()
             return [
                 {"track_id": str(r[0]), "title": r[1] or "", "album": r[2],
                  "artists": list(r[3] or [])}
@@ -223,8 +259,13 @@ class GeniusFetchService:
 
     # ── the job ─────────────────────────────────────────────────────────────
 
-    def run(self, limit: Optional[int] = None) -> Dict[str, Any]:
-        """Bounded pass. Returns metrics; never raises for a single bad track."""
+    def run(self, limit: Optional[int] = None, album_id: Optional[str] = None) -> Dict[str, Any]:
+        """Bounded pass. Returns metrics; never raises for a single bad track.
+
+        With ``album_id`` the pass is scoped to that album (research-poller
+        nudge); otherwise it drains the research-demand pool, active requests
+        first.
+        """
         metrics = {
             "considered": 0, "matched": 0, "ambiguous": 0,
             "not_found": 0, "annotations": 0, "errors": 0,
@@ -239,7 +280,7 @@ class GeniusFetchService:
         if limit <= 0:
             logger.warning("genius_fetch: limit=%s — nothing to do", limit)
             return metrics
-        work = self._claim_work(limit)          # session closed before any HTTP
+        work = self._claim_work(limit, album_id)  # session closed before any HTTP
         metrics["considered"] = len(work)
         if not work:
             return metrics
@@ -300,5 +341,11 @@ class GeniusFetchService:
         return song, MATCH_MATCHED, annotations
 
 
-def run_genius_fetch(session_factory, client: GeniusClient, *, limit: Optional[int] = None) -> Dict[str, Any]:
-    return GeniusFetchService(session_factory, client).run(limit=limit)
+def run_genius_fetch(
+    session_factory,
+    client: GeniusClient,
+    *,
+    limit: Optional[int] = None,
+    album_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    return GeniusFetchService(session_factory, client).run(limit=limit, album_id=album_id)
