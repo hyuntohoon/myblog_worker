@@ -183,8 +183,14 @@ def test_unresolved_still_unresolved_is_refreshed():
     assert session.execute.call_count == 1       # refreshed (updated_at bumps -> queue rotates)
 
 
+def _sole_statement(session):
+    """The one SQL statement a guard-kept row produces (its rotation touch)."""
+    assert session.execute.call_count == 1
+    return " ".join(str(session.execute.call_args[0][0]).split())
+
+
 def test_matched_row_is_protected_by_guard():
-    # Defensive: even if a matched row were selected, the guard must keep it (not written).
+    # Defensive: even if a matched row were selected, the guard must keep its CONTENT.
     client = _FakeClient(result=[_matching_candidate()])
     row = {"id": uuid.uuid4(), "title": "Hello", "duration_sec": 295,
            "artist_names": ["Adele"], "aliases": [],
@@ -193,7 +199,10 @@ def test_matched_row_is_protected_by_guard():
     metrics = svc.reassess()
     assert metrics["guard_kept"] == 1
     assert metrics["evaluated"] == 0
-    session.execute.assert_not_called()          # good match untouched
+    # The row is re-checked, so its rotation cursor advances — but nothing else may move.
+    assert _sole_statement(session) == (
+        "UPDATE track_lyrics SET updated_at = NOW() WHERE track_id = :track_id"
+    )
 
 
 def test_best_of_row_superseded_by_fresh_exact_title():
@@ -222,7 +231,57 @@ def test_best_of_row_not_downgraded_when_recheck_fails():
     metrics = svc.reassess()
     assert metrics["guard_kept"] == 1
     assert metrics["evaluated"] == 0
-    session.execute.assert_not_called()
+    assert metrics["bestof_superseded"] == 0
+    assert "UPDATE track_lyrics SET updated_at" in _sole_statement(session)
+
+
+def test_unsupersedable_best_of_row_still_rotates():
+    """The failure mode Step 3b's queue inversion would otherwise create.
+
+    A best-of row whose re-check reproduces the same best-of basis is refused by the
+    guard (a lateral swap) and therefore never rewritten. With best-of rows now ordered
+    AHEAD of the unresolved pool and sorted stalest-first, a row whose `updated_at` never
+    moves would be re-selected on every single run for the rest of time — the ~16% that
+    cannot be superseded would permanently own all 150 slots and unresolved recovery
+    would stop dead. The touch is what prevents that, so it is asserted on its own.
+    """
+    client = _FakeClient(result=[_matching_candidate()])
+    row = {"id": uuid.uuid4(), "title": "Hello", "duration_sec": 295,
+           "artist_names": ["Adele"], "aliases": [],
+           "existing_status": "matched", "existing_basis": "best-of-ambiguous"}
+    svc, session = _service(client, [row])
+    # decide_match returns exact-title here, so force the lateral-swap case explicitly.
+    import worker.service.lyrics_eval_core as core
+    original = core.decide_match
+    try:
+        core.decide_match = lambda **kw: MatchOutcome(
+            track_id=kw["track_id"], match_status=STATUS_MATCHED,
+            match_basis="best-of-ambiguous", version_agrees=True,
+            evidence={"promotion": {"from_status": "ambiguous"}},
+            lyric_plain="x", lyric_synced=None, matcher_version="test",
+        )
+        metrics = svc.reassess()
+    finally:
+        core.decide_match = original
+    assert metrics["guard_kept"] == 1          # lateral best-of -> best-of refused
+    assert metrics["evaluated"] == 0           # content untouched
+    assert "UPDATE track_lyrics SET updated_at" in _sole_statement(session)
+
+
+def test_best_of_supersession_is_counted():
+    """`bestof_superseded` is how prod reports whether the Step 3b flip is working —
+    LOG_LEVEL=WARNING hides the per-run info log, so the metric is the only signal."""
+    client = _FakeClient(result=[_matching_candidate()])
+    row = {"id": uuid.uuid4(), "title": "Hello", "duration_sec": 295,
+           "artist_names": ["Adele"], "aliases": [],
+           "existing_status": "matched", "existing_basis": "best-of-ambiguous"}
+    svc, _ = _service(client, [row])
+    metrics = svc.reassess()
+    assert metrics["bestof_superseded"] == 1
+
+    # An ordinary unresolved promotion is NOT a supersession.
+    svc2, _ = _service(_FakeClient(result=[_matching_candidate()]), [_unresolved_row("not_found")])
+    assert svc2.reassess()["bestof_superseded"] == 0
 
 
 # --------------------------------------------------------------------------
@@ -256,7 +315,7 @@ class TestReassessAlbum:
         svc, session = _album_service(client, [row])
         metrics = svc.reassess_album("album-1")
         assert metrics["guard_kept"] == 1
-        session.execute.assert_not_called()
+        assert "UPDATE track_lyrics SET updated_at" in _sole_statement(session)
 
     def test_does_not_run_pool_wide_exclusion_sync(self, monkeypatch):
         """`reassess` recomputes exclusions before selecting; the expedite must not. It is a
@@ -312,18 +371,51 @@ class TestAlbumSelectionSQL:
         assert "tl.evidence ->> 'match_basis' LIKE 'best-of-%'" in sql
 
 
-def test_selection_sql_reselects_best_of_with_unresolved_priority():
-    """The selection is otherwise DB-only (stubbed in the tests above); assert the SQL
-    carries the two Step-2 arms: the best-of re-select and the unresolved-first ORDER BY.
-    (A live-DB integration needs TEST_DB_URL — CI-only.)"""
-    session = MagicMock()
-    session.execute.return_value.fetchall.return_value = []
-    svc = LyricsReassessmentService(session, client=_FakeClient())
-    svc._fetch_unresolved_tracks(10)
-    sql = str(session.execute.call_args[0][0])
-    # best-of matched rows are back in the pool…
-    assert "tl.evidence ->> 'match_basis' LIKE 'best-of-%'" in sql
-    assert "tl.match_status = 'matched'" in sql
-    # …but unresolved rows keep rotation priority (CASE tier before updated_at)
-    assert "CASE WHEN tl.match_status IN ('not_found', 'ambiguous', 'review_required')" in sql
-    assert sql.index("CASE WHEN") < sql.index("tl.updated_at ASC")
+class TestScheduledSelectionSQL:
+    """DATA-catalog-noise Step 3b — the scheduled queue drains the best-of backlog first.
+
+    The selection is DB-only (stubbed everywhere else in this file), so these assert the
+    SQL text. A live-DB integration needs TEST_DB_URL — CI-only.
+    """
+
+    def _sql_and_params(self, limit=10):
+        session = MagicMock()
+        session.execute.return_value.fetchall.return_value = []
+        svc = LyricsReassessmentService(session, client=_FakeClient())
+        svc._fetch_unresolved_tracks(limit)
+        return str(session.execute.call_args[0][0]), session.execute.call_args[0][1]
+
+    def test_best_of_rows_are_still_reselected(self):
+        """Step 2's widened pool: without this arm a best-of row leaves the corpus forever
+        and the promised supersession can never happen."""
+        sql, _ = self._sql_and_params()
+        assert "tl.evidence ->> 'match_basis' LIKE 'best-of-%'" in sql
+        assert "tl.match_status = 'matched'" in sql
+
+    def test_best_of_backlog_is_ordered_AHEAD_of_unresolved(self):
+        """The Step 3b inversion, and the whole reason this arm executes at all.
+
+        Measured 2026-08-03: 11,033 unresolved rows sat ahead of 2,765 best-of rows under
+        a LIMIT of 150, so the supersession path was unreachable, not merely slow. If this
+        assertion flips back, the arm is dead code in prod again — silently, because a
+        dead arm still passes every other test in this file.
+        """
+        sql, _ = self._sql_and_params()
+        assert "CASE WHEN tl.match_status = 'matched' THEN 0 ELSE 1 END" in sql
+        assert sql.index("CASE WHEN") < sql.index("tl.updated_at ASC")
+
+    def test_best_of_arm_rests_between_re_checks(self):
+        """What makes the inversion terminate. ~16% of best-of rows cannot be superseded
+        (the guard refuses a lateral swap), so they are re-checked and never rewritten;
+        the rest interval is what stops them owning the queue head forever."""
+        sql, params = self._sql_and_params()
+        assert "make_interval(days => :bestof_rest_days)" in sql
+        assert params["bestof_rest_days"] == settings.LYRICS_BESTOF_RECHECK_INTERVAL_DAYS
+
+    def test_rest_interval_applies_only_to_the_best_of_arm(self):
+        """An unresolved row must never be gated by the best-of rest interval — that would
+        cut the pool's own rotation from daily to monthly."""
+        sql, _ = self._sql_and_params()
+        best_of_arm = sql[sql.index("tl.match_status = 'matched'"):sql.index("GROUP BY")]
+        assert "make_interval(days => :bestof_rest_days)" in best_of_arm
+        assert sql.count("make_interval(days => :bestof_rest_days)") == 1
