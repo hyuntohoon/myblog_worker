@@ -170,6 +170,16 @@ class Settings(BaseSettings):
     LYRICS_REASSESS_CONCURRENCY: int = 20
     LYRICS_REASSESS_TIME_BUDGET_SEC: float = 90.0
 
+    # How long a best-of-* matched row rests between supersession re-checks
+    # (DATA-catalog-noise Step 3b). The reassessment queue puts the best-of backlog AHEAD of
+    # the unresolved pool, which only terminates because a re-checked row goes quiet for this
+    # long: ~16% of best-of rows cannot be superseded (a re-check reproduces the same best-of
+    # basis, and the replacement guard refuses a lateral swap), so without a rest interval
+    # they would sit at the head of a stalest-first queue forever and the job would never
+    # return to unresolved recovery. 30 days also paces the genuine second chance — LRCLIB
+    # coverage is what changes, and it changes slowly.
+    LYRICS_BESTOF_RECHECK_INTERVAL_DAYS: int = 30
+
     # Album-scoped expedite (DATA-catalog-noise Step 4): re-check ONE album out of turn, fired
     # by an SQS message carrying "album_id". The cooldown is the idempotency bound — SQS is
     # at-least-once and the writer bumps updated_at, so without it a redelivered message would

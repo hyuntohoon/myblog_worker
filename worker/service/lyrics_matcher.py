@@ -572,6 +572,32 @@ class TrackLyricsWriter:
     def __init__(self, session: Session):
         self.session = session
 
+    def touch(self, track_id) -> bool:
+        """Bump ``updated_at`` on a row that was re-checked but deliberately NOT rewritten.
+
+        ``updated_at`` is this pipeline's rotation cursor, not a content-change timestamp:
+        every selection orders by it so the queue advances across the pool. A row the
+        replacement guard protects is re-checked (we spent the LRCLIB call) but never
+        written, so its cursor would never move — and under a stalest-first ORDER BY it
+        would be re-selected every single run, forever, crowding out everything behind it.
+        That is latent today only because the best-of arm is unreachable; DATA-catalog-noise
+        Step 3b puts that arm at the head of the queue, which makes the touch load-bearing.
+
+        Content is untouched — this writes no status, evidence, or lyric — so a protected
+        good match stays exactly as it was.
+        """
+        try:
+            self.session.execute(
+                text("UPDATE track_lyrics SET updated_at = NOW() WHERE track_id = :track_id"),
+                {"track_id": track_id},
+            )
+            self.session.commit()
+            return True
+        except Exception as exc:  # noqa: BLE001 - isolation: matches write_outcomes
+            logger.error("Failed to touch track %s: %s", track_id, exc)
+            self.session.rollback()
+            return False
+
     def write_outcomes(self, outcomes: List[MatchOutcome], batch_size: int = 100) -> int:
         written = 0
         failed = 0

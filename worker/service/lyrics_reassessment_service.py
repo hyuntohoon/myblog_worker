@@ -3,8 +3,8 @@
 
 LRCLIB coverage grows over time, so tracks that parked as ``not_found`` / ``ambiguous`` /
 ``review_required`` earlier may become matchable later. This periodic EventBridge job
-re-checks the **unresolved pool** (stalest first) with the same canonical ``decide_match``,
-and:
+re-checks the **unresolved pool** (stalest first, behind the best-of supersession backlog —
+DATA-catalog-noise Step 3b) with the same canonical ``decide_match``, and:
 
   * **promotes** an unresolved track to ``matched`` / ``no_lyrics`` when the evidence now
     supports it,
@@ -102,12 +102,14 @@ class LyricsReassessmentService:
         )
 
     def reassess(self, limit: Optional[int] = None) -> Dict[str, Any]:
-        """Re-check up to ``limit`` unresolved tracks (stalest first). Returns per-status metrics.
+        """Re-check up to ``limit`` rows — best-of backlog first, then unresolved (stalest first).
 
-        In this all-unresolved pool the metrics read directly as the reassessment story:
-        ``matched`` / ``no_lyrics`` counts are *promotions*; ``not_found`` / ``ambiguous`` /
-        ``review_required`` are *refreshed* rows that stayed parked; ``guard_kept`` protects
-        any (defensively passed) resolved row from being overwritten.
+        Reading the metrics: ``matched`` / ``no_lyrics`` are rows that left the unresolved
+        pool (*promotions*); ``not_found`` / ``ambiguous`` / ``review_required`` are
+        *refreshed* rows that stayed parked. Since Step 3b the batch also carries best-of
+        rows, for which the story is different — ``bestof_superseded`` counts the ones
+        upgraded to a stronger basis, and ``guard_kept`` counts the ones whose content the
+        replacement guard protected (those are re-checked and rotated, never overwritten).
         """
         limit = limit or settings.LYRICS_REASSESS_BATCH_LIMIT
         # Recompute label-yield exclusions before selecting. This is what makes rule F
@@ -122,6 +124,7 @@ class LyricsReassessmentService:
             time_budget_sec=self.time_budget_sec,
             client=self._client,
             should_write=should_replace,
+            touch_on_guard_kept=True,
             log_prefix="Lyrics reassessment",
         )
         metrics["exclusions"] = exclusions
@@ -170,6 +173,7 @@ class LyricsReassessmentService:
             time_budget_sec=self.time_budget_sec,
             client=self._client,
             should_write=should_replace,
+            touch_on_guard_kept=True,
             log_prefix=f"Lyrics expedite (album {album_id})",
         )
         metrics["album_id"] = str(album_id)
@@ -183,8 +187,15 @@ class LyricsReassessmentService:
         Deliberately a near-copy of ``_fetch_unresolved_tracks``: same status arms, same
         projection, same shared LATERAL — so the expedite evaluates exactly what the scheduled
         pass would, and the two cannot drift into disagreeing about what "unresolved" means.
-        The two differences are the point of the method: the album filter, and the **absence**
+        Two differences are the point of the method: the album filter, and the **absence**
         of the ``NOT (tl.evidence ? 'excluded_by')`` guard.
+
+        Two further differences are scoping artefacts, not policy, and must stay that way:
+        this path keeps unresolved rows FIRST (the scheduled pass inverts that to drain the
+        best-of backlog — DATA-catalog-noise Step 3b), and it applies no best-of rest
+        interval. Both are queue-fairness devices for a five-figure pool; an album holds a
+        few dozen tracks and ``limit`` covers all of them, so ordering decides nothing here
+        and a rest interval would only refuse work a human explicitly asked for.
 
         ``make_interval(secs => :cooldown_sec)`` rather than ``:cooldown_sec * INTERVAL '1 s'``:
         the function signature pins the bind parameter to ``double precision``, where the
@@ -236,19 +247,46 @@ class LyricsReassessmentService:
         ]
 
     def _fetch_unresolved_tracks(self, limit: int) -> List[Dict[str, Any]]:
-        """Reassessment targets: unresolved rows + best-of-* matched rows (stalest first).
+        """Reassessment targets: best-of-* matched rows first, then the unresolved pool.
 
         FEAT-lyrics-best-of-promotion Step 2 widens the selection: a ``best-of-*``
         ``matched`` row must stay a reassessment target so a later ``exact-title`` match
         can supersede it via the replacement guard — without this arm a promoted row
         would leave the pool forever and the promised supersession could never occur.
 
-        Unresolved rows keep rotation priority over best-of re-checks: a best-of row
-        already carries a usable lyric, so ``not_found`` recovery (the scarcer win) runs
-        first. Within each tier ``ORDER BY tl.updated_at ASC`` re-checks the longest-parked
-        rows first; because a rewrite bumps ``updated_at`` (the writer's
+        **That arm had never executed.** It sat behind the unresolved pool, and a
+        stalest-first ``ORDER BY`` with ``LIMIT 150`` reaches it only when fewer than 150
+        unresolved rows exist. Measured against prod 2026-08-03: 11,033 unresolved rows
+        ahead of 2,765 best-of rows, with ~57 new unresolved rows arriving per day. The
+        pool never empties, so the promise was structurally unreachable rather than merely
+        rare.
+
+        DATA-catalog-noise Step 3b therefore **inverts the priority**. The justification is
+        measured yield per re-check, live against LRCLIB on 2026-08-03: **83.6% of best-of
+        rows (112/134 sampled) now resolve to a strictly stronger ``exact-title`` match**,
+        against **~5.5%** for the unresolved pool. A best-of slot is worth ~15 unresolved
+        slots, so the backlog is drained first. (The RFC's own proposal for this method — a
+        recency-tiered re-order of the unresolved pool — was measured and dropped: yield is
+        flat across release-recency tiers, 10.95 / 10.77 / 8.70%. See the RFC's Step 3b.)
+
+        **Why this terminates.** A superseded row leaves the ``best-of-%`` arm by changing
+        its own basis, so the backlog is self-consuming: ~2,765 rows at 150/run ≈ 19 runs.
+        The ~16% that cannot be superseded are the hazard — the guard refuses a lateral
+        best-of→best-of swap, so they are re-checked but never rewritten. Two things stop
+        them pinning the queue head forever: ``TrackLyricsWriter.touch`` advances their
+        rotation cursor even when the guard keeps the row, and the interval below then
+        rests them for 30 days. Once the backlog clears, this arm goes quiet on its own and
+        the budget returns to unresolved recovery, no human action and no follow-up PR.
+
+        Within each arm ``ORDER BY tl.updated_at ASC`` re-checks the longest-parked rows
+        first; because a rewrite bumps ``updated_at`` (the writer's
         ``ON CONFLICT ... updated_at = NOW()``), reassessment rotates fairly across the
         whole pool over successive runs.
+
+        ``make_interval(days => :n)`` rather than ``:n * INTERVAL '1 day'``: the function
+        signature pins the bind parameter's type, where the multiplication form leaves
+        Postgres to infer a bare parameter and fail with "could not determine data type"
+        (the worker #84 → #85 failure, verbatim).
         """
         rows = self.session.execute(
             text(
@@ -267,18 +305,19 @@ class LyricsReassessmentService:
                 WHERE NOT (tl.evidence ? 'excluded_by')
                   AND (tl.match_status IN ('not_found', 'ambiguous', 'review_required')
                        OR (tl.match_status = 'matched'
-                           AND tl.evidence ->> 'match_basis' LIKE 'best-of-%'))
+                           AND tl.evidence ->> 'match_basis' LIKE 'best-of-%'
+                           AND tl.updated_at
+                               < NOW() - make_interval(days => :bestof_rest_days)))
                 GROUP BY t.id, t.title, t.duration_sec,
                          tl.match_status, (tl.evidence ->> 'match_basis'), tl.updated_at,
                          primary_artists.artist_names
                 ORDER BY
-                    CASE WHEN tl.match_status IN ('not_found', 'ambiguous', 'review_required')
-                         THEN 0 ELSE 1 END,
+                    CASE WHEN tl.match_status = 'matched' THEN 0 ELSE 1 END,
                     tl.updated_at ASC
                 LIMIT :limit
                 """
             ),
-            {"limit": limit},
+            {"limit": limit, "bestof_rest_days": settings.LYRICS_BESTOF_RECHECK_INTERVAL_DAYS},
         ).fetchall()
         return [
             {

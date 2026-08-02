@@ -142,6 +142,11 @@ def new_metrics() -> Dict[str, Any]:
         "promotion_criteria": {  # per-criterion breakdown of promotions
             "exact-base-title": 0,
         },
+        # A best-of-* row upgraded to a strictly stronger basis this run — the supersession
+        # FEAT-lyrics-best-of-promotion promised and DATA-catalog-noise Step 3b made
+        # reachable. Distinct from `promoted_*` (which count rows lifted OUT of the parked
+        # pool INTO a best-of basis); this counts rows leaving that basis for a real match.
+        "bestof_superseded": 0,
     }
 
 
@@ -153,6 +158,7 @@ def run_eval_batch(
     time_budget_sec: float,
     client: Optional[LrclibClient] = None,
     should_write: Optional[WriteGate] = None,
+    touch_on_guard_kept: bool = False,
     log_prefix: str = "Lyrics eval",
 ) -> Dict[str, Any]:
     """Evaluate ``tracks`` against LRCLIB and persist outcomes, bounded by a wall clock.
@@ -164,6 +170,15 @@ def run_eval_batch(
 
     ``should_write``: consulted before persisting each outcome (default: always write).
     Returning False leaves the existing row intact and counts it under ``guard_kept``.
+
+    ``touch_on_guard_kept``: bump ``updated_at`` on a guard-kept row. OFF by default because
+    the two callers mean different things by a kept row. For **reassessment**, the row was
+    selected from the queue and re-checked, and only its content is protected — its rotation
+    cursor must still advance or a permanently-unwritable row pins the queue head forever
+    (DATA-catalog-noise Step 3b). For the **incremental collector**, a kept row means a peer
+    invocation corpused the track between our selection and our write: that row belongs to
+    the peer's outcome, this run did nothing to it, and touching it would falsify a
+    freshness timestamp we have no claim on.
     """
     metrics = new_metrics()
     if not tracks:
@@ -242,12 +257,18 @@ def run_eval_batch(
 
             if should_write is not None and not should_write(row, outcome):
                 metrics["guard_kept"] += 1
+                if touch_on_guard_kept:
+                    # The row was re-checked; only its CONTENT is protected. Advance the
+                    # rotation cursor so a permanently-unsupersedable row cannot pin the
+                    # head of a stalest-first queue (DATA-catalog-noise Step 3b).
+                    writer.touch(row["id"])
                 continue
 
             writer.write_outcomes([outcome])  # per-row commit (sentinel included)
             metrics["evaluated"] += 1
             metrics[outcome.match_status] = metrics.get(outcome.match_status, 0) + 1
             _count_promotion(metrics, outcome)
+            _count_supersession(metrics, row, outcome)
     finally:
         # Whatever we didn't reach (budget) simply stays selectable for the next run.
         metrics["skipped_budget"] = (
@@ -260,6 +281,24 @@ def run_eval_batch(
 
     logger.info("%s complete: %s", log_prefix, metrics)
     return metrics
+
+
+def _count_supersession(
+    metrics: Dict[str, Any], row: Dict[str, Any], outcome: MatchOutcome
+) -> None:
+    """Count a written row that left a ``best-of-*`` basis for a stronger one.
+
+    Read off the row's PRE-existing basis rather than recomputed from the ladder: by the
+    time this runs the write gate has already applied the strictly-``>`` rule, so any
+    written outcome whose existing basis was best-of and whose new basis is not IS a
+    supersession. This is the number that says whether Step 3b's queue flip is doing its
+    job in prod, where LOG_LEVEL=WARNING hides the per-run info log.
+    """
+    existing = row.get("existing_basis") or ""
+    if not existing.startswith("best-of-"):
+        return
+    if outcome.match_status == STATUS_MATCHED and outcome.match_basis not in _BEST_OF_BASES:
+        metrics["bestof_superseded"] += 1
 
 
 def _count_promotion(metrics: Dict[str, Any], outcome: MatchOutcome) -> None:
