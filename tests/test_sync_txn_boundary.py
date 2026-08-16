@@ -42,7 +42,7 @@ SCHEMA = [
     )""",
     """CREATE TABLE tracks (
         id INTEGER PRIMARY KEY, spotify_id TEXT UNIQUE, album_id INTEGER,
-        title TEXT, track_no INTEGER, duration_sec INTEGER
+        title TEXT, track_no INTEGER, disc_no INTEGER, duration_sec INTEGER
     )""",
     "CREATE TABLE album_artists (album_id INTEGER, artist_id INTEGER, PRIMARY KEY (album_id, artist_id))",
     "CREATE TABLE track_artists (track_id INTEGER, artist_id INTEGER, PRIMARY KEY (track_id, artist_id))",

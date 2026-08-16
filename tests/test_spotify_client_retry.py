@@ -124,6 +124,39 @@ def test_get_albums_exhausted_429_still_raises(monkeypatch):
 
 
 @pytest.mark.unit
+def test_get_album_tracks_pages_until_next_is_null(monkeypatch):
+    """DATA-multidisc-track-order Step 2b: GET /albums/{id}/tracks must page past
+    50 items (unlike get_albums' nested-tracks cap), stopping when `next` is null."""
+    calls, _ = _patch_requests(monkeypatch, [
+        _resp(200, json_body={
+            "items": [{"id": f"t{i}", "disc_number": 1} for i in range(50)],
+            "next": "https://api.spotify.com/v1/albums/alb1/tracks?offset=50",
+        }),
+        _resp(200, json_body={
+            "items": [{"id": "t50", "disc_number": 1}],
+            "next": None,
+        }),
+    ])
+    out = _client_with_token().get_album_tracks("alb1")
+    assert len(out) == 51
+    assert [c[1] for c in calls] == [
+        f"{suc.settings.SPOTIFY_API_BASE}/albums/alb1/tracks",
+        f"{suc.settings.SPOTIFY_API_BASE}/albums/alb1/tracks",
+    ]
+
+
+@pytest.mark.unit
+def test_get_album_tracks_stops_on_empty_page_even_if_next_is_set(monkeypatch):
+    """Defensive: an empty items page must not loop forever regardless of `next`."""
+    calls, _ = _patch_requests(monkeypatch, [
+        _resp(200, json_body={"items": [], "next": "https://example.com/more"}),
+    ])
+    out = _client_with_token().get_album_tracks("alb1")
+    assert out == []
+    assert len(calls) == 1
+
+
+@pytest.mark.unit
 def test_token_request_retries_transient_5xx(monkeypatch):
     calls, sleeps = _patch_requests(monkeypatch, [
         _resp(503),

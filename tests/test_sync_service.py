@@ -213,6 +213,56 @@ def test_sync_albums_batch_track_duration(mock_spotify, db_connection, db_sessio
     assert result == 284
 
 
+@pytest.mark.integration
+@patch("worker.service.sync_service.spotify")
+def test_sync_albums_batch_captures_disc_no(mock_spotify, db_connection, db_session_factory):
+    """DATA-multidisc-track-order Step 2: Spotify's disc_number lands in tracks.disc_no."""
+    album = {
+        "id": "test_album_multidisc",
+        "name": "Multidisc Test",
+        "artists": [{"id": "test_artist_001", "name": "Radiohead"}],
+        "images": [{"url": "https://example.com/cover-md.jpg"}],
+        "release_date": "1997-06-16",
+        "album_type": "album",
+        "total_tracks": 2,
+        "label": "Parlophone",
+        "popularity": 85,
+        "external_urls": {"spotify": "https://open.spotify.com/album/test_album_multidisc"},
+        "external_ids": {"upc": "0724385522926"},
+        "tracks": {
+            "items": [
+                {
+                    "id": "test_track_disc1",
+                    "name": "Disc 1 Track",
+                    "track_number": 1,
+                    "disc_number": 1,
+                    "duration_ms": 100000,
+                    "artists": [{"id": "test_artist_001", "name": "Radiohead"}],
+                },
+                {
+                    "id": "test_track_disc2",
+                    "name": "Disc 2 Track",
+                    "track_number": 1,
+                    "disc_number": 2,
+                    "duration_ms": 200000,
+                    "artists": [{"id": "test_artist_001", "name": "Radiohead"}],
+                },
+            ]
+        },
+    }
+    mock_spotify.get_albums.return_value = [album]
+
+    svc = AlbumSyncService(db_session_factory)
+    svc.sync_albums_batch(["test_album_multidisc"], "KR")
+
+    rows = db_connection.execute(
+        text("SELECT spotify_id, disc_no FROM tracks WHERE spotify_id IN ('test_track_disc1', 'test_track_disc2')"),
+    ).fetchall()
+    by_sid = {r[0]: r[1] for r in rows}
+    assert by_sid["test_track_disc1"] == 1
+    assert by_sid["test_track_disc2"] == 2
+
+
 # --- FEAT-genre-system Step 2: ext_refs UPC capture + S1 inline mapping ------
 # Real-engine tests (Neon test branch carries V17 genres seed; per-test rollback).
 # Dedicated spotify ids — legacy committed rows under the shared fixture ids
