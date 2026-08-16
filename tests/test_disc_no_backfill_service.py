@@ -12,7 +12,13 @@ Invariants pinned here:
   2. only tracks belonging to the album being processed are eligible for a
      match (a spotify_id collision with another album's track must not leak),
   3. one album's failure rolls back and does not block the next album,
-  4. writes are sorted by track_id (bulk-write lock-ordering rule).
+  4. writes are sorted by track_id (bulk-write lock-ordering rule),
+  5. a market-relinked track (`linked_from.id` differs from `id`) still matches
+     the LOCAL id — a live prod gap found running this backfill: 2 of the 78
+     albums (Queen's "Sheer Heart Attack (Deluxe Remastered Version)" and "The
+     Game (Deluxe Remastered Version)") returned market=KR ids that differ from
+     what's stored locally, with the matching id only reachable via
+     `linked_from.id`.
 """
 from __future__ import annotations
 
@@ -34,7 +40,7 @@ class FakeSession:
     def execute(self, stmt, params=None):
         sql = str(stmt)
         self.calls.append((sql, params))
-        if "SELECT id, spotify_id FROM tracks WHERE album_id" in sql:
+        if "SELECT spotify_id FROM tracks WHERE album_id" in sql:
             rows = self.tracks_by_album.get(params["album_id"], [])
             return _FakeResult(rows)
         return None
@@ -64,7 +70,7 @@ def _svc(session, albums: List[Dict[str, Any]]) -> DiscNoBackfillService:
 
 
 def test_track_with_no_local_row_is_skipped_not_inserted():
-    session = FakeSession(tracks_by_album={"alb-1": [("t-1", "sp-track-1")]})
+    session = FakeSession(tracks_by_album={"alb-1": [("sp-track-1",)]})
     svc = _svc(session, [{"id": "alb-1", "spotify_id": "alb-sp-1"}])
 
     with patch("worker.service.disc_no_backfill_service.spotify") as mock_spotify:
@@ -87,7 +93,7 @@ def test_spotify_id_belonging_to_another_album_is_not_updated():
     the SELECT is scoped by album_id, so a same-spotify_id row living under a
     different local album never enters the candidate set."""
     session = FakeSession(tracks_by_album={
-        "alb-1": [("t-1", "sp-shared")],
+        "alb-1": [("sp-shared",)],
         "alb-2": [],  # sp-shared does NOT live under alb-2 locally
     })
     svc = _svc(session, [{"id": "alb-2", "spotify_id": "alb-sp-2"}])
@@ -105,7 +111,7 @@ def test_spotify_id_belonging_to_another_album_is_not_updated():
 
 def test_writes_are_sorted_by_track_id():
     session = FakeSession(tracks_by_album={
-        "alb-1": [("t-1", "sp-b"), ("t-2", "sp-a")],
+        "alb-1": [("sp-b",), ("sp-a",)],
     })
     svc = _svc(session, [{"id": "alb-1", "spotify_id": "alb-sp-1"}])
 
@@ -123,8 +129,8 @@ def test_writes_are_sorted_by_track_id():
 
 def test_one_album_failure_does_not_block_the_next_album():
     session = FakeSession(tracks_by_album={
-        "alb-1": [("t-1", "sp-1")],
-        "alb-2": [("t-2", "sp-2")],
+        "alb-1": [("sp-1",)],
+        "alb-2": [("sp-2",)],
     })
     svc = _svc(session, [
         {"id": "alb-1", "spotify_id": "alb-sp-1"},
@@ -147,10 +153,34 @@ def test_one_album_failure_does_not_block_the_next_album():
     assert session.commits == 2  # the initial read-close commit + album-2's write commit
 
 
+def test_market_relinked_track_matches_via_linked_from_id():
+    """Spotify returns a market-scoped id (`it["id"]`) that differs from the id
+    stored locally; the ORIGINAL id only shows up under `linked_from.id`. Matching
+    on `it["id"]` alone (the pre-fix behavior) silently skips this track forever."""
+    session = FakeSession(tracks_by_album={"alb-1": [("sp-local-original",)]})
+    svc = _svc(session, [{"id": "alb-1", "spotify_id": "alb-sp-1"}])
+
+    with patch("worker.service.disc_no_backfill_service.spotify") as mock_spotify:
+        mock_spotify.get_album_tracks.return_value = [
+            {
+                "id": "sp-market-relinked",
+                "disc_number": 1,
+                "linked_from": {"id": "sp-local-original"},
+            },
+        ]
+        metrics = svc.backfill_disc_no()
+
+    assert metrics["tracks_matched"] == 1
+    assert metrics["tracks_skipped_no_local_row"] == 0
+    updates = session.updates()
+    written_ids = {row["track_id"] for row in updates[0][1]}
+    assert written_ids == {"sp-local-original"}
+
+
 def test_track_with_null_disc_number_from_spotify_is_dropped_before_matching():
     """Spotify returning disc_number: null for some malformed item must not
     overwrite a track with NULL — it is simply excluded from the candidate map."""
-    session = FakeSession(tracks_by_album={"alb-1": [("t-1", "sp-1")]})
+    session = FakeSession(tracks_by_album={"alb-1": [("sp-1",)]})
     svc = _svc(session, [{"id": "alb-1", "spotify_id": "alb-sp-1"}])
 
     with patch("worker.service.disc_no_backfill_service.spotify") as mock_spotify:

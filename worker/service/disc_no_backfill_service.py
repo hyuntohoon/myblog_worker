@@ -64,16 +64,34 @@ class DiscNoBackfillService:
             alb_sid = album["spotify_id"]
             try:
                 items = spotify.get_album_tracks(alb_sid, market=market)
-                disc_by_sid = {
-                    it["id"]: it.get("disc_number")
-                    for it in items
-                    if it.get("id") and it.get("disc_number") is not None
-                }
-                if not disc_by_sid:
+                local_sids = self._fetch_local_track_sids(album["id"])
+
+                # Resolve each Spotify item to a LOCAL spotify_id before counting it as
+                # matched or skipped — market-scoped Track Relinking (a live prod finding:
+                # 2 of the 78 albums, e.g. Queen's "Sheer Heart Attack (Deluxe Remastered
+                # Version)", return a market=KR id that differs from the id stored locally,
+                # with the matching id only reachable via `linked_from.id`) means an item
+                # can carry two candidate ids for the same track. Resolving per-item (not
+                # per-id) keeps a relinked track from being double-counted as one match
+                # plus one spurious skip. Same defense as IsrcBackfillService.backfill_isrc.
+                updates: Dict[str, int] = {}
+                skipped = 0
+                for it in items:
+                    disc = it.get("disc_number")
+                    if disc is None:
+                        continue
+                    candidates = [cid for cid in (it.get("id"), (it.get("linked_from") or {}).get("id")) if cid]
+                    local_match = next((cid for cid in candidates if cid in local_sids), None)
+                    if local_match:
+                        updates[local_match] = disc
+                    else:
+                        skipped += 1
+
+                if not updates and not skipped:
                     logger.warning("disc_no backfill: album %s returned no usable tracks", alb_sid)
                     continue
 
-                matched, skipped = self._update_album_disc_no(album["id"], disc_by_sid)
+                matched = self._apply_disc_no_updates(album["id"], updates)
                 self.session.commit()
                 metrics["albums_processed"] += 1
                 metrics["tracks_matched"] += matched
@@ -126,33 +144,31 @@ class DiscNoBackfillService:
         )
         return [{"id": row[0], "spotify_id": row[1]} for row in result.fetchall()]
 
-    def _update_album_disc_no(self, album_id: Any, disc_by_sid: Dict[str, int]) -> tuple[int, int]:
-        """Apply one album's Spotify-fetched disc numbers to its local tracks.
-
-        Matches by spotify_id AND album_id — a spotify_id existing on a
-        different local album (shouldn't happen, but not assumed) is left
-        untouched. Returns (matched, skipped_no_local_row).
-        """
+    def _fetch_local_track_sids(self, album_id: Any) -> set:
+        """spotify_ids of this album's LOCAL track rows — matches by spotify_id
+        AND album_id, so a spotify_id existing on a different local album
+        (shouldn't happen, but not assumed) is never a candidate."""
         rows = self.session.execute(
-            text("SELECT id, spotify_id FROM tracks WHERE album_id = :album_id"),
+            text("SELECT spotify_id FROM tracks WHERE album_id = :album_id"),
             {"album_id": album_id},
         ).fetchall()
-        local_sids = {row[1] for row in rows}
+        return {row[0] for row in rows}
 
-        updates = [
-            {"track_id": sid, "disc": disc}
-            for sid, disc in sorted(disc_by_sid.items())
-            if sid in local_sids
-        ]
-        skipped = len(disc_by_sid) - len(updates)
-
-        if updates:
-            self.session.execute(
-                text("""
-                    UPDATE tracks
-                    SET disc_no = :disc
-                    WHERE spotify_id = :track_id AND album_id = :album_id
-                """),
-                [{**u, "album_id": album_id} for u in updates],
-            )
-        return len(updates), skipped
+    def _apply_disc_no_updates(self, album_id: Any, updates: Dict[str, int]) -> int:
+        """UPDATE only, never INSERT — `updates` keys are already confirmed
+        local spotify_ids. Sorted by track_id for the bulk-write lock-ordering
+        rule. Returns the number of rows written."""
+        if not updates:
+            return 0
+        self.session.execute(
+            text("""
+                UPDATE tracks
+                SET disc_no = :disc
+                WHERE spotify_id = :track_id AND album_id = :album_id
+            """),
+            [
+                {"track_id": sid, "disc": disc, "album_id": album_id}
+                for sid, disc in sorted(updates.items())
+            ],
+        )
+        return len(updates)
