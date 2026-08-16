@@ -228,6 +228,21 @@ def _run_isrc_backfill(limit: int | None = None) -> None:
         logger.warning("ISRC backfill metrics: %s", metrics)
 
 
+def _run_disc_no_backfill(limit: int | None = None) -> None:
+    """One-off `disc_no` backfill for DATA-multidisc-track-order Step 2b. Re-fetches
+    each currently-colliding album from Spotify and sets `tracks.disc_no`, matched by
+    spotify_id. Bounded to the ~78-album collision population — not a recurring job;
+    every future sync captures `disc_no` naturally via Step 2a's `AlbumSyncService`
+    change. Same failure-isolation shape as `_run_isrc_backfill`."""
+    from worker.service.disc_no_backfill_service import DiscNoBackfillService
+
+    with SessionLocal() as session:
+        svc = DiscNoBackfillService(session)
+        metrics = svc.backfill_disc_no(limit=limit)
+        # WARNING, not INFO: prod Lambdas run LOG_LEVEL=WARNING.
+        logger.warning("disc_no backfill metrics: %s", metrics)
+
+
 def _run_artist_photo_backfill(limit: int | None = None) -> None:
     """One-shot backlog + weekly EventBridge sweep (BUG-artist-image-backfill).
     EventBridge/SQS triggered and failure-isolated so it must not block album sync.
@@ -327,6 +342,16 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         limit = event.get("limit")  # None ⇒ settings.ISRC_BACKFILL_BATCH_LIMIT
         logger.info("EventBridge/SQS trigger: running ISRC backfill (limit=%s)", limit)
         _run_isrc_backfill(limit=limit)
+        return {}
+
+    # Manual-invoke only — DATA-multidisc-track-order Step 2b one-off backfill.
+    # No EventBridge rule: the ~78-album collision population doesn't recur (every
+    # future sync captures disc_no via Step 2a), so this is triggered once by hand
+    # via `aws lambda invoke` and never scheduled.
+    if event.get("job") == "disc_no_backfill":
+        limit = event.get("limit")  # None ⇒ all colliding albums
+        logger.info("Manual trigger: running disc_no backfill (limit=%s)", limit)
+        _run_disc_no_backfill(limit=limit)
         return {}
 
     # EventBridge/SQS trigger — Genius annotation fetch (FEAT-lyrics-annotations).

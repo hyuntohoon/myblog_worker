@@ -172,6 +172,7 @@ class AlbumSyncService:
                     alb_sid=alb_sid,
                     title=t.get("name") or "",
                     no=t.get("track_number"),
+                    disc=t.get("disc_number"),
                     dur=(t.get("duration_ms") or 0) // 1000,
                 ))
                 for a in (t.get("artists") or []):
@@ -284,16 +285,17 @@ class AlbumSyncService:
                 track_data.sort(key=lambda t: t["sid"])
                 session.execute(
                     text("""
-                        INSERT INTO tracks (spotify_id, album_id, title, track_no, duration_sec)
+                        INSERT INTO tracks (spotify_id, album_id, title, track_no, disc_no, duration_sec)
                         VALUES (
                             :sid,
                             (SELECT id FROM albums WHERE spotify_id = :alb_sid),
-                            :title, :no, :dur
+                            :title, :no, :disc, :dur
                         )
                         ON CONFLICT (spotify_id) DO UPDATE
                            SET title        = EXCLUDED.title,
                                album_id     = EXCLUDED.album_id,
                                track_no     = EXCLUDED.track_no,
+                               disc_no      = EXCLUDED.disc_no,
                                duration_sec = EXCLUDED.duration_sec
                     """),
                     track_data,

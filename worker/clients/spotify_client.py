@@ -230,4 +230,37 @@ class SpotifyClient:
 
         return out
 
+    def get_album_tracks(self, album_id: str, market: Optional[str] = None) -> list[dict[str, Any]]:
+        """GET /v1/albums/{id}/tracks?limit=50&offset=... — fully paginated.
+
+        Unlike the nested `tracks` on a batch `get_albums()` response (capped at 50
+        with no offset control), this endpoint pages properly. Needed for
+        DATA-multidisc-track-order Step 2's collision backfill: 4 of the 78 flagged
+        albums sit at exactly 50 locally-stored tracks, which is consistent with
+        `get_albums()` having silently truncated them at ingest time."""
+        out: list[dict[str, Any]] = []
+        mkt = self._default_market(market)
+        base_url = f"{settings.SPOTIFY_API_BASE}/albums/{album_id}/tracks"
+        limit = 50
+        offset = 0
+
+        while True:
+            params: Dict[str, Any] = {"limit": limit, "offset": offset}
+            if mkt:
+                params["market"] = mkt
+
+            r = _request_with_retry(
+                "GET", base_url, headers=self._headers(), params=params, timeout=20
+            )
+            r.raise_for_status()
+            payload = r.json()
+            items = payload.get("items") or []
+            out.extend(items)
+
+            if not payload.get("next") or not items:
+                break
+            offset += limit
+
+        return out
+
 spotify = SpotifyClient()
