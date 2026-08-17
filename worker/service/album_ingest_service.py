@@ -21,8 +21,19 @@
 # or removing artists shifts partitions slightly, but every artist is still visited
 # once per cycle. NOTE: at the OQ5 floor (≥50 ≈ 1,530 eligible / 30 per tick /
 # rate(1 day)) a full cycle is ~51 days — so a "release-day" confirm can lag the
-# actual release by up to a cycle; the per-tick knob is owner curation policy and
-# was deliberately NOT changed here (flagged in the Step 5 report).
+# actual release by up to a cycle for a non-tracked artist; the per-tick knob is
+# owner curation policy and was deliberately NOT changed here (flagged in the
+# Step 5 report).
+#
+# FEAT-personal-release-tracking gap fix (found via a live "카탈로그 ID 없음"
+# 나를 위한 새 앨범 report): a user_artist_tracks artist is pulled OUT of that
+# rotation and swept every tick instead (still deduped against the day's
+# regular bucket). Confirmation is exclusively driven by this sweep — the
+# MB/iTunes announced-pollers (release_upcoming_service.py) already excused
+# tracked artists from the popularity floor (2026-07-18), but this sweep
+# didn't, so a tracked artist's own release could ride the full ~51-day
+# rotation before ever getting a spotify_album_id / status='released', even
+# once the album already existed in the catalog via an unrelated ingest path.
 from __future__ import annotations
 
 import logging
@@ -47,9 +58,20 @@ logger = logging.getLogger(__name__)
 # matches only. This key reads ARTIST genres because tracks do not exist yet at
 # ingest time. hashtext supplies a deterministic 1-in-:holdout_mod holdout so
 # the misclassification rate stays measurable forever.
+#
+# `tracked` (FEAT-personal-release-tracking gap fix): a user_artist_tracks row
+# both (a) admits a sub-:pop_min artist to `eligible` at all and (b) forces
+# `watch` true for them, mirroring release_upcoming_service.py's MB/iTunes
+# watchlist queries — those two already carve tracked artists out of the
+# popularity floor (shipped 2026-07-18); this sweep, which is the ONLY path
+# that ever confirms an artist_release_events row (spotify_album_id +
+# status='released'), never got the same carve-out. `tracked` is also read
+# below to pull these artists out of the day-bucket rotation.
 _SELECT_ELIGIBLE = text(
     """
-    SELECT spotify_id, id AS artist_id, (popularity >= :watch_min) AS watch,
+    SELECT spotify_id, id AS artist_id,
+           (popularity >= :watch_min OR t.artist_id IS NOT NULL) AS watch,
+           (t.artist_id IS NOT NULL) AS tracked,
            EXISTS (
              SELECT 1 FROM jsonb_array_elements_text(a.genres) g
               WHERE g NOT IN ('클래식 록','클래식 소울','클래식 컨트리','바로크 팝','클래식 크로스오버')
@@ -58,7 +80,9 @@ _SELECT_ELIGIBLE = text(
            ) AS classical,
            (abs(hashtext(spotify_id)) % :holdout_mod) = 0 AS holdout
       FROM artists a
-     WHERE popularity >= :pop_min
+      LEFT JOIN (SELECT DISTINCT artist_id FROM user_artist_tracks) t
+        ON t.artist_id = a.id
+     WHERE popularity >= :pop_min OR t.artist_id IS NOT NULL
      ORDER BY spotify_id
     """
 )
@@ -122,7 +146,7 @@ def run_album_ingest(
         today = date.today()
 
     counters = {
-        "eligible": 0, "swept": 0, "discovered": 0, "fresh": 0,
+        "eligible": 0, "swept": 0, "tracked_swept": 0, "discovered": 0, "fresh": 0,
         "novel": 0, "passed_gate": 0, "enqueued": 0,
         "classical_excluded": 0, "classical_holdout": 0,
         "confirm_candidates": 0, "confirm_flipped": 0, "confirm_inserted": 0,
@@ -153,7 +177,7 @@ def run_album_ingest(
 
     classical_allowlist = set(settings.INGEST_CLASSICAL_ALLOWLIST)
     eligible = []
-    for spotify_id, artist_id, watch, classical, holdout in rows:
+    for spotify_id, artist_id, watch, tracked, classical, holdout in rows:
         if (
             settings.INGEST_EXCLUDE_CLASSICAL
             and classical
@@ -164,7 +188,7 @@ def run_album_ingest(
             else:
                 counters["classical_excluded"] += 1
                 continue
-        eligible.append((spotify_id, artist_id, bool(watch)))
+        eligible.append((spotify_id, artist_id, bool(watch), bool(tracked)))
     counters["eligible"] = len(eligible)
     if not eligible:
         logger.warning("album_ingest: no artists clear ARTIST_POP_MIN=%d", settings.ARTIST_POP_MIN)
@@ -173,7 +197,19 @@ def run_album_ingest(
     buckets = max(1, math.ceil(len(eligible) / settings.SWEEP_ARTISTS_PER_TICK))
     bucket = days_since_epoch % buckets
     start = bucket * settings.SWEEP_ARTISTS_PER_TICK
-    sweep = eligible[start : start + settings.SWEEP_ARTISTS_PER_TICK]
+    bucketed = eligible[start : start + settings.SWEEP_ARTISTS_PER_TICK]
+
+    # Tracked artists ride EVERY tick, outside the day-bucket rotation — a
+    # ~1,530-artist pool at 30/tick means a bucket-rotated artist is only
+    # revisited every ~51 days, which is also how long a personally-tracked
+    # release could sit unconfirmed (see _SELECT_ELIGIBLE comment). Dedup
+    # against this tick's bucket so a tracked artist who's also due for their
+    # regular popularity-bucket turn isn't swept twice.
+    tracked_artists = [e for e in eligible if e[3]]
+    counters["tracked_swept"] = len(tracked_artists)
+    tracked_ids = {e[1] for e in tracked_artists}
+    merged = tracked_artists + [e for e in bucketed if e[1] not in tracked_ids]
+    sweep = [(spotify_id, artist_id, watch) for spotify_id, artist_id, watch, _tracked in merged]
     counters["swept"] = len(sweep)
 
     # Slow external discovery loop — no DB session held open here.
@@ -256,6 +292,7 @@ def run_album_ingest(
 
     logger.warning(
         "album_ingest summary: eligible=%(eligible)d swept=%(swept)d "
+        "tracked_swept=%(tracked_swept)d "
         "discovered=%(discovered)d fresh=%(fresh)d novel=%(novel)d "
         "passed_gate=%(passed_gate)d enqueued=%(enqueued)d "
         "confirm_candidates=%(confirm_candidates)d "

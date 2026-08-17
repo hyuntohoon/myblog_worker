@@ -48,8 +48,9 @@ class _Result:
 
 class _FakeSession:
     def __init__(self, album_count=0, eligible=(), known=(), events=()):
-        # eligible: (spotify_id, watch, classical=False, holdout=False), with
-        # artist_id derived as f"{sid}-id". Two-tuples keep older tests concise.
+        # eligible: (spotify_id, watch, classical=False, holdout=False,
+        # tracked=False), with artist_id derived as f"{sid}-id". Two-tuples
+        # keep older tests concise.
         self.album_count = album_count
         self.eligible = list(eligible)
         self.known = set(known)          # album spotify_ids already in DB
@@ -69,8 +70,8 @@ class _FakeSession:
             assert (params or {}).get("holdout_mod") is not None
             rows = []
             for sid, watch, *classification in self.eligible:
-                classical, holdout = [*classification, False, False][:2]
-                rows.append(_Row(sid, f"{sid}-id", watch, classical, holdout))
+                classical, holdout, tracked = [*classification, False, False, False][:3]
+                rows.append(_Row(sid, f"{sid}-id", watch or tracked, tracked, classical, holdout))
             return _Result(rows=rows)
         if "FROM albums WHERE spotify_id = ANY" in sql:
             sids = params["sids"]
@@ -148,7 +149,7 @@ def test_happy_path_filters_known_and_gates_low_pop(monkeypatch):
 
     assert enqueued == ["new-hot"]  # old filtered, known deduped, low-pop gated
     assert counters == {
-        "eligible": 2, "swept": 2, "discovered": 4, "fresh": 3,
+        "eligible": 2, "swept": 2, "tracked_swept": 0, "discovered": 4, "fresh": 3,
         "novel": 2, "passed_gate": 1, "enqueued": 1,
         "classical_excluded": 0, "classical_holdout": 0,
         "confirm_candidates": 0, "confirm_flipped": 0, "confirm_inserted": 0,
@@ -226,6 +227,7 @@ def test_eligible_artist_sql_classifies_decoys_and_deterministic_holdout():
     assert "hashtext(spotify_id)" in sql and ":holdout_mod" in sql
     assert "ORDER BY spotify_id" in sql
     assert ":pop_min" in sql
+    assert "user_artist_tracks" in sql  # tracked artists bypass the popularity floor
 
 
 @pytest.mark.unit
@@ -294,6 +296,74 @@ def test_day_bucket_rotation_covers_all_and_wraps(monkeypatch):
     assert sorted(swept_by_day[0] + swept_by_day[1] + swept_by_day[2]) == [
         s for s, _ in eligible
     ]
+
+
+@pytest.mark.unit
+def test_tracked_artist_swept_every_tick_outside_rotation(monkeypatch):
+    """FEAT-personal-release-tracking gap fix: a user_artist_tracks artist rides
+    every tick regardless of the day-bucket cursor — the bug report this closes
+    was a tracked artist's own release sitting unconfirmed for weeks because the
+    bucket rotation hadn't reached them yet."""
+    monkeypatch.setattr(ais.settings, "INGEST_SINCE", "2026-01-01")
+    monkeypatch.setattr(ais.settings, "SWEEP_ARTISTS_PER_TICK", 2)
+    # 3 buckets over [a1..a5]; "tracked" (tuple form: sid, watch, classical,
+    # holdout, tracked) sits outside every bucket ([a1,a2] [a3,a4] [a5]).
+    eligible = [(f"a{i}", False) for i in range(1, 6)] + [
+        ("tracked", False, False, False, True),
+    ]
+
+    for day in range(3):  # one full rotation cycle
+        session = _FakeSession(album_count=0, eligible=eligible)
+        catalog = _FakeCatalog({}, {})
+        counters, _ = _run(session, catalog, day=day)
+        swept = [sid for sid, _ in catalog.artist_calls]
+        assert "tracked" in swept, f"day {day} missed the tracked artist"
+        assert counters["tracked_swept"] == 1
+
+
+@pytest.mark.unit
+def test_tracked_artist_deduped_against_its_own_bucket_turn(monkeypatch):
+    """When the tracked artist's regular popularity-bucket turn coincides with
+    its every-tick tracked sweep, it must not be visited (and confirmed) twice
+    in the same tick."""
+    monkeypatch.setattr(ais.settings, "INGEST_SINCE", "2026-01-01")
+    monkeypatch.setattr(ais.settings, "SWEEP_ARTISTS_PER_TICK", 2)
+    eligible = [("a1", False), ("tracked", False, False, False, True)]  # 1 bucket: both
+    session = _FakeSession(album_count=0, eligible=eligible)
+    catalog = _FakeCatalog({}, {})
+    counters, _ = _run(session, catalog, day=0)
+
+    assert [sid for sid, _ in catalog.artist_calls].count("tracked") == 1
+    assert counters["swept"] == 2
+
+
+@pytest.mark.unit
+def test_tracked_artist_below_pop_floor_still_eligible_and_confirms(monkeypatch):
+    """The real-world gap: a tracked artist below ARTIST_POP_MIN/RELEASE_POLL_
+    POP_MIN was invisible to this sweep entirely (release_upcoming_service.py's
+    MB/iTunes pollers already carved tracked artists out of the floor; this
+    sweep — the only one that ever confirms — hadn't). It must now (a) enter
+    `eligible` at all, (b) sweep with include_groups widened for singles/EPs
+    like any other watchlist artist, and (c) flip a matching announced row."""
+    monkeypatch.setattr(ais.settings, "INGEST_SINCE", "2026-06-10")
+    events = [
+        _Row(id="ev-mb", artist_id="niche-id", title="Camera",
+             release_date=date(2026, 7, 21), status="announced", spotify_album_id=None),
+    ]
+    # watch=False (popularity is below the floor) but tracked=True.
+    session = _FakeSession(eligible=[("niche", False, False, False, True)], events=events)
+    catalog = _FakeCatalog(
+        {"niche": [{"id": "sp-camera", "name": "Camera",
+                    "album_type": "single", "release_date": "2026-07-21"}]},
+        {},
+    )
+    counters, _ = _run(session, catalog)
+
+    assert counters["eligible"] == 1
+    assert catalog.artist_calls == [("niche", "album,single")]
+    assert counters["confirm_flipped"] == 1
+    (_, params), = session.sql_of(lambda s: "UPDATE artist_release_events" in s)
+    assert params["spotify_album_id"] == "sp-camera"
 
 
 @pytest.mark.unit
