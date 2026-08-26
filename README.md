@@ -151,3 +151,4 @@ CI 는 GitHub Actions `secrets.TEST_DB_URL` 로 주입합니다 (`.github/workfl
 | [`myblog_shared_db`](https://github.com/hyuntohoon/myblog_shared_db)   | 공유 SQLAlchemy 모델 (git-pinned)     |
 
 > 옛 `myblog_publish` 서비스는 ARCH-11 으로 backend 에 흡수되었고 업스트림은 archived 됨.
+
