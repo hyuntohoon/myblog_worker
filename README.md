@@ -98,7 +98,7 @@ SpotifyUserClient (refresh token → access token, myblog/spotify 시크릿)
 
 | 변수                    | 설명                                                                |
 |-------------------------|---------------------------------------------------------------------|
-| `SECRETS_ARN`           | AWS Secrets Manager `myblog/worker` 의 ARN (prod). cold-start 1회 fetch + `@lru_cache` |
+| `SECRETS_PARAM`         | SSM Parameter Store SecureString 이름 (prod: `/myblog/worker`). cold-start 1회 fetch + `@lru_cache`. 실패 시 조용히 넘어가지 않고 raise 합니다 (CHORE-secrets-ssm-migration — Secrets Manager 는 폐기) |
 | `DATABASE_URL`          | Neon 접속 URL (`postgresql+psycopg://...`) — local dev 시 직접 주입 |
 | `SPOTIFY_CLIENT_ID`     | Spotify 앱 Client ID                                                |
 | `SPOTIFY_CLIENT_SECRET` | Spotify 앱 Client Secret                                            |
