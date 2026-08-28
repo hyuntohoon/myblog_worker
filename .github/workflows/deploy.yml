@@ -73,6 +73,14 @@ jobs:
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
       && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # Job-level permissions REPLACE the workflow-level block, so `contents: read`
+    # is restated here rather than inherited. `id-token: write` is what lets this
+    # job mint the OIDC token it trades for the AWS role, and it is granted to this
+    # job ONLY — the test/check jobs run on every pull request and must not be able
+    # to request one.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -94,11 +102,23 @@ jobs:
           find build -name "*.pyc" -delete
           cd build && zip -r ../bundle.zip .
 
+      # SEC-system-hardening Step 3c: OIDC, not a long-lived key. The role's trust
+      # policy pins `sub` AND `job_workflow_ref` with StringEquals, so only this
+      # workflow file on this repo's main can assume it — `sub` alone would also
+      # match a pull_request_target run, whose GITHUB_REF is the base branch. The
+      # role can call exactly the Lambda actions below on ONE function; the shared
+      # github-actions-deploy user it replaces could write four.
+      #
+      # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY remain set and are now unused;
+      # they are deleted only after this lane is confirmed green in production.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: gha-worker-deploy-${{ github.run_id }}
+          aws-region: ap-northeast-2
+
       - name: Deploy to Lambda
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ap-northeast-2
           FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME || 'blogWorkerLambda' }}
         run: |
           aws lambda update-function-code \
@@ -115,14 +135,13 @@ jobs:
       # detect-and-alert-fast + rollback trigger, not a pre-cutover gate.
       - name: Post-deploy smoke (health invoke)
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ap-northeast-2
           FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME || 'blogWorkerLambda' }}
         run: |
-          # function-updated-v2 polls GetFunction (already granted to the deploy
-          # user); the v1 waiter polls GetFunctionConfiguration, which the
-          # least-privilege lambda-deploy-only policy does not allow.
+          # function-updated-v2 polls GetFunction; the v1 waiter polls
+          # GetFunctionConfiguration, which neither the old lambda-deploy-only user
+          # policy nor the OIDC role that replaced it allows. Keep the v2 waiter.
+          # GetFunction and InvokeFunction are granted on THIS function only —
+          # infra/github_oidc.tf, myblog-github-worker-deploy.
           aws lambda wait function-updated-v2 --function-name "$FUNCTION_NAME"
           aws lambda invoke \
             --function-name "$FUNCTION_NAME" \
