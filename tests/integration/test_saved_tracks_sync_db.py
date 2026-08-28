@@ -1,18 +1,17 @@
 """FEAT-genre-artist-distribution Step 2 integration test — exercises the
 saved-tracks upsert / full-reconcile prune / catalog-resolve against a REAL
-SQLAlchemy engine (Neon test branch).
+SQLAlchemy engine backed by CI's disposable Postgres 16 service.
 
 Why this exists ([[feedback-sa-session-lifecycle-mock-blind]]): the unit tests use
 fakes and never touch real SQL, so they can't catch a broken ON CONFLICT, a wrong
 ``= ANY(:keep)`` array binding, or a ``CAST(... AS timestamptz)`` failure. This runs
 the real service on a live engine.
 
-spotify_saved_tracks on the test branch is an exclusive sandbox for this test (the
-worker saved-tracks sync only ever runs against prod), so the full-mode prune
-deleting non-test rows is harmless here; each test still cleans up its own rows.
+The disposable CI database is an exclusive sandbox for this test, so the full-mode
+prune deleting non-test rows is harmless; each test still cleans up its own rows.
 
-Guarded by TEST_DB_URL; skipped when unset. Also skipped if the V24 table isn't on
-the test branch yet (schema-drift guard, mirroring test_listening_sync_db.py).
+CI provides TEST_DB_URL and the pinned canonical schema. A local run without
+TEST_DB_URL is skipped; the V24/V26 probes diagnose an older local schema.
 """
 from __future__ import annotations
 
@@ -29,7 +28,7 @@ _TEST_DB_URL = os.environ.get("TEST_DB_URL")
 
 pytestmark = pytest.mark.skipif(
     not _TEST_DB_URL,
-    reason="integration test requires TEST_DB_URL env var (Neon test branch)",
+    reason="integration test requires TEST_DB_URL env var (Postgres test database)",
 )
 
 
@@ -55,10 +54,10 @@ def factory():
         ).first()
     if not present:
         eng.dispose()
-        pytest.skip("spotify_saved_tracks not on test branch — apply migration V24 first")
+        pytest.skip("spotify_saved_tracks missing from test database (V24)")
     if not has_duration:
         eng.dispose()
-        pytest.skip("spotify_saved_tracks.duration_ms missing — apply V26 to the test branch first")
+        pytest.skip("spotify_saved_tracks.duration_ms missing from test database (V26)")
     yield sessionmaker(bind=eng, autoflush=False, autocommit=False, future=True)
     eng.dispose()
 

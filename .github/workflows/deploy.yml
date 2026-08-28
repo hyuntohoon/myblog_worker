@@ -33,11 +33,34 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: myblog_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d myblog_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Check out canonical shared-db schema
+        uses: actions/checkout@v4
+        with:
+          repository: hyuntohoon/myblog_shared_db
+          ref: 90a6fca4a0528a0ed37be3a514e86ad379373042
+          token: ${{ secrets.SHARED_DB_PAT }}
+          persist-credentials: false
+          path: shared-db-schema
 
       - name: Configure git auth for private package
         env:
@@ -49,13 +72,74 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-test.txt
 
+      - name: Load canonical schema and deterministic fixtures
+        env:
+          POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: |
+          docker exec -i "$POSTGRES_CONTAINER_ID" \
+            psql -U postgres -d myblog_test --set ON_ERROR_STOP=on \
+            < shared-db-schema/tests/canonical_schema.sql
+          docker exec -i "$POSTGRES_CONTAINER_ID" \
+            psql -U postgres -d myblog_test --set ON_ERROR_STOP=on \
+            < tests/integration/fixtures/catalog.sql
+
       - name: Run tests
         env:
-          TEST_DB_URL: ${{ secrets.TEST_DB_URL }}
+          TEST_DB_URL: postgresql+psycopg://postgres:postgres@localhost:5432/myblog_test
           SPOTIFY_CLIENT_ID: "test"
           SPOTIFY_CLIENT_SECRET: "test"
           DRY_RUN: "true"
-        run: pytest tests/ -v --alluredir=allure-results
+        run: >-
+          pytest tests/ -v
+          --alluredir=allure-results
+          --junitxml=pytest-results.xml
+
+      - name: Enforce zero DB-bound skips
+        run: |
+          python - <<'PY'
+          import json
+          import sys
+          import xml.etree.ElementTree as ET
+
+          allowed_suffix = "integration/test_musicbrainz_live.py"
+          testcases = ET.parse("pytest-results.xml").findall(".//testcase")
+          skipped = [case for case in testcases if case.find("skipped") is not None]
+          allowed_live = []
+          unexpected = []
+
+          for case in skipped:
+              source = case.get("file")
+              if not source:
+                  source = case.get("classname", "").replace(".", "/") + ".py"
+              source = source.removeprefix("./")
+              record = f"{source}::{case.get('name', '<unknown>')}"
+              if source == allowed_suffix or source.endswith("/" + allowed_suffix):
+                  allowed_live.append(record)
+              else:
+                  unexpected.append(record)
+
+          evidence = {
+              "collected": len(testcases),
+              "skipped_total": len(skipped),
+              "allowed_musicbrainz_live_skips": len(allowed_live),
+              "db_bound_skips": len(unexpected),
+          }
+          print(json.dumps(evidence, sort_keys=True))
+          print("DB-bound skips: 0" if not unexpected else "DB-bound skips detected")
+
+          if len(allowed_live) != 3:
+              print(
+                  f"::error::Expected 3 intentional MusicBrainz live skips, got {len(allowed_live)}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          if unexpected:
+              print(
+                  "::error::Unexpected skipped tests: " + ", ".join(unexpected),
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          PY
 
       - name: Upload Allure results
         if: always()
@@ -63,6 +147,13 @@ jobs:
         with:
           name: allure-results
           path: allure-results/
+
+      - name: Upload JUnit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results
+          path: pytest-results.xml
 
   deploy:
     needs: test

@@ -3,8 +3,8 @@
 # Pure-logic tests with a fake session that records executed SQL — they verify the
 # distinct-window extraction, known/unknown split, prune, and enqueue wiring. They
 # are deliberately blind to real SQL semantics (upsert/prune correctness against
-# Postgres lives in tests/integration/test_listening_sync_db.py, gated on TEST_DB_URL —
-# per feedback-sa-session-lifecycle-mock-blind).
+# Postgres lives in tests/integration/test_listening_sync_db.py and runs against
+# CI's disposable local Postgres — per feedback-sa-session-lifecycle-mock-blind).
 from __future__ import annotations
 
 import uuid

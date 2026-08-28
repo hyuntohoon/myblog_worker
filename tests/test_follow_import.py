@@ -1,7 +1,7 @@
 # FEAT-for-you-releases Step 2 — followed-artists import tests.
 # Pure-mock (library-sync style): Spotify HTTP, boto3 SQS, and the DB session are
-# all faked — TEST_DB_URL-bound coverage can't gate merges (no worker PR CI), so
-# orchestration decisions are what these tests pin down.
+# all faked; the disposable-Postgres integration gate covers SQL semantics, while
+# these tests pin down orchestration decisions.
 import json
 import time
 import uuid

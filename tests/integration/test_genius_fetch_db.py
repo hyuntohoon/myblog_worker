@@ -3,16 +3,16 @@
 Why this exists ([[feedback-sa-session-lifecycle-mock-blind]] + the isrc lesson):
 the unit tests assert the SQL *text* (no `track_lyrics`, `album_research` present)
 but never run it, so a broken bind or a bad `CAST(:album_id AS uuid)` would pass
-CI and die on the first prod invocation. This runs both selection queries on the
-Neon test branch:
+mock-only tests and die on the first prod invocation. This runs both selection
+queries on CI's disposable Postgres 16 database:
 
   * research demand is the eligibility — a track with NO lyrics row is selected
     once its album has an `album_research` row, and an album without one is not
   * already-fetched tracks (`track_genius_songs` row) stay out of the pool
   * the album-scoped nudge path binds and CASTs its uuid through a real driver
 
-Guarded by TEST_DB_URL; skipped when unset. Also skipped if V49
-(`track_genius_songs`) is not on the test branch (schema-drift guard).
+CI provides TEST_DB_URL and the pinned canonical schema. A local run without
+TEST_DB_URL is skipped; the V49 probe diagnoses an older local schema.
 """
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ _TEST_DB_URL = os.environ.get("TEST_DB_URL")
 
 pytestmark = pytest.mark.skipif(
     not _TEST_DB_URL,
-    reason="integration test requires TEST_DB_URL env var (Neon test branch)",
+    reason="integration test requires TEST_DB_URL env var (Postgres test database)",
 )
 
 
@@ -47,7 +47,7 @@ def factory():
             )
         ).first()
         if not has_v49:
-            pytest.skip("V49 (track_genius_songs) not deployed to test branch yet")
+            pytest.skip("V49 (track_genius_songs) missing from test database")
     return sessionmaker(bind=eng)
 
 
