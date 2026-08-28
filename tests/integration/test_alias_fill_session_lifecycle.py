@@ -8,9 +8,9 @@ that mock-only coverage misses connection-lifecycle bugs (session.commit
 returning the cached handle to the pool, leaving stale state). This test makes
 the closure SELECT run on a live engine across multiple row commits.
 
-Guarded by an explicit `TEST_DB_URL` env var — when unset, the test is skipped at
-collection ([[feedback-local-db-smoke-fallback]]) so the CI/local matrix without
-a test DB doesn't fail.
+CI supplies `TEST_DB_URL` for a disposable Postgres 16 database bootstrapped from
+the canonical schema. When a local developer does not provide `TEST_DB_URL`, the
+test is skipped at collection ([[feedback-local-db-smoke-fallback]]).
 
 Scope: covers the three RFC-stated outcomes in one EventBridge-equivalent run:
 - row 1: 1st MB candidate already in DB → pre-check rejects → 2nd candidate adopted
@@ -34,18 +34,15 @@ _TEST_DB_URL = os.environ.get("TEST_DB_URL")
 
 pytestmark = pytest.mark.skipif(
     not _TEST_DB_URL,
-    reason="integration test requires TEST_DB_URL env var (Neon test branch)",
+    reason="integration test requires TEST_DB_URL env var (Postgres test database)",
 )
 
 
 @pytest.fixture(scope="module")
 def engine():
     eng = create_engine(_TEST_DB_URL, pool_pre_ping=True, future=True)
-    # Guard against Neon test-branch schema drift: BUG-13 added the partial
-    # UNIQUE on artists.musicbrainz_id in prod via shared_db migration, but
-    # the Neon test branch may not have been re-applied. When the column is
-    # absent the seed INSERT here would explode and fail CI with a misleading
-    # message that hides the schema-drift root cause.
+    # Make a non-canonical local TEST_DB_URL fail with an explicit schema-drift
+    # diagnostic. CI always loads the pinned canonical shared-db schema first.
     with eng.connect() as conn:
         has_column = conn.execute(
             text("""
@@ -59,8 +56,8 @@ def engine():
     if has_column is None:
         eng.dispose()
         pytest.skip(
-            "Neon test branch artists.musicbrainz_id 컬럼 부재 — shared_db 마이그레이션 "
-            "재적용 필요. 통합 테스트 자체는 정상이며 prod schema 와는 무관."
+            "test database artists.musicbrainz_id 컬럼 부재 — canonical schema "
+            "로드 또는 shared_db 마이그레이션 적용 필요."
         )
     yield eng
     eng.dispose()
@@ -83,13 +80,9 @@ def seed_rows(engine):
     Spotify IDs use a '#' prefix so they sort BEFORE every real base62
     Spotify ID ('0'–'9' / 'A'–'Z' / 'a'–'z') under C.UTF-8 collation
     ('#' = 0x23, '0' = 0x30). This guarantees the seeds land inside the
-    ``WHERE musicbrainz_id IS NULL ORDER BY spotify_id LIMIT 10`` window
-    even when the shared Neon test branch already contains hundreds of
-    real NULL-mbid rows.
-
-    Verified empirically on the Neon test branch with a BEGIN/ROLLBACK
-    probe (230 pre-existing NULL rows as of 2026-06-05): all 3 NULL-mbid
-    seeds appeared as rows 1-3 of the LIMIT 10 result.
+    ``WHERE musicbrainz_id IS NULL ORDER BY spotify_id LIMIT 10`` window. CI's
+    canonical database is deterministic; the ordering also protects local runs
+    pointed at a populated developer database.
     """
     pre_existing_mbid = "bug18-test-occupied-mbid-0001"
     # '#' prefix sorts before '0' in C.UTF-8 (byte 0x23 < 0x30), ensuring

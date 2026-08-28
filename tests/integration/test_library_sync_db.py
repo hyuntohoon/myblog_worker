@@ -5,11 +5,10 @@ Why this exists ([[feedback-sa-session-lifecycle-mock-blind]]): the unit tests u
 _FakeSession that emulates the dedup in Python, so they cannot catch that a bare
 ``ON CONFLICT (bucket_id, album_id)`` raises against V30's PARTIAL album index
 ("no unique or exclusion constraint matching the ON CONFLICT specification"). The fix
-replaced that with a schema-agnostic NOT-EXISTS guard; this test runs it on live Postgres.
+replaced that with a schema-agnostic NOT-EXISTS guard; this test runs it on real Postgres.
 
-Guarded by TEST_DB_URL; skipped when unset. Also skipped if the V30 partial index
-``uq_review_bucket_items_album`` isn't on the test branch yet (schema-drift guard,
-mirroring test_saved_tracks_sync_db.py — apply V30 to the test branch first).
+CI provides TEST_DB_URL, the pinned canonical schema, and a deterministic catalog album.
+A local run without TEST_DB_URL is skipped; the V30 probe diagnoses an older local schema.
 """
 from __future__ import annotations
 
@@ -26,7 +25,7 @@ _TEST_DB_URL = os.environ.get("TEST_DB_URL")
 
 pytestmark = pytest.mark.skipif(
     not _TEST_DB_URL,
-    reason="integration test requires TEST_DB_URL env var (Neon test branch)",
+    reason="integration test requires TEST_DB_URL env var (Postgres test database)",
 )
 
 
@@ -41,11 +40,11 @@ def factory():
     if not has_partial:
         eng.dispose()
         pytest.skip(
-            "uq_review_bucket_items_album partial index absent — apply V30 to the test branch first"
+            "uq_review_bucket_items_album partial index absent from test database"
         )
     if not has_albums:
         eng.dispose()
-        pytest.skip("no albums on the test branch to attach a bucket item to")
+        pytest.skip("no fixture album in test database to attach a bucket item to")
     yield sessionmaker(bind=eng, autoflush=False, autocommit=False, future=True)
     eng.dispose()
 
@@ -88,4 +87,4 @@ def test_insert_bucket_item_idempotent_against_partial_index(factory):
             ).scalar()
             assert count == 1, f"expected idempotent single insert, got {count}"
         finally:
-            tx.rollback()  # leave the test branch untouched
+            tx.rollback()  # leave the test database untouched

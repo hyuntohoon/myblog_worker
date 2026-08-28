@@ -1,13 +1,14 @@
 """FEAT-lyrics-corpus Step 1b integration test — exercises ISRC backfill against
-a REAL SQLAlchemy engine (Neon test branch).
+a real SQLAlchemy engine backed by CI's disposable Postgres 16 service.
 
 Why this exists ([[feedback-sa-session-lifecycle-mock-blind]]): the unit tests
 use mocks for Spotify API responses and never touch real SQL, so they can't catch
 a wrong UUID CAST, a broken batch update, or a sentinel handling error. This runs
 the real service on a live engine.
 
-Guarded by TEST_DB_URL; skipped when unset. Also skipped if the V34 table
-(Track.isrc column) isn't on the test branch yet (schema-drift guard).
+CI provides TEST_DB_URL and the pinned canonical schema. A local run without
+TEST_DB_URL is skipped; the V34 probe provides a clear diagnostic when a developer
+points the test at an older, non-canonical database.
 
 `test_isrc_backfill_txn_boundary_and_batch_isolation` is the FIX-bug-audit-2026-07
 WS-C H2 regression: it drives the service exactly as the handler now does (a session,
@@ -32,7 +33,7 @@ _TEST_DB_URL = os.environ.get("TEST_DB_URL")
 
 pytestmark = pytest.mark.skipif(
     not _TEST_DB_URL,
-    reason="integration test requires TEST_DB_URL env var (Neon test branch)",
+    reason="integration test requires TEST_DB_URL env var (Postgres test database)",
 )
 
 
@@ -51,7 +52,7 @@ def factory():
             )
         ).first()
         if not has_isrc:
-            pytest.skip("V34 (Track.isrc) not deployed to test branch yet")
+            pytest.skip("V34 (Track.isrc) missing from test database")
     return sessionmaker(bind=eng)
 
 

@@ -4,11 +4,11 @@ upsert/prune against a real SQLAlchemy engine.
 Why this exists ([[feedback-sa-session-lifecycle-mock-blind]]): the unit tests in
 tests/test_listening_sync.py use a fake session and never touch real SQL, so they
 can't catch a broken `ON CONFLICT`, a wrong `= ANY(:keep)` array binding, or a
-`CAST(... AS timestamptz)` failure. This runs the real service on a live engine.
+`CAST(... AS timestamptz)` failure. This runs the real service on real Postgres.
 
-Guarded by TEST_DB_URL (Neon test branch); skipped when unset
-([[feedback-local-db-smoke-fallback]]). Also skipped if the V9 tables aren't on the
-test branch yet (schema-drift guard, mirroring test_alias_fill_session_lifecycle).
+CI provides TEST_DB_URL and the pinned canonical schema. A local run without
+TEST_DB_URL is skipped ([[feedback-local-db-smoke-fallback]]); the V9 probe diagnoses
+an older local schema.
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ _TEST_DB_URL = os.environ.get("TEST_DB_URL")
 
 pytestmark = pytest.mark.skipif(
     not _TEST_DB_URL,
-    reason="integration test requires TEST_DB_URL env var (Neon test branch)",
+    reason="integration test requires TEST_DB_URL env var (Postgres test database)",
 )
 
 
@@ -47,7 +47,7 @@ def factory():
         ).first()
     if not present:
         eng.dispose()
-        pytest.skip("spotify_recent_albums not on test branch — apply migration V9 first")
+        pytest.skip("spotify_recent_albums missing from test database (V9)")
     yield sessionmaker(bind=eng, autoflush=False, autocommit=False, future=True)
     eng.dispose()
 
@@ -211,7 +211,7 @@ def test_play_events_append_idempotent(factory):
     idempotent via ON CONFLICT (album_id, played_at) DO NOTHING. Unit mocks can't see
     the real conflict semantics, so this exercises them on a live engine."""
     if not _table_exists(factory, "spotify_play_events"):
-        pytest.skip("spotify_play_events not on test branch — apply migration V10 first")
+        pytest.skip("spotify_play_events missing from test database (V10)")
 
     sid = f"itest_events_{uuid.uuid4().hex[:8]}"
     with factory() as s:
@@ -267,7 +267,7 @@ def test_recent_tracks_resolve_and_idempotent(factory):
     no-op via ON CONFLICT (spotify_track_id, played_at) DO NOTHING — unit mocks can't
     see the real conflict semantics, so this exercises them on a live engine."""
     if not _table_exists(factory, "spotify_recent_tracks"):
-        pytest.skip("spotify_recent_tracks not on test branch — apply migration V14 first")
+        pytest.skip("spotify_recent_tracks missing from test database (V14)")
 
     sid = f"itest_rt_alb_{uuid.uuid4().hex[:8]}"
     tid_known = f"itest_rt_k_{uuid.uuid4().hex[:8]}"
@@ -330,7 +330,7 @@ def test_recent_tracks_pruned_to_window(factory):
     (all with the newest timestamps) and assert the oldest of ours is pruned while
     the newest survives."""
     if not _table_exists(factory, "spotify_recent_tracks"):
-        pytest.skip("spotify_recent_tracks not on test branch — apply migration V14 first")
+        pytest.skip("spotify_recent_tracks missing from test database (V14)")
     from worker.service.listening_sync_service import RECENT_TRACKS_WINDOW
 
     run = uuid.uuid4().hex[:8]
@@ -397,7 +397,7 @@ def test_track_play_events_append_idempotent(factory):
     semantics or the tracks.spotify_id resolution, so this exercises them on a live
     engine ([[feedback-sa-session-lifecycle-mock-blind]])."""
     if not _table_exists(factory, "spotify_track_play_events"):
-        pytest.skip("spotify_track_play_events not on test branch — apply migration V19 first")
+        pytest.skip("spotify_track_play_events missing from test database (V19)")
 
     sid = f"itest_tpe_alb_{uuid.uuid4().hex[:8]}"
     tid_known = f"itest_tpe_k_{uuid.uuid4().hex[:8]}"     # catalog track → track_id resolves

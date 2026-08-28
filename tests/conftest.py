@@ -9,10 +9,12 @@ from sqlalchemy.orm import sessionmaker
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# Neon test branch URL is fetched from env. CI (GHA) injects via
-# `secrets.TEST_DB_URL`; local dev exports from AWS Secrets Manager:
-#   export TEST_DB_URL=$(aws secretsmanager get-secret-value \
-#     --secret-id myblog/test-db --query SecretString --output text \
+# DB-bound tests read their URL from the environment. CI uses its disposable
+# Postgres 16 service; local dev can export the shared test URL from the
+# SSM SecureString `/myblog/test-db`:
+#   export TEST_DB_URL=$(aws ssm get-parameter \
+#     --name /myblog/test-db --with-decryption \
+#     --query Parameter.Value --output text \
 #     | python3 -c "import sys,json; print(json.load(sys.stdin)['TEST_DB_URL'])")
 # When unset, DB-bound fixtures skip rather than fall back to a hardcoded URL
 # (BUG-16 Step 1 — removed plaintext credential from source).
@@ -23,7 +25,7 @@ TEST_DB_URL = os.environ.get("TEST_DB_URL")
 def db_engine():
     """전체 테스트에서 DB 엔진 하나만 생성."""
     if not TEST_DB_URL:
-        pytest.skip("TEST_DB_URL not set — see conftest.py for Secrets Manager fetch command")
+        pytest.skip("TEST_DB_URL not set — see conftest.py for the SSM /myblog/test-db command")
     engine = create_engine(TEST_DB_URL, pool_pre_ping=True, future=True)
     yield engine
     engine.dispose()
@@ -50,7 +52,7 @@ def db_session(db_bound_connection):
         # The service under test commits its own short transactions now
         # (FIX-worker-txn-across-http). Joining via SAVEPOINT keeps those commits
         # nested inside the fixture's outer transaction, so teardown still rolls
-        # the whole test back instead of leaving rows on the Neon test branch.
+        # the whole test back instead of leaving rows in the test database.
         join_transaction_mode="create_savepoint",
     )
     session = Session()

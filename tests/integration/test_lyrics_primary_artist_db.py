@@ -1,4 +1,4 @@
-"""Primary-artist ordering regression — REAL engine (Neon test branch).
+"""Primary-artist ordering regression — real engine on disposable Postgres 16.
 
 The LRCLIB search artist is ``artist_names[0]``. The selection queries used to build
 that array with ``ARRAY_AGG(DISTINCT a.name)``, which sorts ALPHABETICALLY, so on a
@@ -26,14 +26,11 @@ so a regression to either rule fails loudly rather than passing by luck.
 **Two tiers, deliberately.** The ordering rule lives in one shared SQL constant,
 ``PRIMARY_ARTIST_NAMES_LATERAL``, and the first tier exercises that constant directly —
 it needs only ``tracks`` / ``artists`` / ``track_artists`` / ``album_artists``, so it
-runs on the test branch as it exists today and is the real regression gate.
+runs against the pinned canonical schema and is the focused regression gate.
 
 The second tier drives the two selection queries end-to-end, which additionally requires
-``track_lyrics``. That table is NOT on the Neon test branch yet (the branch lags prod on
-the FEAT-lyrics-corpus migration), so those are guarded and will start running by
-themselves once the branch catches up — the same schema-drift guard style as
-``test_isrc_backfill_db.factory``'s V34 check. Do not delete the guard without checking
-the branch; do not assume tier 2 is protecting you today.
+``track_lyrics``. CI's canonical schema includes it, so both tiers run in the deploy gate;
+the probe remains as a clear diagnostic for local runs pointed at an older database.
 
 Guarded by TEST_DB_URL; skipped when unset.
 """
@@ -54,7 +51,7 @@ _TEST_DB_URL = os.environ.get("TEST_DB_URL")
 
 pytestmark = pytest.mark.skipif(
     not _TEST_DB_URL,
-    reason="integration test requires TEST_DB_URL env var (Neon test branch)",
+    reason="integration test requires TEST_DB_URL env var (Postgres test database)",
 )
 
 _PREFIX = "lyr_primary_"
@@ -76,7 +73,7 @@ def factory():
 
 @pytest.fixture(scope="module")
 def has_track_lyrics(factory):
-    """Schema-drift guard — track_lyrics is not on the test branch yet."""
+    """Diagnose a non-canonical local schema before the end-to-end tier runs."""
     with factory() as s:
         return s.execute(
             text(
@@ -239,7 +236,7 @@ def test_lateral_dedupes_by_name(factory):
 
 def test_incremental_selection_puts_the_album_artist_first(factory, has_track_lyrics):
     if not has_track_lyrics:
-        pytest.skip("track_lyrics not on the test branch yet (FEAT-lyrics-corpus migration)")
+        pytest.skip("track_lyrics missing from test database (FEAT-lyrics-corpus migration)")
     Session = factory
     try:
         with Session() as s:
@@ -260,7 +257,7 @@ def test_incremental_selection_puts_the_album_artist_first(factory, has_track_ly
 def test_reassessment_selection_uses_the_same_ordering(factory, has_track_lyrics):
     """The twin query must not drift from the incremental one."""
     if not has_track_lyrics:
-        pytest.skip("track_lyrics not on the test branch yet (FEAT-lyrics-corpus migration)")
+        pytest.skip("track_lyrics missing from test database (FEAT-lyrics-corpus migration)")
     Session = factory
     try:
         with Session() as s:

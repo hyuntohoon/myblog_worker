@@ -1,6 +1,6 @@
 # tests/test_sync_service.py
 """AlbumSyncService 통합 테스트.
-Spotify는 mock, DB는 Neon test 브랜치 실제 연동.
+Spotify는 mock, DB는 CI의 disposable Postgres 16 실제 연동.
 """
 import pytest
 from unittest.mock import patch, MagicMock
@@ -264,9 +264,8 @@ def test_sync_albums_batch_captures_disc_no(mock_spotify, db_connection, db_sess
 
 
 # --- FEAT-genre-system Step 2: ext_refs UPC capture + S1 inline mapping ------
-# Real-engine tests (Neon test branch carries V17 genres seed; per-test rollback).
-# Dedicated spotify ids — legacy committed rows under the shared fixture ids
-# could have photo_url set, which would skip the enrich path these tests drive.
+# Real-engine tests (the CI catalog fixture supplies the required genres; per-test rollback).
+# Dedicated Spotify ids ensure no catalog-fixture row can skip the enrich path these tests drive.
 
 def _genre_album(alb_sid: str, art_sid: str, *, with_upc: bool = True) -> dict:
     alb = {

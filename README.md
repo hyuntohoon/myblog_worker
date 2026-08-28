@@ -110,16 +110,17 @@ SpotifyUserClient (refresh token → access token, myblog/spotify 시크릿)
 
 ## 로컬 테스트
 
-DB 의존 픽스처는 `TEST_DB_URL` 환경 변수가 있을 때만 동작합니다 (없으면 자동 skip). 로컬에서 실행하려면 AWS Secrets Manager 에서 받아옵니다:
+DB 의존 픽스처는 `TEST_DB_URL` 환경 변수가 있을 때만 동작합니다 (없으면 자동 skip). 로컬에서 실행하려면 SSM SecureString `/myblog/test-db` 에서 JSON 값을 받아옵니다:
 
 ```bash
-export TEST_DB_URL=$(aws secretsmanager get-secret-value \
-  --secret-id myblog/test-db --query SecretString --output text \
+export TEST_DB_URL=$(aws ssm get-parameter \
+  --name /myblog/test-db --with-decryption \
+  --query Parameter.Value --output text \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['TEST_DB_URL'])")
 pytest tests/ -v
 ```
 
-CI 는 GitHub Actions `secrets.TEST_DB_URL` 로 주입합니다 (`.github/workflows/deploy.yml`).
+CI 는 `TEST_DB_URL` secret 을 사용하지 않습니다. GitHub Actions 가 disposable Postgres 16 service 를 띄우고, 정확히 pin 된 `myblog_shared_db` canonical schema 와 `tests/integration/fixtures/catalog.sql` 의 deterministic catalog fixture 를 적용한 뒤 전체 suite 를 실행합니다 (`.github/workflows/deploy.yml`).
 
 ---
 

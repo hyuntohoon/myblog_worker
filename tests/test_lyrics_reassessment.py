@@ -375,7 +375,7 @@ class TestScheduledSelectionSQL:
     """DATA-catalog-noise Step 3b — the scheduled queue drains the best-of backlog first.
 
     The selection is DB-only (stubbed everywhere else in this file), so these assert the
-    SQL text. A live-DB integration needs TEST_DB_URL — CI-only.
+    SQL text. Live-DB integration coverage runs in CI's disposable local Postgres gate.
     """
 
     def _sql_and_params(self, limit=10):
