@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from functools import lru_cache
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -153,3 +153,156 @@ class TestReleaseCalendarStep5Defaults:
         s = _make_settings(SECRETS_PARAM="")
         assert s.RELEASE_CONFIRM_DATE_PROXIMITY_DAYS == 7
         assert s.RELEASE_CONFIRM_LOOKBACK_DAYS == 90
+
+
+class TestRequiredSecretContract:
+    """The payload-based required-key contract (settings-loader sweep).
+
+    `TestGetSettings` above already covers "a required key is absent". These
+    cover the conditions the previous formulation — copy anything truthy across,
+    then check the RESOLVED settings with `if not v` — could not see. Each was
+    reproduced against that code, not inferred: `{"DATABASE_URL": "   "}` booted
+    with a whitespace DSN, and `{"SPOTIFY_CLIENT_ID": 12345}` booted with an
+    `int` sitting in a `str` field because this model does not set
+    `validate_assignment`.
+
+    The required SET is unchanged by this sweep — LASTFM_API_KEY and
+    GENIUS_ACCESS_TOKEN stay optional, and `test_optional_keys_*` is what keeps
+    them that way.
+    """
+
+    _DB = "postgresql+psycopg://u:pw@db.example/worker"
+    _CID = "spotify-client-id"
+    _CSECRET = "spotify-client-secret"
+
+    @property
+    def _full(self) -> dict:
+        return {
+            "DATABASE_URL": self._DB,
+            "SPOTIFY_CLIENT_ID": self._CID,
+            "SPOTIFY_CLIENT_SECRET": self._CSECRET,
+        }
+
+    def _call(self, secrets, *, param: str = "/myblog/worker", env: dict | None = None):
+        """get_settings() with the SSM load stubbed and the lru_cache cleared.
+
+        The required names are blanked in the environment so an exported shell
+        value cannot stand in for a key the payload is missing — the
+        substitution `test_env_var_cannot_mask_a_missing_key` pins. The optional
+        names are blanked for the same reason.
+        """
+        get_settings.cache_clear()
+        base = {
+            "SECRETS_PARAM": param,
+            "DATABASE_URL": "",
+            "SPOTIFY_CLIENT_ID": "",
+            "SPOTIFY_CLIENT_SECRET": "",
+            "LASTFM_API_KEY": "",
+            "GENIUS_ACCESS_TOKEN": "",
+        }
+        try:
+            with (
+                patch("worker.core.config._load_secrets", return_value=secrets),
+                patch.dict("os.environ", {**base, **(env or {})}, clear=False),
+            ):
+                return get_settings()
+        finally:
+            get_settings.cache_clear()
+
+    def test_env_var_cannot_mask_a_missing_key(self):
+        """A stale Lambda env var must not satisfy the contract.
+
+        Dormant today — `blogWorkerLambda` carries no such variable — which is
+        exactly why only a test keeps it that way.
+        """
+        with pytest.raises(ValueError, match="SPOTIFY_CLIENT_SECRET"):
+            self._call(
+                {"DATABASE_URL": self._DB, "SPOTIFY_CLIENT_ID": self._CID},
+                env={"SPOTIFY_CLIENT_SECRET": "from-the-env"},
+            )
+
+    @pytest.mark.parametrize("bad", ["", "   ", "\t\n", None, 123, 0, [], {}, True])
+    def test_unusable_required_value_counts_as_missing(self, bad):
+        """`null`, empty, whitespace-only and non-strings are all "absent".
+
+        The parameter is hand-edited JSON; each shape has a plausible way of
+        being written. `"   "` and `123` are the two the previous truthiness
+        check let through.
+        """
+        with pytest.raises(ValueError, match="SPOTIFY_CLIENT_ID"):
+            self._call({**self._full, "SPOTIFY_CLIENT_ID": bad})
+
+    def test_payload_that_is_valid_json_but_not_an_object_fails(self):
+        """`json.loads` succeeds on `"abc"` and `[1,2]`; `.get` would explode.
+
+        The failure must name the parameter, not surface as an AttributeError.
+        """
+        for payload in ("just-a-string", [1, 2], 7, None):
+            with pytest.raises(ValueError, match="/myblog/worker"):
+                self._call(payload)
+
+    def test_required_values_are_assigned_verbatim_and_never_stripped(self):
+        """Whitespace decides presence but must NOT be trimmed off the value.
+
+        "Normalize the config values" is a natural tidy-up and it breaks the
+        Spotify token mint: the client secret is sent byte-for-byte and a
+        trimmed one 400s the exchange, taking ingest, enrich and album-sync with
+        it. Without this, `secrets[k].strip()` passes every other test here.
+        """
+        padded = {
+            "DATABASE_URL": " postgresql+psycopg://u:pw@h/worker ",
+            "SPOTIFY_CLIENT_ID": "  cid-with-padding  ",
+            "SPOTIFY_CLIENT_SECRET": "\tcsecret-with-padding\t",
+        }
+        s = self._call(padded)
+        assert s.DATABASE_URL == padded["DATABASE_URL"]
+        assert s.SPOTIFY_CLIENT_ID == padded["SPOTIFY_CLIENT_ID"]
+        assert s.SPOTIFY_CLIENT_SECRET == padded["SPOTIFY_CLIENT_SECRET"]
+
+    @pytest.mark.parametrize("key", ["LASTFM_API_KEY", "GENIUS_ACCESS_TOKEN"])
+    def test_optional_keys_are_applied_when_present(self, key):
+        s = self._call({**self._full, key: "opt-value"})
+        assert getattr(s, key) == "opt-value"
+
+    @pytest.mark.parametrize("key", ["LASTFM_API_KEY", "GENIUS_ACCESS_TOKEN"])
+    @pytest.mark.parametrize("absent", [None, "", "   "])
+    def test_optional_keys_never_block_boot_and_are_warned_about(self, key, absent, caplog):
+        """This Lambda hosts many independent jobs.
+
+        Promoting either of these to required would take album ingest, artist
+        enrich, the release sweep and the SQS album-sync consumer down at import
+        time because one degradable integration is unconfigured. The WARNING is
+        the only signal the operator gets — the gated job otherwise no-ops in
+        silence.
+        """
+        payload = dict(self._full)
+        if absent is not None:
+            payload[key] = absent
+        with caplog.at_level(logging.WARNING, logger="worker.core.config"):
+            s = self._call(payload)
+        assert s.DATABASE_URL == self._DB, "a missing optional key must not stop boot"
+        assert getattr(s, key) == "", "an unusable optional value must not be stored"
+        assert key in caplog.text
+        assert "/myblog/worker" in caplog.text
+
+    def test_secret_values_never_reach_the_exception_or_the_logs(self, caplog):
+        """The error names the parameter and the KEYS. Never a value.
+
+        A config error is read off CloudWatch by whoever is paged; a value
+        pasted into it is a secret published to a log group with a different
+        audience than the parameter it came from.
+        """
+        leaked = "SUPERSECRET-DB-PASSWORD"
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(ValueError) as exc:
+                self._call({"DATABASE_URL": f"postgresql://u:{leaked}@h/worker"})
+        assert leaked not in str(exc.value)
+        assert leaked not in caplog.text
+        assert "SPOTIFY_CLIENT_ID" in str(exc.value)
+        assert "/myblog/worker" in str(exc.value)
+
+    def test_successful_boot_does_not_log_the_secret_values(self, caplog):
+        with caplog.at_level(logging.DEBUG):
+            self._call(self._full)
+        assert self._CSECRET not in caplog.text
+        assert "pw@db.example" not in caplog.text
