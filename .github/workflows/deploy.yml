@@ -53,6 +53,17 @@ jobs:
         with:
           python-version: "3.12"
 
+      # This job also holds SHARED_DB_PAT, so both halves of this step are pinned.
+      # The action pin alone is not enough: the action's real work is
+      # `docker run --privileged <image>`, and its default image is the mutable
+      # tag tonistiigi/binfmt:latest. A repush of that tag would get privileged
+      # execution on the runner one step before the PAT is written to ~/.gitconfig,
+      # so the image is pinned by digest too.
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        with:
+          platforms: arm64
+          image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+
       - name: Check out canonical shared-db schema
         uses: actions/checkout@v4
         with:
@@ -67,10 +78,54 @@ jobs:
           SHARED_DB_PAT: ${{ secrets.SHARED_DB_PAT }}
         run: git config --global url."https://${SHARED_DB_PAT}@github.com/".insteadOf "https://github.com/"
 
-      - name: Install dependencies
+      - name: Install lock compiler
+        run: python -m pip install uv==0.12.7
+
+      - name: Check dependency lock
+        run: ./scripts/check_requirements_lock.sh
+
+      - name: Verify repeatable arm64 Lambda bundle
         run: |
-          pip install -r requirements.txt
-          pip install -r requirements-test.txt
+          set -euo pipefail
+          TARGET_ONE="$(mktemp -d)"
+          TARGET_TWO="$(mktemp -d)"
+          trap 'rm -rf "$TARGET_ONE" "$TARGET_TWO"' EXIT
+          for target in "$TARGET_ONE" "$TARGET_TWO"; do
+            # --no-cache-dir is what makes this a reproducibility test rather than
+            # a tautology: myblog-shared-db is a git dependency, so pip builds it on
+            # the runner, and without this the second install is just handed the
+            # wheel the first one built -- leaving the one distribution actually
+            # produced here as the only one the check could not see.
+            python -m pip install --no-deps --no-cache-dir -r requirements.lock -t "$target" \
+              --platform manylinux2014_aarch64 \
+              --python-version 3.12 \
+              --implementation cp \
+              --abi cp312 \
+              --only-binary=:all:
+          done
+          python scripts/distribution_manifest.py "$TARGET_ONE" > /tmp/manifest-one.txt
+          python scripts/distribution_manifest.py "$TARGET_TWO" > /tmp/manifest-two.txt
+          diff -u /tmp/manifest-one.txt /tmp/manifest-two.txt
+          find "$TARGET_ONE" -name "__pycache__" -type d -exec rm -rf {} +
+          find "$TARGET_ONE" -name "*.pyc" -delete
+          cp -r worker "$TARGET_ONE"/
+          (cd "$TARGET_ONE" && python -m zipfile -c /tmp/worker-bundle.zip .)
+          test -s /tmp/worker-bundle.zip
+          docker run --rm --platform linux/arm64 \
+            -e ENV=local \
+            -e DATABASE_URL=postgresql+psycopg://x:x@localhost/x \
+            -e SPOTIFY_CLIENT_ID=test \
+            -e SPOTIFY_CLIENT_SECRET=test \
+            -v "${TARGET_ONE}:/var/task:ro" -w /var/task \
+            --entrypoint /bin/bash public.ecr.aws/lambda/python:3.12 \
+            -lc "python -c 'from worker.handler import lambda_handler; assert callable(lambda_handler)'"
+
+      # One invocation, matching backend and music: with two, the second pip
+      # run knows nothing about the lock and will happily upgrade a pinned
+      # package to satisfy a test dependency. In one run the == pins make that
+      # a hard ResolutionImpossible instead of a silent bump.
+      - name: Install dependencies
+        run: pip install -r requirements.lock -r requirements-test.txt
 
       - name: Load canonical schema and deterministic fixtures
         env:
@@ -186,8 +241,12 @@ jobs:
       - name: Build zip
         run: |
           mkdir -p build
-          pip install -r requirements.txt -t build \
-            --platform manylinux2014_aarch64 --only-binary=:all:
+          pip install --no-deps -r requirements.lock -t build \
+            --platform manylinux2014_aarch64 \
+            --python-version 3.12 \
+            --implementation cp \
+            --abi cp312 \
+            --only-binary=:all:
           cp -r worker build/
           find build -name "__pycache__" -exec rm -rf {} +
           find build -name "*.pyc" -delete
