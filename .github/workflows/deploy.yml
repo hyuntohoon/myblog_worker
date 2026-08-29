@@ -53,7 +53,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      - uses: docker/setup-qemu-action@v3
+      # Pinned to a commit: this job also holds SHARED_DB_PAT, and a mutable
+      # major tag on a third-party action is a writable edge next to it.
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.6.0
         with:
           platforms: arm64
 
@@ -94,6 +96,8 @@ jobs:
           python scripts/distribution_manifest.py "$TARGET_ONE" > /tmp/manifest-one.txt
           python scripts/distribution_manifest.py "$TARGET_TWO" > /tmp/manifest-two.txt
           diff -u /tmp/manifest-one.txt /tmp/manifest-two.txt
+          find "$TARGET_ONE" -name "__pycache__" -type d -exec rm -rf {} +
+          find "$TARGET_ONE" -name "*.pyc" -delete
           cp -r worker "$TARGET_ONE"/
           (cd "$TARGET_ONE" && python -m zipfile -c /tmp/worker-bundle.zip .)
           test -s /tmp/worker-bundle.zip
@@ -106,10 +110,12 @@ jobs:
             --entrypoint /bin/bash public.ecr.aws/lambda/python:3.12 \
             -lc "python -c 'from worker.handler import lambda_handler; assert callable(lambda_handler)'"
 
+      # One invocation, matching backend and music: with two, the second pip
+      # run knows nothing about the lock and will happily upgrade a pinned
+      # package to satisfy a test dependency. In one run the == pins make that
+      # a hard ResolutionImpossible instead of a silent bump.
       - name: Install dependencies
-        run: |
-          pip install -r requirements.lock
-          pip install -r requirements-test.txt
+        run: pip install -r requirements.lock -r requirements-test.txt
 
       - name: Load canonical schema and deterministic fixtures
         env:
