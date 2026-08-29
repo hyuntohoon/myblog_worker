@@ -4,7 +4,7 @@
 # flow and can only read the public catalog. The /me/player/* endpoints are tied
 # to a specific user account, so they require a user grant — minted once out-of-band
 # (scripts/spotify_bootstrap_token.py) and stored as a long-lived refresh token in
-# Secrets Manager myblog/spotify (RFC Q17). This client exchanges that refresh token
+# the SSM SecureString /myblog/spotify (RFC Q17). This client exchanges that refresh token
 # for short-lived access tokens on demand.
 #
 # Scopes: user-read-recently-played, user-read-currently-playing (listening reads),
@@ -116,23 +116,19 @@ def _request_with_retry(
 
 
 def _read_spotify_secret() -> Dict:
-    """Read the raw myblog/spotify JSON, preferring SSM Parameter Store
-    (SPOTIFY_SECRETS_PARAM) and falling back to Secrets Manager (SPOTIFY_SECRETS_ARN)
-    on unset-or-error (CHORE-secrets-ssm-migration). Caller handles the no-source case."""
+    """Read the raw /myblog/spotify JSON from SSM Parameter Store.
+
+    SSM is the only source (CHORE-secrets-ssm-migration). A read failure is
+    raised, never degraded to ``{}`` — see ``_load_spotify_creds``: masking a
+    credential-availability problem as "not configured" would silently no-op the
+    EventBridge tick instead of failing it into a retry. Caller handles the
+    no-source (SPOTIFY_SECRETS_PARAM unset) case.
+    """
     import boto3
 
-    param = settings.SPOTIFY_SECRETS_PARAM
-    arn = settings.SPOTIFY_SECRETS_ARN
-    if param:
-        try:
-            ssm = boto3.client("ssm", region_name=settings.AWS_DEFAULT_REGION)
-            return json.loads(ssm.get_parameter(Name=param, WithDecryption=True)["Parameter"]["Value"])
-        except Exception as e:
-            if not arn:
-                raise
-            logger.error("SSM spotify read failed for %s, falling back to Secrets Manager: %s", param, e)
-    sm = boto3.client("secretsmanager", region_name=settings.AWS_DEFAULT_REGION)
-    return json.loads(sm.get_secret_value(SecretId=arn)["SecretString"])
+    ssm = boto3.client("ssm", region_name=settings.AWS_DEFAULT_REGION)
+    raw = ssm.get_parameter(Name=settings.SPOTIFY_SECRETS_PARAM, WithDecryption=True)
+    return json.loads(raw["Parameter"]["Value"])
 
 
 def _load_spotify_creds() -> Dict[str, str]:
@@ -143,7 +139,7 @@ def _load_spotify_creds() -> Dict[str, str]:
         "client_secret": settings.SPOTIFY_CLIENT_SECRET,
         "refresh_token": settings.SPOTIFY_REFRESH_TOKEN,
     }
-    if settings.SPOTIFY_SECRETS_PARAM or settings.SPOTIFY_SECRETS_ARN:
+    if settings.SPOTIFY_SECRETS_PARAM:
         try:
             payload = _read_spotify_secret()
             for k in ("client_id", "client_secret", "refresh_token"):
@@ -171,7 +167,7 @@ def _is_invalid_grant(resp: "httpx.Response") -> bool:
 def _persist_token_state(
     *, rotated_refresh_token: Optional[str] = None, needs_reauth: bool = False
 ) -> None:
-    """Best-effort write-back of Spotify token state to Secrets Manager myblog/spotify (D30).
+    """Best-effort write-back of Spotify token state to SSM /myblog/spotify (D30).
 
     On a successful refresh: record ``last_successful_refresh_at`` (so the 연동 tab can
     show when the token last worked), clear any ``needs_reauth`` marker, and persist a
@@ -179,13 +175,12 @@ def _persist_token_state(
     ``needs_reauth`` so the connection status reflects token *validity*, not presence.
 
     Non-fatal: a write failure is logged (never the token value) and swallowed so a
-    transient Secrets Manager / IAM hiccup can't break listening sync. The caller has
-    already updated its in-memory creds, so a warm Lambda keeps using the live token.
+    transient SSM / IAM hiccup can't break listening sync. The caller has already
+    updated its in-memory creds, so a warm Lambda keeps using the live token.
     Reads-then-writes (like the bootstrap script) to preserve unrelated keys.
     """
     param = settings.SPOTIFY_SECRETS_PARAM
-    arn = settings.SPOTIFY_SECRETS_ARN
-    if not param and not arn:
+    if not param:
         return  # local/dev: token comes from env, nothing to write back
     try:
         import boto3
@@ -200,13 +195,8 @@ def _persist_token_state(
             if rotated_refresh_token and rotated_refresh_token != payload.get("refresh_token"):
                 payload["refresh_token"] = rotated_refresh_token
             payload["last_successful_refresh_at"] = datetime.now(timezone.utc).isoformat()
-        # Write back to whichever store is the active source (SSM-preferred).
-        if param:
-            ssm = boto3.client("ssm", region_name=settings.AWS_DEFAULT_REGION)
-            ssm.put_parameter(Name=param, Value=json.dumps(payload), Type="SecureString", Overwrite=True)
-        else:
-            sm = boto3.client("secretsmanager", region_name=settings.AWS_DEFAULT_REGION)
-            sm.put_secret_value(SecretId=arn, SecretString=json.dumps(payload))
+        ssm = boto3.client("ssm", region_name=settings.AWS_DEFAULT_REGION)
+        ssm.put_parameter(Name=param, Value=json.dumps(payload), Type="SecureString", Overwrite=True)
     except Exception as e:  # pragma: no cover - network/IAM failure path
         logger.error("Spotify token write-back failed (non-fatal): %s", e)
 
