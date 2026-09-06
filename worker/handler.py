@@ -313,7 +313,44 @@ def _run_album_ingest() -> None:
     run_album_ingest(SessionLocal, spotify, enqueue_album_sync)
 
 
+def _run_youtube_ref_refresh(limit: int | None = None) -> None:
+    """III.E.4 retention sweep + re-verification for stored YouTube mappings.
+
+    A COMPLIANCE MECHANISM, not a cache warmer. Two passes, expire first, so a
+    quota failure in the refresh can never postpone a deletion the policy
+    requires. Fails LOUDLY when the key is unconfigured rather than no-opping
+    quietly: a retention sweep that silently does nothing is the failure mode
+    the policy exists to prevent, and it would look identical to a healthy run.
+    """
+    from worker.clients.youtube_client import YouTubeNotConfigured, youtube
+    from worker.service.youtube_ref_refresh_service import run_youtube_ref_refresh
+
+    try:
+        run_youtube_ref_refresh(
+            SessionLocal,
+            youtube,
+            limit=limit if limit is not None else settings.YOUTUBE_REFRESH_BATCH_LIMIT,
+            retention_days=settings.YOUTUBE_RETENTION_DAYS,
+        )
+    except YouTubeNotConfigured:
+        logger.error(
+            "youtube_ref_refresh: YOUTUBE_API_KEY is unset — the retention sweep did "
+            "NOT run. Stored mappings will age past the III.E.4 30-day ceiling until "
+            "this is fixed."
+        )
+        raise
+
+
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    # EventBridge daily cron — YouTube mapping retention sweep + re-verification
+    # (FEAT-youtube-playback-provider Step A5). Constant input
+    # {"job": "youtube_ref_refresh"}, routed with the other job-keyed branches.
+    if event.get("job") == "youtube_ref_refresh":
+        limit = event.get("limit")  # None ⇒ settings.YOUTUBE_REFRESH_BATCH_LIMIT
+        logger.info("EventBridge trigger: running YouTube ref refresh (limit=%s)", limit)
+        _run_youtube_ref_refresh(limit=limit)
+        return {}
+
     # EventBridge 1h cron — Spotify listening cache sync. This rule's target sends a
     # constant input {"job": "spotify_listening"} (no "source"), so check job first.
     if event.get("job") == "spotify_listening":
