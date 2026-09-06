@@ -62,6 +62,30 @@ class Settings(BaseSettings):
     # rotated refresh token. SPOTIFY_REFRESH_TOKEN is an env fallback for local
     # dev / tests only.
     SPOTIFY_SECRETS_PARAM: str = ""
+
+    # YouTube Data API v3 (FEAT-youtube-playback-provider Step A5).
+    # `videos.list` ONLY — discovery (`search.list`, 100 units) lives in
+    # myblog_music and must not gain a second home. This job refreshes stored
+    # mappings inside the III.E.4 30-day window and deletes what it could not
+    # refresh.
+    #
+    # Its own SSM parameter, shared with music and backend — one key, one home,
+    # one rotation. Deliberately NOT in the required-key check: every other job
+    # in this Lambda must keep running when YouTube is unconfigured, and this
+    # job no-ops loudly on its own instead.
+    YOUTUBE_SECRETS_PARAM: str = ""
+    YOUTUBE_API_KEY: str = ""
+    YOUTUBE_API_BASE: str = "https://www.googleapis.com/youtube/v3"
+    YOUTUBE_HTTP_TIMEOUT: float = 8.0
+    # Rows examined per invocation. `videos.list` takes 50 ids per 1-unit call,
+    # so 500 rows is 10 units — the whole catalog would be ~618 calls per 30
+    # days (~21 units/day) if it were ever fully mapped. Bounded per invocation
+    # so one run cannot become unbounded work on a Lambda clock.
+    YOUTUBE_REFRESH_BATCH_LIMIT: int = 500
+    # III.E.4.c/.d. NOT a tuning knob: a larger value ships stored API data past
+    # the policy ceiling. The read path enforces the same number independently
+    # (myblog_backend PlaybackService), so both must move together if it ever does.
+    YOUTUBE_RETENTION_DAYS: int = 30
     SPOTIFY_REFRESH_TOKEN: str = ""
 
     # Per-user Spotify listening poll (FEAT-multi-user Phase 3b-d).
@@ -257,6 +281,19 @@ def get_settings() -> Settings:
                 f"Required secrets missing after SSM load: {missing}. "
                 f"Check the {s.SECRETS_PARAM} SecureString and the Lambda role's ssm:GetParameter policy."
             )
+    # Loaded separately and NOT required — see YOUTUBE_SECRETS_PARAM above. The
+    # failure is logged and swallowed, which is correct HERE and nowhere else in
+    # this function, because the fallback state is "the YouTube job refuses to
+    # run" rather than "some other job proceeds on a default".
+    if s.YOUTUBE_SECRETS_PARAM and not s.YOUTUBE_API_KEY:
+        try:
+            s.YOUTUBE_API_KEY = _load_secrets(s.YOUTUBE_SECRETS_PARAM).get("YOUTUBE_API_KEY", "")
+        except Exception:
+            logger.error(
+                "YouTube secret load failed for %s; the refresh job will refuse to run.",
+                s.YOUTUBE_SECRETS_PARAM,
+            )
+
     return s
 
 

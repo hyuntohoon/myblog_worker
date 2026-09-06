@@ -68,7 +68,18 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: hyuntohoon/myblog_shared_db
-          ref: 90a6fca4a0528a0ed37be3a514e86ad379373042
+          # FEAT-youtube-playback-provider Step A5: bumped to V56 so the test
+          # database has `track_provider_refs.created_by_member_id` and
+          # `embeddable NOT NULL`. WITHOUT THIS the A5 integration tests SKIP —
+          # they guard on the V56 columns — and a skip reads as green.
+          #
+          # NOTE this repo has TWO shared-db pins with DIFFERENT values: this
+          # one (the canonical SCHEMA loaded into the CI Postgres) and the
+          # installed PACKAGE in requirements.txt/.lock. The package pin is
+          # deliberately NOT bumped here: the A5 job uses raw SQL and imports no
+          # new model, so bumping the runtime ORM would be an unrelated deploy
+          # change riding along in a compliance PR.
+          ref: abcfadebaaeec482f619d46a59f1969bc19febab
           token: ${{ secrets.SHARED_DB_PAT }}
           persist-credentials: false
           path: shared-db-schema
