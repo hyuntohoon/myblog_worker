@@ -46,11 +46,16 @@ def engine():
                 )
             ).all()
         )
+    # FAIL, not skip. A skip for a schema problem reports the same green as a
+    # pass, and this repo's CI has a gate that exists precisely because of that
+    # ("Enforce zero DB-bound skips"). A wrong pin is the failure worth being
+    # told about, so say it directly rather than making the gate translate it.
     if "created_by_member_id" not in cols or cols.get("embeddable") != "NO":
         eng.dispose()
-        pytest.skip(
+        raise AssertionError(
             "track_provider_refs is not at V56 in this test database — the canonical "
-            "schema load or the shared-db pin predates it."
+            "schema load or the shared-db pin in .github/workflows/deploy.yml predates "
+            f"it. Columns seen: {sorted(cols)}"
         )
     yield eng
     eng.dispose()
@@ -63,20 +68,43 @@ def session_factory(engine):
 
 @pytest.fixture
 def seed(engine):
-    """Insert mapping rows against real tracks, and clean them up afterwards."""
+    """Insert a track AND its mapping row, and clean both up afterwards.
+
+    IT CREATES ITS OWN TRACK rather than borrowing one from the ambient catalog.
+    The first version did `SELECT id FROM tracks … LIMIT 1` and skipped when that
+    returned nothing — and CI's fixture (`tests/integration/fixtures/catalog.sql`)
+    seeds albums and genres but **no tracks at all**, so every test here skipped.
+    The repo's "Enforce zero DB-bound skips" gate caught it, which is exactly
+    what that gate is for: a suite that skips reports the same green as a suite
+    that passes.
+
+    A test that depends on rows it did not create is a test that reports
+    "skipped" for an environment problem and "passed" for a code problem, and
+    cannot tell you which it saw.
+    """
     created = []
+    album_id = uuid.uuid4()
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO albums (id, title, spotify_id) "
+                "VALUES (:a, 'A5 fixture album', :s)"
+            ),
+            {"a": album_id, "s": _TAG + uuid.uuid4().hex[:12]},
+        )
 
     def _insert(*, age_days, verify_state="live", video_id=None, embeddable=True):
         vid = video_id or (_TAG + uuid.uuid4().hex[:8])
+        track_id = uuid.uuid4()
         with engine.begin() as conn:
-            track_id = conn.execute(
+            conn.execute(
                 text(
-                    "SELECT id FROM tracks WHERE id NOT IN "
-                    "(SELECT track_id FROM track_provider_refs) LIMIT 1"
-                )
-            ).scalar_one_or_none()
-            if track_id is None:
-                pytest.skip("no unmapped track available in the test database")
+                    "INSERT INTO tracks (id, album_id, title, spotify_id) "
+                    "VALUES (:t, :a, 'A5 fixture track', :s)"
+                ),
+                {"t": track_id, "a": album_id, "s": _TAG + uuid.uuid4().hex[:12]},
+            )
             conn.execute(
                 text(
                     "INSERT INTO track_provider_refs "
@@ -96,6 +124,10 @@ def seed(engine):
         conn.execute(
             text("DELETE FROM track_provider_refs WHERE external_id LIKE :p"),
             {"p": _TAG + "%"},
+        )
+        # tracks cascade from albums, so one DELETE clears both.
+        conn.execute(
+            text("DELETE FROM albums WHERE spotify_id LIKE :p"), {"p": _TAG + "%"}
         )
 
 
