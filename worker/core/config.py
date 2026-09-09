@@ -212,6 +212,43 @@ class Settings(BaseSettings):
     # timeout is minutes) while still letting a human re-fire the same album within the hour.
     LYRICS_EXPEDITE_COOLDOWN_SEC: float = 600.0
 
+    # Targeted source collection for V57 album demand (FEAT-lyrics-listening-experience
+    # Step 3). Same shared eval loop as the two corpus jobs, so the limit/concurrency/budget
+    # knobs mirror theirs; what differs is the selection (demanded albums, both the
+    # never-evaluated and the parked arm) and the write-back into lyrics_album_tracks.
+    LYRICS_DEMAND_BATCH_LIMIT: int = 150
+    LYRICS_DEMAND_JOB_LIMIT: int = 50
+    LYRICS_DEMAND_CONCURRENCY: int = 20
+    LYRICS_DEMAND_TIME_BUDGET_SEC: float = 80.0
+    # Whole-invocation ceiling. LYRICS_DEMAND_TIME_BUDGET_SEC bounds only the LRCLIB loop;
+    # this job also runs a catalog pass before it and a V57 write-back after it, both of
+    # which are per-row-committed round trips to a remote database. 100s leaves headroom
+    # inside the 120s Lambda timeout for the phases to hand over cleanly, and per-row
+    # commits make an over-budget run resumable rather than lossy.
+    LYRICS_DEMAND_TOTAL_BUDGET_SEC: float = 100.0
+
+    # OQ5 backoff ladder (owner-approved 2026-09-09): min(cap, max(base, 2 x previous)).
+    # Applied ONLY when an evaluation actually completed and came back unresolved; a
+    # transient LRCLIB failure writes nothing at all, so an outage cannot push waiting
+    # demand out to the cap. There is no attempt ceiling and no attempts column — demand is
+    # never discarded on a failure count, it only re-checks more slowly.
+    #
+    # 6h base: fast enough that an album demanded today is re-checked several times while
+    # the member still remembers asking. 30d cap: the one interval this codebase already
+    # justifies (LYRICS_BESTOF_RECHECK_INTERVAL_DAYS) with the reason that applies here
+    # too — LRCLIB coverage is what changes, and it changes slowly. Note the cap is still
+    # MORE aggressive than the status quo: the global unresolved pass cycles a given row
+    # only every ~2-3 months (eventbridge.tf), so demanded albums strictly gain.
+    LYRICS_DEMAND_SOURCE_RETRY_BASE_SEC: float = 21_600.0     # 6 hours
+    LYRICS_DEMAND_SOURCE_RETRY_CAP_SEC: float = 2_592_000.0   # 30 days
+
+    # Catalog resolution ladder — a different failure with a different time constant. An
+    # album missing from the catalog is waiting on album ingest, which resolves in hours,
+    # not on third-party lyric coverage. Retrying it on the 30-day ladder would strand a
+    # demanded album that became ingestable the same afternoon.
+    LYRICS_DEMAND_CATALOG_RETRY_BASE_SEC: float = 900.0       # 15 minutes
+    LYRICS_DEMAND_CATALOG_RETRY_CAP_SEC: float = 86_400.0     # 24 hours
+
     # ISRC backfill (FEAT-lyrics-corpus Step 1b, worker EventBridge job). Bounded like every
     # other scheduled job so a run always finishes inside the 120s Lambda timeout: 500 tracks
     # is 10 Spotify chunks of 50, and the budget stops the loop rather than letting a 429

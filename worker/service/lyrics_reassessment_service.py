@@ -118,6 +118,9 @@ class LyricsReassessmentService:
         # that the matcher's `ON CONFLICT ... evidence = EXCLUDED.evidence` overwrote.
         exclusions = sync_exclusions(self.session)
         tracks = self._fetch_unresolved_tracks(limit)
+        # `_fetch_unresolved_tracks` opens a read transaction. Release it before
+        # `run_eval_batch` starts the external LRCLIB loop.
+        self.session.commit()
         metrics = run_eval_batch(
             self.session, tracks,
             concurrency=self.concurrency,
@@ -167,6 +170,8 @@ class LyricsReassessmentService:
             cooldown_sec if cooldown_sec is not None else settings.LYRICS_EXPEDITE_COOLDOWN_SEC
         )
         tracks = self._fetch_album_tracks(album_id, limit, cooldown_sec)
+        # As above, do not leave the selection transaction open across LRCLIB.
+        self.session.commit()
         metrics = run_eval_batch(
             self.session, tracks,
             concurrency=self.concurrency,

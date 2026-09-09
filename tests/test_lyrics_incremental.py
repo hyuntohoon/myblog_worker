@@ -145,7 +145,9 @@ def test_matched_track_is_written_per_row():
     assert metrics[STATUS_MATCHED] == 1
     # per-row commit: gate re-check SELECT + writer INSERT, one commit
     assert session.execute.call_count == 2
-    assert session.commit.call_count == 1
+    # One commit closes the materialized-selection transaction before LRCLIB;
+    # the other persists this row's outcome.
+    assert session.commit.call_count == 2
 
 
 def test_no_candidate_writes_not_found_sentinel():
@@ -360,7 +362,9 @@ def test_race_lost_row_is_guard_kept_not_overwritten():
     metrics = svc.collect()
     assert metrics["guard_kept"] == 1
     assert metrics["evaluated"] == 0
-    assert session.commit.call_count == 0  # nothing written
+    # One commit closes the materialized selection and another closes the guard
+    # query, because no writer commit follows a lost race.
+    assert session.commit.call_count == 2
 
 
 def test_stray_best_of_without_promotion_block_is_refused():
