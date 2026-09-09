@@ -253,6 +253,45 @@ def test_never_evaluated_album_is_invisible_to_the_expedite_but_covered_here(wor
     assert metrics["demand"]["source_ready"] >= 1
 
 
+def test_already_parked_track_is_classified_even_though_the_guard_keeps_its_row(
+    world, factory
+):
+    """A track the replacement guard protects was still EVALUATED, and must be classified.
+
+    This is the case the rest of the suite misses: every other track starts with no
+    `track_lyrics` row, so `_write_gate` takes the first-fetch branch and `should_replace`
+    is never consulted. Here the row already exists as `no_lyrics` — the commonest real
+    shape, an interlude the global collector reached first — so `should_replace` returns
+    False (not unresolved, and the new outcome is not a stronger `matched`) and
+    `run_eval_batch` writes nothing.
+
+    Without `touch_on_guard_kept`, `updated_at` would not move, the write-back would read
+    the row as "not evaluated this run", and the track would keep `next_attempt_at IS NULL`
+    — re-selected every 15 minutes forever, sorted to the HEAD of the queue by
+    `ORDER BY next_attempt_at NULLS FIRST`, with its album unable to ever reach `done`.
+    """
+    with factory() as s, s.begin():
+        s.execute(text(
+            "INSERT INTO track_lyrics (track_id, match_status, lyric_plain) "
+            "VALUES (:t, 'no_lyrics', '')"), {"t": world["Track Instrumental"]})
+
+    client = _client_all_outcomes()
+    metrics = _run(factory, client)
+
+    assert "Track Instrumental" in client.seen          # it WAS re-checked
+    assert metrics["guard_kept"] >= 1                   # and deliberately not rewritten
+    row = _tracks(factory, world["job"])["Track Instrumental"]
+    assert row["source_state"] == "not_required", (
+        "a guard-kept evaluation must still reach the demand side"
+    )
+    assert row["last_reason"] == "no_lyrics"
+
+    # And it is genuinely out of the queue, not merely relabelled.
+    again = _FakeClient({})
+    _run(factory, again)
+    assert "Track Instrumental" not in again.seen
+
+
 def test_second_pass_skips_everything_it_already_settled(world, factory):
     """Idempotence: a re-fire must not re-spend LRCLIB on settled or not-yet-due rows."""
     _run(factory, _client_all_outcomes())

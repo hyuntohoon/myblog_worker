@@ -46,6 +46,7 @@ resumable. RFC: ``docs/rfcs/FEAT-lyrics-listening-experience.md`` (Step 3, OQ5).
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -106,6 +107,16 @@ def next_attempt(
 
     The caller passes the DATABASE's ``now()`` so the gap it encodes is exact rather than
     skewed by the Lambda's clock.
+
+    **The encoding is exact for `lyrics_album_tracks` and only approximate for
+    `lyrics_album_jobs`.** Every writer of a track row (`set_source_state`, `ensure_work`)
+    writes both columns together. A job row does not have that property: `add_demand` and
+    `remove_origin` both bump `updated_at` alone, so a second member saving the album
+    between two catalog attempts makes the recovered gap negative and the ladder restarts
+    at ``base``. That is why the clamps are not merely defensive — they are what keeps this
+    safe. Restarting a 15m-base catalog ladder is a cheap, self-correcting outcome; do not
+    reuse this encoding for a ladder where an early retry would be expensive without first
+    checking every writer of its ``updated_at``.
     """
     if previous_gap is None or previous_gap.total_seconds() <= 0:
         gap = base_sec
@@ -156,7 +167,16 @@ class LyricsDemandSourceService:
         limit = limit or settings.LYRICS_DEMAND_BATCH_LIMIT
         job_limit = job_limit or settings.LYRICS_DEMAND_JOB_LIMIT
 
-        catalog = self._resolve_due_catalogs(job_limit)
+        # `time_budget_sec` bounds the LRCLIB loop only. The catalog pass before it and the
+        # write-back after it are both per-row-committed round trips to a remote database
+        # (~15-20ms each against Neon), so at the configured limits they are worth tens of
+        # seconds on their own — enough for the three phases together to exceed the 120s
+        # Lambda timeout even though each is individually "bounded". This deadline covers
+        # the whole invocation; per-row commits mean stopping early simply leaves the
+        # remainder for the next tick.
+        deadline = time.monotonic() + settings.LYRICS_DEMAND_TOTAL_BUDGET_SEC
+
+        catalog = self._resolve_due_catalogs(job_limit, deadline)
 
         # Materialize the whole selection BEFORE the slow LRCLIB loop; the snapshot's
         # work_id/source_revision are what the write-back validates against, so an
@@ -184,17 +204,30 @@ class LyricsDemandSourceService:
             self.session,
             tracks,
             concurrency=self.concurrency,
-            time_budget_sec=self.time_budget_sec,
+            time_budget_sec=min(
+                self.time_budget_sec, max(0.0, deadline - time.monotonic())
+            ),
             client=self._client,
             should_write=self._write_gate,
+            # Load-bearing here, exactly as `TrackLyricsWriter.touch` describes. A track the
+            # replacement guard protects WAS evaluated — we spent the LRCLIB call — but
+            # nothing is written, so without this its `updated_at` never moves. The
+            # write-back below uses that timestamp to decide whether this run produced
+            # evidence, so an untouched guard-kept row would be read as "not evaluated",
+            # never get a `next_attempt_at`, and be re-selected every 15 minutes forever —
+            # while `ORDER BY next_attempt_at NULLS FIRST` sorts it to the head of the
+            # queue. The commonest case is an interlude already parked as `no_lyrics`:
+            # `should_replace` refuses to rewrite it, so it would pin the queue and its
+            # album could never reach `done`.
+            touch_on_guard_kept=True,
             log_prefix="Lyrics demand source",
         )
         metrics["catalog"] = catalog
-        metrics["demand"] = self._record_source_outcomes(tracks, run_started_at)
+        metrics["demand"] = self._record_source_outcomes(tracks, run_started_at, deadline)
         return metrics
 
     # ── catalog resolution ─────────────────────────────────────────────────────────────
-    def _resolve_due_catalogs(self, job_limit: int) -> Dict[str, int]:
+    def _resolve_due_catalogs(self, job_limit: int, deadline: float) -> Dict[str, int]:
         """Attach the catalog album + its track list to due jobs, one short txn each.
 
         ``set_catalog`` validates the provider identity and the track membership itself and
@@ -204,7 +237,8 @@ class LyricsDemandSourceService:
         less stays incomplete and is retried, which is what stops a half-ingested album
         from ever reporting done.
         """
-        counts = {"resolved": 0, "complete": 0, "deferred": 0, "stale": 0}
+        counts = {"resolved": 0, "complete": 0, "partial": 0, "deferred": 0,
+                  "stale": 0, "stuck": 0, "over_budget": 0}
         rows = self.session.execute(
             text(
                 f"""
@@ -223,6 +257,9 @@ class LyricsDemandSourceService:
             return counts
 
         for job in [dict(r) for r in rows]:
+            if time.monotonic() >= deadline:
+                counts["over_budget"] = counts.get("over_budget", 0) + 1
+                continue
             try:
                 self._resolve_one_catalog(job, counts)
                 self.session.commit()
@@ -231,12 +268,40 @@ class LyricsDemandSourceService:
                 counts["stale"] += 1
             except Exception:  # noqa: BLE001 — one bad job must not sink the batch
                 self.session.rollback()
-                counts["deferred"] += 1
                 logger.exception(
                     "Lyrics demand source: catalog resolution failed for job %s", job["id"]
                 )
+                # The rollback discarded any deferral this attempt had written, so the job
+                # would keep `next_attempt_at = NULL` and — under `ORDER BY next_attempt_at
+                # NULLS FIRST` — sit at the head of every 15-minute batch forever. A
+                # deterministic failure (a Spotify id that no longer matches the catalog
+                # album, say) would then crowd out every other job. Defer it in a FRESH
+                # transaction so the failure is paced like any other.
+                self._defer_after_failure(job, counts)
         logger.info("Lyrics demand source: catalog %s", counts)
         return counts
+
+    def _defer_after_failure(self, job: Dict[str, Any], counts: Dict[str, int]) -> None:
+        """Pace a job whose resolution raised, in its own transaction. Best effort: if even
+        this fails the job simply stays due, which is the pre-existing behaviour."""
+        try:
+            now = self.session.execute(text("SELECT now() AS now")).scalar_one()
+            LyricsDemandStore(self.session.connection()).defer_catalog(
+                job["id"], "catalog_resolution_failed",
+                next_attempt(
+                    now, _previous_gap(job),
+                    base_sec=settings.LYRICS_DEMAND_CATALOG_RETRY_BASE_SEC,
+                    cap_sec=settings.LYRICS_DEMAND_CATALOG_RETRY_CAP_SEC,
+                ),
+            )
+            self.session.commit()
+            counts["deferred"] += 1
+        except Exception:  # noqa: BLE001
+            self.session.rollback()
+            counts["stuck"] += 1
+            logger.exception(
+                "Lyrics demand source: could not defer failed job %s", job["id"]
+            )
 
     def _resolve_one_catalog(self, job: Dict[str, Any], counts: Dict[str, int]) -> None:
         store = LyricsDemandStore(self.session.connection())
@@ -291,6 +356,7 @@ class LyricsDemandSourceService:
         if complete:
             counts["complete"] += 1
         else:
+            counts["partial"] += 1
             # Enumeration is attached but partial: schedule the re-check explicitly, since
             # set_catalog clears next_attempt_at on success.
             store.defer_catalog(
@@ -379,7 +445,7 @@ class LyricsDemandSourceService:
 
     # ── write-back ─────────────────────────────────────────────────────────────────────
     def _record_source_outcomes(
-        self, tracks: List[Dict[str, Any]], run_started_at: datetime
+        self, tracks: List[Dict[str, Any]], run_started_at: datetime, deadline: float
     ) -> Dict[str, int]:
         """Translate each evaluated track's resulting corpus state into V57 source state.
 
@@ -405,12 +471,18 @@ class LyricsDemandSourceService:
         """
         counts = {
             "not_required": 0, "backoff": 0, "source_ready": 0,
-            "unevaluated": 0, "stale": 0,
+            "unevaluated": 0, "stale": 0, "over_budget": 0,
         }
         if not tracks:
             return counts
 
         for row in tracks:
+            if time.monotonic() >= deadline:
+                # The evaluation is already committed to track_lyrics; only the V57
+                # classification is deferred, and the row stays due so the next tick
+                # re-selects it. Losing the run marker just means it re-evaluates.
+                counts["over_budget"] += 1
+                continue
             try:
                 self._record_one(row, counts, run_started_at)
                 self.session.commit()

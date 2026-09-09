@@ -220,6 +220,12 @@ class Settings(BaseSettings):
     LYRICS_DEMAND_JOB_LIMIT: int = 50
     LYRICS_DEMAND_CONCURRENCY: int = 20
     LYRICS_DEMAND_TIME_BUDGET_SEC: float = 80.0
+    # Whole-invocation ceiling. LYRICS_DEMAND_TIME_BUDGET_SEC bounds only the LRCLIB loop;
+    # this job also runs a catalog pass before it and a V57 write-back after it, both of
+    # which are per-row-committed round trips to a remote database. 100s leaves headroom
+    # inside the 120s Lambda timeout for the phases to hand over cleanly, and per-row
+    # commits make an over-budget run resumable rather than lossy.
+    LYRICS_DEMAND_TOTAL_BUDGET_SEC: float = 100.0
 
     # OQ5 backoff ladder (owner-approved 2026-09-09): min(cap, max(base, 2 x previous)).
     # Applied ONLY when an evaluation actually completed and came back unresolved; a
