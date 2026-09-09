@@ -65,6 +65,10 @@ class LyricsIncrementalService:
         # Materialize the selection up front, before the slow LRCLIB loop
         # (reference-db-session-across-long-external-loop).
         tracks = self._fetch_uncorpused_tracks(limit)
+        # The selection starts a read transaction. Close it before submitting the
+        # external LRCLIB calls so the connection cannot sit idle in transaction
+        # for the lifetime of the batch.
+        self.session.commit()
         return run_eval_batch(
             self.session, tracks,
             concurrency=self.concurrency,
@@ -86,7 +90,13 @@ class LyricsIncrementalService:
             text("SELECT 1 FROM track_lyrics WHERE track_id = :tid"),
             {"tid": row["id"]},
         ).first()
-        return exists is None
+        if exists is None:
+            return True
+        # A lost race does not write an outcome, so `run_eval_batch` will continue
+        # without its normal per-row writer commit. Close this guard query's read
+        # transaction before a later row can make another external LRCLIB call.
+        self.session.commit()
+        return False
 
     def _fetch_uncorpused_tracks(self, limit: int) -> List[Dict[str, Any]]:
         """Recently-added tracks lacking a ``track_lyrics`` row, with artist names + aliases.
