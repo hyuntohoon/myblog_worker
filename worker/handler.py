@@ -293,6 +293,26 @@ def _run_lyrics_reassessment(
         logger.info("Lyrics reassessment metrics: %s", metrics)
 
 
+def _run_lyrics_demand_source(
+    limit: int | None = None, job_limit: int | None = None
+) -> None:
+    """Targeted source collection for V57 album demand (FEAT-lyrics-listening-experience
+    Step 3). Resolves due album catalogs, then evaluates the demanded albums' tracks —
+    BOTH the never-evaluated ones (which the album expedite cannot select) and the parked
+    ones — through the same canonical matcher and replacement guard, and records the result
+    as V57 source state so waiting demand advances with no second manual request.
+
+    Does not create demand: the automatic producers are Steps 4/5. This job only serves
+    demand that already exists, and it stops serving an album whose last member removed it.
+    Separate invocation from album sync and bounded to the 120s Lambda."""
+    from worker.service.lyrics_demand_source_service import LyricsDemandSourceService
+
+    with SessionLocal() as session:
+        svc = LyricsDemandSourceService(session)
+        metrics = svc.collect(limit=limit, job_limit=job_limit)
+        logger.info("Lyrics demand source metrics: %s", metrics)
+
+
 def _run_alias_generation() -> None:
     """Called by the EventBridge scheduled trigger (not the SQS sync path)."""
     try:
@@ -442,6 +462,19 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         )
         return {}
 
+    # EventBridge/SQS trigger — targeted source collection for V57 album demand
+    # (FEAT-lyrics-listening-experience Step 3). Constant input
+    # {"job":"lyrics_demand_source"}; optional "limit"/"job_limit" override the settings.
+    # Serves existing demand only — it never creates any (Steps 4/5 own the producers).
+    if event.get("job") == "lyrics_demand_source":
+        limit, job_limit = event.get("limit"), event.get("job_limit")
+        logger.info(
+            "EventBridge/SQS trigger: running lyrics demand source collection "
+            "(limit=%s, job_limit=%s)", limit, job_limit,
+        )
+        _run_lyrics_demand_source(limit=limit, job_limit=job_limit)
+        return {}
+
     # EventBridge cron — per-user Last.fm recent-tracks poll (constant input, no
     # "source"; FEAT-multi-user Phase 3a). Routed before the alias source check.
     if event.get("job") == "lastfm_recent_tracks":
@@ -538,6 +571,15 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     limit=body.get("limit"),
                     album_id=body.get("album_id"),
                     cooldown_sec=body.get("cooldown_sec"),
+                )
+                continue
+
+            if body.get("job") == "lyrics_demand_source":
+                # Manual blogSQS nudge for Step 3, mirroring the EventBridge branch above.
+                # An SQS-delivered message arrives wrapped in Records, so it needs its own
+                # route here or the documented one-message fire path silently does nothing.
+                _run_lyrics_demand_source(
+                    limit=body.get("limit"), job_limit=body.get("job_limit")
                 )
                 continue
 
