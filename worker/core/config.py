@@ -249,6 +249,15 @@ class Settings(BaseSettings):
     LYRICS_DEMAND_CATALOG_RETRY_BASE_SEC: float = 900.0       # 15 minutes
     LYRICS_DEMAND_CATALOG_RETRY_CAP_SEC: float = 86_400.0     # 24 hours
 
+    # FEAT-lyrics-listening-experience Step 4 — the automatic demand producers. Read from
+    # the worker's OWN settings and never from an SQS message, so a stray or replayed
+    # message cannot switch production on. Default TRUE: Step 4's whole purpose is that
+    # member saved albums and recent listening start creating demand without owner action,
+    # and shipping it dormant would need a Terraform apply (which the workspace does not do
+    # automatically) before the step delivered anything. Rollback is the standard revert of
+    # the squash commit; this env var is the faster override if the owner wants one.
+    LYRICS_MEMBER_DEMAND_ENABLED: bool = True
+
     # ISRC backfill (FEAT-lyrics-corpus Step 1b, worker EventBridge job). Bounded like every
     # other scheduled job so a run always finishes inside the 120s Lambda timeout: 500 tracks
     # is 10 Spotify chunks of 50, and the budget stops the loop rather than letting a 429

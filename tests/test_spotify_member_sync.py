@@ -168,9 +168,21 @@ class _FakeClient:
 
 
 def _run(session, client, kms, **kw):
+    # demand_enabled defaults OFF here: these tests are about the LISTENING poll, and
+    # the Step 4 producer they would otherwise drag in needs a real store (its SQL is
+    # invisible to _FakeSession, which is the whole reason the producer is covered by
+    # tests/integration/test_lyrics_member_demand_db.py against real Postgres instead).
+    # Passing it explicitly also keeps these assertions honest: a demand failure here
+    # would be swallowed into demand_failed rather than failing a test.
+    kw.setdefault("demand_enabled", False)
     return run_spotify_member_sync(
         lambda: session, client, kms=kms, kms_key_id=kw.pop("kms_key_id", "key-123"), **kw
     )
+
+
+# Every pass now reports the Step 4 demand counters alongside the listening ones; with
+# the producer off they are all zero.
+_NO_DEMAND = {"saved_added": 0, "saved_removed": 0, "recent_albums": 0, "demand_failed": 0}
 
 
 class TestSpotifyMemberSync:
@@ -180,7 +192,7 @@ class TestSpotifyMemberSync:
         kms = _FakeKms()
         client = _FakeClient(player=_player_state(), recent=[_recent_item()])
         res = _run(session, client, kms)
-        assert res == {"users": 1, "recent": 1, "reauth": 0, "skipped": 0}
+        assert res == {"users": 1, "recent": 1, "reauth": 0, "skipped": 0, **_NO_DEMAND}
         # decrypt received the b64-decoded envelope
         assert kms.decrypt_calls == [b"kms-envelope-blob"]
         assert client.refresh_calls == [REFRESH_TOKEN]
@@ -201,7 +213,7 @@ class TestSpotifyMemberSync:
         kms = _FakeKms()
         client = _FakeClient(refresh_exc=SpotifyInvalidGrant("invalid_grant"))
         res = _run(session, client, kms)
-        assert res == {"users": 0, "recent": 0, "reauth": 1, "skipped": 0}
+        assert res == {"users": 0, "recent": 0, "reauth": 1, "skipped": 0, **_NO_DEMAND}
         upd = session.sql_of(lambda s: "status = 'reauth'" in s)
         assert upd and upd[0][1] == {"user_id": uid}
         # payload kept: no payload UPDATE, no KMS Encrypt, no player reads
@@ -215,7 +227,7 @@ class TestSpotifyMemberSync:
         kms = _FakeKms(fail_decrypt=True)
         client = _FakeClient()
         res = _run(session, client, kms)
-        assert res == {"users": 0, "recent": 0, "reauth": 0, "skipped": 1}
+        assert res == {"users": 0, "recent": 0, "reauth": 0, "skipped": 1, **_NO_DEMAND}
         assert client.refresh_calls == []
         assert not session.sql_of(lambda s: "UPDATE user_integrations" in s)
 
@@ -257,7 +269,7 @@ class TestSpotifyMemberSync:
             player=_player_state(), recent=[_recent_item()],
         )
         res = _run(session, client, kms)
-        assert res == {"users": 1, "recent": 1, "reauth": 0, "skipped": 0}
+        assert res == {"users": 1, "recent": 1, "reauth": 0, "skipped": 0, **_NO_DEMAND}
         assert not session.sql_of(lambda s: "SET payload" in s)  # old row untouched
         assert session.sql_of(lambda s: "INSERT INTO spotify_member_now_playing" in s)
 
@@ -311,12 +323,12 @@ class TestSpotifyMemberSync:
                 return [_recent_item()]
 
         res = _run(session, _ClientAFails(player=None), _FakeKms())
-        assert res == {"users": 1, "recent": 1, "reauth": 0, "skipped": 1}
+        assert res == {"users": 1, "recent": 1, "reauth": 0, "skipped": 1, **_NO_DEMAND}
         touched = session.sql_of(lambda s: "SET last_synced_at = now()" in s)
         assert [p["user_id"] for _, p in touched] == [uid_b]
 
     def test_no_connected_users_is_noop(self):
         session = _FakeSession([])
         res = _run(session, _FakeClient(), _FakeKms())
-        assert res == {"users": 0, "recent": 0, "reauth": 0, "skipped": 0}
+        assert res == {"users": 0, "recent": 0, "reauth": 0, "skipped": 0, **_NO_DEMAND}
         assert not session.sql_of(lambda s: "INSERT" in s)

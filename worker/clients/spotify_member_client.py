@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from worker.core.config import settings
 from worker.clients.spotify_user_client import (
+    LIBRARY_PAGE_LIMIT,
     _is_invalid_grant,
     _load_spotify_creds,
     _request_with_retry,
@@ -30,6 +31,17 @@ class SpotifyInvalidGrant(RuntimeError):
     """The member's refresh token was revoked/expired (token-endpoint 400
     error=invalid_grant) — the ONLY signal that maps to status='reauth'. Transient
     failures (5xx / 429 / network) must never raise this."""
+
+
+class SpotifyMemberScopeError(RuntimeError):
+    """The member's grant lacks `user-library-read` (403 on /me/albums).
+
+    Distinct from SpotifyInvalidGrant: the refresh token is still valid, so the
+    integration must NOT be flipped to status='reauth' (that would break the
+    member's player and recent reads over a library-only gap). The front already
+    renders a library-scope reconsent prompt from the stored scope string
+    (`spotifyGrantLacksLibraryScopes`), so the caller just skips the saved-album
+    origin for this member and leaves everything else running."""
 
 
 class SpotifyMemberClient:
@@ -83,6 +95,44 @@ class SpotifyMemberClient:
         if not r.content:
             return None
         return r.json()
+
+    def get_saved_albums(self, access_token: str) -> List[Dict[str, Any]]:
+        """GET /me/albums?limit=50&offset=… — paginate the MEMBER's saved-albums
+        library and return the unwrapped album objects (callers read album["id"]).
+
+        Same pagination contract as the owner client's get_saved_albums (`next` is
+        authoritative, `total` guards a never-null `next`), but stateless: the access
+        token is passed in per call because members share no cached token. A 403 is a
+        missing `user-library-read` grant, not a revoked token — see
+        SpotifyMemberScopeError."""
+        url = f"{settings.SPOTIFY_API_BASE}/me/albums"
+        albums: List[Dict[str, Any]] = []
+        offset = 0
+        while True:
+            r = _request_with_retry(
+                "GET", url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={"limit": LIBRARY_PAGE_LIMIT, "offset": offset},
+                timeout=20,
+            )
+            if r.status_code == 403:
+                raise SpotifyMemberScopeError(
+                    "Spotify GET /me/albums returned 403 (grant lacks user-library-read)"
+                )
+            r.raise_for_status()
+            payload = r.json() or {}
+            items = payload.get("items") or []
+            for it in items:
+                album = (it or {}).get("album")
+                if album and album.get("id"):
+                    albums.append(album)
+            total = payload.get("total")
+            offset += len(items)
+            if not items or not payload.get("next"):
+                break
+            if isinstance(total, int) and offset >= total:
+                break
+        return albums
 
     def get_recently_played(self, access_token: str, limit: int = 50) -> List[Dict[str, Any]]:
         """GET /me/player/recently-played → raw play items (most recent first).

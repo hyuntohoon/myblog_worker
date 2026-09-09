@@ -39,7 +39,11 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.sql import text
 
 from worker.core.config import settings
-from worker.clients.spotify_member_client import SpotifyInvalidGrant
+from worker.clients.spotify_member_client import (
+    SpotifyInvalidGrant,
+    SpotifyMemberScopeError,
+)
+from worker.service.lyrics_member_demand_service import sync_member_demand
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +54,7 @@ _SELECT_CONNECTED = text(
     SELECT ui.user_id AS user_id, ui.payload AS payload
       FROM user_integrations ui
      WHERE ui.provider = 'spotify' AND ui.status = 'connected' AND ui.payload IS NOT NULL
+       AND (CAST(:only AS uuid) IS NULL OR ui.user_id = CAST(:only AS uuid))
      ORDER BY ui.last_synced_at NULLS FIRST
      LIMIT :lim
     """
@@ -231,9 +236,42 @@ def _rotated_payload(old_doc: Dict[str, Any], token_body: Dict[str, Any], new_ci
     )
 
 
-def _sync_one(session_factory, client, kms, kms_key_id: str, user_id: Any, payload_raw: str) -> Dict[str, int]:
+def _produce_demand(session_factory, client, access_token: str, user_id: Any,
+                    recent_items: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Step 4 producer, isolated from the listening poll (see the module docstring).
+
+    Runs with NO DB session held by the caller, because the library read below is a
+    fully paginated Spotify call and a session left open across it is the exact
+    idle-in-transaction shape that has bitten this project before.
+
+    A library read that fails passes `saved_albums=None`, never `[]`: an empty list is
+    a truthful observation that the member saved nothing and would reconcile every
+    saved-origin demand away. A failed read must not be able to delete demand.
+    """
+    saved: Optional[List[Dict[str, Any]]] = None
+    try:
+        saved = client.get_saved_albums(access_token)
+    except SpotifyMemberScopeError:
+        # The grant predates library consent (or the member declined it). The token is
+        # still valid — do NOT touch status; the front already prompts for reconsent
+        # from the stored scope string. Recent-listening demand still runs below.
+        logger.info(
+            "member library skipped — grant lacks user-library-read (user_id=%s)", user_id
+        )
+    except Exception as e:
+        logger.warning(
+            "member library read failed, saved-origin left untouched (user_id=%s): %s",
+            user_id, type(e).__name__,
+        )
+    return sync_member_demand(
+        session_factory, user_id, saved_albums=saved, recent_items=recent_items
+    )
+
+
+def _sync_one(session_factory, client, kms, kms_key_id: str, user_id: Any, payload_raw: str,
+              demand_enabled: bool = False) -> Dict[str, int]:
     """One member's full poll. Raises on transient failures (caller isolates);
-    returns {"recent": inserted_count, "reauth": 0|1}."""
+    returns {"recent": inserted_count, "reauth": 0|1, "demand_*": …}."""
     # -- decrypt (no session held; KMS/parse failure propagates → skip user) --
     payload_doc = json.loads(payload_raw)
     refresh_token = _decrypt_refresh_token(kms, payload_doc)
@@ -286,7 +324,21 @@ def _sync_one(session_factory, client, kms, kms_key_id: str, user_id: Any, paylo
         else:
             session.execute(_UPSERT_NOWPLAYING_IDLE, {"user_id": user_id})
         session.execute(_TOUCH_SYNCED, {"user_id": user_id})
-    return {"recent": inserted, "reauth": 0}
+
+    # -- Step 4 demand production (session closed again; never fails the poll) --
+    result = {"recent": inserted, "reauth": 0, "demand_failed": 0}
+    if demand_enabled:
+        try:
+            result.update(_produce_demand(session_factory, client, access_token, user_id, recent_items))
+        except Exception:
+            # Isolated on purpose: a demand-store failure must not cost this member
+            # their listening data, and must not look like a credential problem.
+            result["demand_failed"] = 1
+            logger.error(
+                "member demand production failed (listening sync kept) for user_id=%s",
+                user_id, exc_info=True,
+            )
+    return result
 
 
 def run_spotify_member_sync(
@@ -296,29 +348,50 @@ def run_spotify_member_sync(
     kms=None,
     kms_key_id: Optional[str] = None,
     max_users: int = 10,
+    only_user_id: Optional[str] = None,
+    demand_enabled: Optional[bool] = None,
 ) -> Dict[str, int]:
     """Poll each connected member's Spotify listening state. Returns a summary dict.
-    Logs only user counts / exception type names — never tokens or ciphertext."""
+    Logs only user counts / exception type names — never tokens or ciphertext.
+
+    `only_user_id` narrows the pass to a single member — the connect-time bootstrap
+    (Step 4) runs the identical code for one member rather than a parallel
+    implementation, which is what makes the 15-minute cron a true recovery path for a
+    bootstrap message that was never delivered. A member id that is not connected
+    selects nothing and is a clean no-op.
+
+    `demand_enabled` defaults to the worker's OWN setting, never a message field, so a
+    stray or replayed SQS message can never switch the producers on.
+    """
     if kms is None:
         kms = _default_kms()
     if kms_key_id is None:
         kms_key_id = settings.USER_TOKENS_KMS_KEY_ID
+    if demand_enabled is None:
+        demand_enabled = settings.LYRICS_MEMBER_DEMAND_ENABLED
 
     # Phase 1 — read the connected members, then CLOSE the session.
     with session_factory() as session:
-        rows = session.execute(_SELECT_CONNECTED, {"lim": max_users}).fetchall()
+        rows = session.execute(
+            _SELECT_CONNECTED, {"lim": max_users, "only": only_user_id}
+        ).fetchall()
     users = [(r.user_id, r.payload) for r in rows]
     if not users:
-        logger.info("spotify member sync: no connected users")
-        return {"users": 0, "recent": 0, "reauth": 0, "skipped": 0}
+        logger.info("spotify member sync: no connected users (only_user_id=%s)", only_user_id)
+        return {"users": 0, "recent": 0, "reauth": 0, "skipped": 0,
+                "saved_added": 0, "saved_removed": 0, "recent_albums": 0, "demand_failed": 0}
 
     synced = 0
     total_recent = 0
     total_reauth = 0
     skipped = 0
+    demand = {"saved_added": 0, "saved_removed": 0, "recent_albums": 0, "demand_failed": 0}
     for user_id, payload_raw in users:
         try:
-            result = _sync_one(session_factory, client, kms, kms_key_id, user_id, payload_raw)
+            result = _sync_one(
+                session_factory, client, kms, kms_key_id, user_id, payload_raw,
+                demand_enabled=demand_enabled,
+            )
         except Exception as e:
             # Transient (KMS/config/network/5xx) or malformed payload — skip this
             # user, keep status, never log token material.
@@ -333,9 +406,17 @@ def run_spotify_member_sync(
             continue
         synced += 1
         total_recent += result["recent"]
+        demand["saved_added"] += result.get("saved_added", 0)
+        demand["saved_removed"] += result.get("saved_removed", 0)
+        demand["recent_albums"] += result.get("recent_added", 0)
+        demand["demand_failed"] += result.get("demand_failed", 0)
 
     logger.info(
-        "spotify member sync: users=%d recent=%d reauth=%d skipped=%d",
+        "spotify member sync: users=%d recent=%d reauth=%d skipped=%d "
+        "demand(saved +%d/-%d, recent +%d, failed=%d, enabled=%s)",
         synced, total_recent, total_reauth, skipped,
+        demand["saved_added"], demand["saved_removed"], demand["recent_albums"],
+        demand["demand_failed"], demand_enabled,
     )
-    return {"users": synced, "recent": total_recent, "reauth": total_reauth, "skipped": skipped}
+    return {"users": synced, "recent": total_recent, "reauth": total_reauth,
+            "skipped": skipped, **demand}
