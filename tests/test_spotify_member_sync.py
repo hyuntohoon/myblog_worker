@@ -12,6 +12,7 @@ import json
 import uuid
 
 from worker.clients.spotify_member_client import SpotifyInvalidGrant
+from worker.service.lyrics_member_demand_service import DISCOVERY_ORIGINS
 from worker.service.spotify_member_sync_service import run_spotify_member_sync
 
 CIPHERTEXT_B64 = base64.b64encode(b"kms-envelope-blob").decode()
@@ -43,6 +44,23 @@ class _Result:
         self.rowcount = rowcount
 
     def fetchall(self):
+        return self._rows
+
+    def mappings(self):
+        # `LyricsDemandStore.revoke_scopes` opens with a scope SELECT and returns {} when
+        # it finds none. This fake holds no scope rows, so the revoke is a faithful no-op
+        # for a member who never produced demand — enough to keep the reauth path running
+        # here. What the revoke actually DOES is a property of SQL a fake cannot show
+        # ([[feedback-sa-session-lifecycle-mock-blind]]); that lives in
+        # tests/integration/test_lyrics_member_demand_db.py against real Postgres.
+        return _Mappings(self._rows)
+
+
+class _Mappings:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
         return self._rows
 
 
@@ -77,6 +95,12 @@ class _FakeSession:
 
     def begin(self):
         return _FakeSession._Ctx()
+
+    def connection(self):
+        """`LyricsDemandStore` takes a Connection and only calls `.execute`, so the
+        recorder itself stands in — which also means the revoke's SQL lands in
+        `self.executed` and the reauth test can assert it was attempted."""
+        return self
 
     class _Ctx:
         def __enter__(self):
@@ -216,6 +240,14 @@ class TestSpotifyMemberSync:
         assert res == {"users": 0, "recent": 0, "reauth": 1, "skipped": 0, **_NO_DEMAND}
         upd = session.sql_of(lambda s: "status = 'reauth'" in s)
         assert upd and upd[0][1] == {"user_id": uid}
+        # An `invalid_grant` is the member revoking us at Spotify, so the flip must be
+        # accompanied by a scope revoke for THAT member (Step 4). The store's own SQL is
+        # exercised for real in tests/integration/test_lyrics_member_demand_db.py; here we
+        # only pin that the poll asks for it, scoped to this member and both origins.
+        rev = session.sql_of(lambda s: "FROM lyrics_discovery_scopes" in s)
+        assert rev, "invalid_grant flipped reauth without revoking the member's scopes"
+        assert rev[0][1]["member"] == uid
+        assert set(rev[0][1]["origins"]) == set(DISCOVERY_ORIGINS)
         # payload kept: no payload UPDATE, no KMS Encrypt, no player reads
         assert not session.sql_of(lambda s: "SET payload" in s)
         assert kms.encrypt_calls == []

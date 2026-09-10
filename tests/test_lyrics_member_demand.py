@@ -300,6 +300,31 @@ class TestPollWiring:
         assert calls == [] and client.saved_calls == []
         assert res["saved_added"] == 0 and res["demand_failed"] == 0
 
+    def test_kill_switch_default_is_read_from_settings(self, monkeypatch):
+        """`demand_enabled=None` must resolve to LYRICS_MEMBER_DEMAND_ENABLED.
+
+        Every other test in this class passes `demand_enabled` explicitly, so the seam
+        that connects the owner's advertised fast override to the code was the one thing
+        none of them touched: replacing the settings read with a bare ``True`` left the
+        whole suite green ([[feedback-mutation-test-your-own-new-tests]]). A kill switch
+        nothing asserts on is a kill switch nobody can trust to be wired.
+        """
+        from worker.core.config import settings
+
+        for enabled, expected in ((False, []), (True, [1])):
+            _, _, session, kms, client = self._two_members()
+            calls = []
+            monkeypatch.setattr(
+                "worker.service.spotify_member_sync_service.sync_member_demand",
+                lambda *a, **kw: (calls.append(1) or {}),
+            )
+            monkeypatch.setattr(settings, "LYRICS_MEMBER_DEMAND_ENABLED", enabled)
+            # demand_enabled deliberately omitted — that is the path under test.
+            run_spotify_member_sync(lambda: session, client, kms=kms, kms_key_id="k")
+            assert calls[:1] == expected[:1], (
+                f"LYRICS_MEMBER_DEMAND_ENABLED={enabled} was not honoured"
+            )
+
     def test_missing_library_scope_skips_saved_but_still_produces_recent(self, monkeypatch):
         uid_a, _, session, kms, _ = self._two_members()
         client = _TokenScopedClient(

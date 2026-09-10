@@ -38,12 +38,17 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.sql import text
 
+from myblog_shared_db.lyrics_demand import LyricsDemandStore
+
 from worker.core.config import settings
 from worker.clients.spotify_member_client import (
     SpotifyInvalidGrant,
     SpotifyMemberScopeError,
 )
-from worker.service.lyrics_member_demand_service import sync_member_demand
+from worker.service.lyrics_member_demand_service import (
+    DISCOVERY_ORIGINS,
+    sync_member_demand,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -284,8 +289,30 @@ def _sync_one(session_factory, client, kms, kms_key_id: str, user_id: Any, paylo
             "spotify member refresh rejected (invalid_grant) → status=reauth (user_id=%s)",
             user_id,
         )
+        # `invalid_grant` is the member revoking us at Spotify (or deleting the app from
+        # their account page) — the strongest "stop using my library" signal there is, and
+        # the one that never touches our UI. Step 4's disconnect fence lives in the backend
+        # DELETE route, which this path never reaches, so without the revoke below a member
+        # who withdraws at the provider keeps a live `saved`/`recent` scope and every demand
+        # row derived from their private library: the poll stops producing NEW demand (they
+        # fall out of `_SELECT_CONNECTED`), but the durable artefact keeps generating
+        # translation work with no way for them to reach it short of reconnecting in order
+        # to disconnect.
+        #
+        # Same transaction as the status flip, for the same reason the backend's disconnect
+        # is atomic: between a committed reauth and a separate revoke there is a window
+        # where consent is withdrawn and the demand is still live. A failure here rolls the
+        # flip back too, leaving the member 'connected' so the next tick retries — the
+        # refresh fails first, so no production happens in the meantime.
+        #
+        # Deliberately NOT gated on `demand_enabled`: the switch stops new production, it
+        # does not make an existing scope legitimate. `revoke_scopes` is a no-op when the
+        # member has no scope rows.
         with session_factory() as session, session.begin():
             session.execute(_UPDATE_REAUTH, {"user_id": user_id})
+            LyricsDemandStore(session.connection()).revoke_scopes(
+                user_id, list(DISCOVERY_ORIGINS)
+            )
         return {"recent": 0, "reauth": 1}
 
     access_token = token_body["access_token"]

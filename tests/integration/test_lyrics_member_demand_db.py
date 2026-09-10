@@ -35,10 +35,12 @@ from sqlalchemy.orm import sessionmaker
 from myblog_shared_db.lyrics_demand import LyricsDemandStore, StaleDiscovery
 
 from worker.service.lyrics_member_demand_service import (
+    DISCOVERY_ORIGINS,
     RECENT_ORIGIN,
     SAVED_ORIGIN,
     sync_member_demand,
 )
+from worker.clients.spotify_member_client import SpotifyInvalidGrant
 from worker.service.spotify_member_sync_service import run_spotify_member_sync
 
 _TEST_DB_URL = os.environ.get("TEST_DB_URL")
@@ -470,6 +472,134 @@ def test_a_disconnected_member_is_not_polled_at_all(factory, members):
     )
     assert res["users"] == 0
     assert _keys(factory, a, SAVED_ORIGIN) == set()
+
+
+def test_revoking_the_app_at_spotify_revokes_the_demand_it_produced(factory, members):
+    """A member who removes the app at spotify.com never touches our DELETE route.
+
+    That is the strongest "stop using my library" signal a member can send, and it
+    reaches us only as `invalid_grant` on the next refresh. Step 4's disconnect fence
+    lives in the backend route this path never enters, so before the revoke was added
+    here the poll flipped the member to `reauth`, dropped them out of
+    `_SELECT_CONNECTED` — and left every demand row derived from their private library
+    live and served, with no way for them to reach it short of reconnecting in order to
+    disconnect. "Stops producing NEW demand" is not the same claim as "stops using the
+    library" ([[feedback-rfc-verification-list-is-not-a-threat-model]]).
+
+    The control is member B, who is untouched: a revoke that fired for every member
+    rather than the one that lost its grant would pass a test that only looked at A.
+    """
+    a, b = members["a"], members["b"]
+    a_alb, b_alb = _sid(members, "arevoke"), _sid(members, "brevoke")
+    kms = _FakeKms({b"env-a": "refresh-a", b"env-b": "refresh-b"})
+
+    # Both members have real, live demand before anything is revoked.
+    client = _PerTokenClient({
+        "at:refresh-a": {"saved": _saved(a_alb), "recent": []},
+        "at:refresh-b": {"saved": _saved(b_alb), "recent": []},
+    })
+    run_spotify_member_sync(
+        factory, client, kms=kms, kms_key_id="k", max_users=10, demand_enabled=True,
+    )
+    assert _keys(factory, a, SAVED_ORIGIN) == {a_alb}
+    assert _keys(factory, b, SAVED_ORIGIN) == {b_alb}
+
+    # Member A removes the app at Spotify: their refresh now fails with invalid_grant.
+    class _RevokedForA:
+        def refresh(self, refresh_token):
+            if refresh_token == "refresh-a":
+                raise SpotifyInvalidGrant("invalid_grant")
+            return {"access_token": f"at:{refresh_token}", "expires_in": 3600}
+
+        def get_player_state(self, access_token):
+            return None
+
+        def get_recently_played(self, access_token, limit=50):
+            return []
+
+        def get_saved_albums(self, access_token):
+            return _saved(b_alb)
+
+    # Narrowed to A on purpose. With B in the same pass, B's own `reset_scope` re-opens
+    # whatever a too-broad revoke had just closed, and a mutant that revoked EVERY
+    # member's scopes would pass this test — the control has to be a member the pass
+    # never touches ([[feedback-measure-with-a-control]]).
+    res = run_spotify_member_sync(
+        factory, _RevokedForA(), kms=kms, kms_key_id="k", max_users=10,
+        only_user_id=str(a), demand_enabled=True,
+    )
+    assert res["reauth"] == 1
+
+    # A: status flipped AND the library-derived demand is gone, in the same transaction.
+    with factory() as s:
+        status = s.execute(
+            text("SELECT status FROM user_integrations WHERE user_id = :u"),
+            {"u": str(a)}).scalar()
+        actives = s.execute(
+            text("SELECT count(*) FROM lyrics_discovery_scopes "
+                 "WHERE user_id = :u AND active"), {"u": str(a)}).scalar()
+    assert status == "reauth"
+    assert actives == 0, "the member revoked us at Spotify and the scope stayed active"
+    assert _keys(factory, a, SAVED_ORIGIN) == set()
+
+    # B is the control: untouched grant, untouched demand.
+    assert _keys(factory, b, SAVED_ORIGIN) == {b_alb}
+    with factory() as s:
+        b_actives = s.execute(
+            text("SELECT count(*) FROM lyrics_discovery_scopes "
+                 "WHERE user_id = :u AND active"), {"u": str(b)}).scalar()
+    # One live scope per origin — an empty `recent` page still opens its scope, so the
+    # number to expect here is the origin count, not 1.
+    assert b_actives == len(DISCOVERY_ORIGINS), (
+        "the revoke fired for a member who never lost their grant"
+    )
+
+
+def test_a_failing_revoke_rolls_the_reauth_flip_back(factory, members, monkeypatch):
+    """The revoke shares the status flip's transaction, and only a failure proves it.
+
+    A sequential test cannot see atomicity: split the two into separate transactions and
+    every assertion in the test above still passes. So this forces the revoke to fail. If
+    the flip were committed separately it would already be durable, and the member would
+    sit in `reauth` — out of `_SELECT_CONNECTED`, so nothing ever retries — with their
+    library-derived demand live forever. Rolling back instead leaves them 'connected' so
+    the next tick tries again; the refresh still fails first, so nothing is produced in
+    the meantime.
+    """
+    a = members["a"]
+    a_alb = _sid(members, "aatomic")
+    kms = _FakeKms({b"env-a": "refresh-a"})
+
+    run_spotify_member_sync(
+        factory, _PerTokenClient({"at:refresh-a": {"saved": _saved(a_alb), "recent": []}}),
+        kms=kms, kms_key_id="k", only_user_id=str(a), demand_enabled=True,
+    )
+    assert _keys(factory, a, SAVED_ORIGIN) == {a_alb}
+
+    def _boom(self, member_id, origins):
+        raise RuntimeError("revoke failed")
+
+    monkeypatch.setattr(LyricsDemandStore, "revoke_scopes", _boom)
+
+    class _RevokedForA:
+        def refresh(self, refresh_token):
+            raise SpotifyInvalidGrant("invalid_grant")
+
+    res = run_spotify_member_sync(
+        factory, _RevokedForA(), kms=kms, kms_key_id="k", only_user_id=str(a),
+        demand_enabled=True,
+    )
+    # The poll isolates the failure per member rather than crashing the invocation.
+    assert res["reauth"] == 0 and res["skipped"] == 1
+
+    with factory() as s:
+        status = s.execute(
+            text("SELECT status FROM user_integrations WHERE user_id = :u"),
+            {"u": str(a)}).scalar()
+    assert status == "connected", (
+        "the reauth flip committed without its revoke — they are not one transaction"
+    )
+    assert _keys(factory, a, SAVED_ORIGIN) == {a_alb}
 
 
 def test_the_cron_recovers_a_bootstrap_message_that_was_never_delivered(factory, members):
