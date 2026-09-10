@@ -92,6 +92,45 @@ def _run_spotify_member_poll() -> None:
     )
 
 
+def _run_member_demand_bootstrap(user_id: Any) -> None:
+    """Connect-time demand bootstrap for ONE member (FEAT-lyrics-listening-experience
+    Step 4). Triggered by {"job": "lyrics_member_bootstrap", "user_id": ...}, which the
+    backend enqueues best-effort right after it commits the member's Spotify credentials
+    (rule #9: the endpoint only enqueues; the worker does every Spotify read).
+
+    Deliberately the SAME code path as the 15-minute cron, narrowed to one member. That
+    is what makes a lost message harmless: the next cron tick reconciles this member
+    anyway, so the broker is a latency optimization and never the system of record. It is
+    also the backfill for members who connected before Step 4 shipped — they need no
+    special handling because the cron already covers every connected member."""
+    import uuid as _uuid
+
+    from worker.clients.spotify_member_client import spotify_member
+    from worker.service.spotify_member_sync_service import run_spotify_member_sync
+
+    # A malformed message must select NOBODY. Passing the value through unchecked has two
+    # bad outcomes: a non-UUID string reaches `CAST(:only AS uuid)` and fails the whole
+    # invocation into the DLQ, and — worse because it is silent — a missing user_id
+    # becomes only_user_id=None, which is the "every member" selector and would quietly
+    # sync an arbitrary member instead of the requested one.
+    try:
+        member_id = str(_uuid.UUID(str(user_id)))
+    except (TypeError, ValueError):
+        logger.warning(
+            "member demand bootstrap ignored — user_id is not a UUID (type=%s)",
+            type(user_id).__name__,
+        )
+        return
+
+    logger.info("member demand bootstrap requested (user_id=%s)", member_id)
+    run_spotify_member_sync(
+        SessionLocal,
+        spotify_member,
+        max_users=1,
+        only_user_id=member_id,
+    )
+
+
 def _run_follow_import(user_id: Any, rerun: bool = False) -> None:
     """Owner followed-artists snapshot import (FEAT-for-you-releases Step 2).
     Triggered by the backend's owner-gated POST /api/me/tracked-artists/spotify-import
@@ -542,6 +581,14 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             # self-chained delayed rerun (rerun=true never fans out again).
             if body.get("job") == "spotify_follow_import":
                 _run_follow_import(body.get("user_id"), rerun=bool(body.get("rerun")))
+                continue
+
+            # Connect-time member demand bootstrap (FEAT-lyrics-listening-experience
+            # Step 4). Enqueued best-effort by the backend PUT /api/integrations/spotify
+            # after the credentials commit. Losing this message costs latency only — the
+            # 15-minute member cron reconciles the same member with the same code.
+            if body.get("job") == "lyrics_member_bootstrap":
+                _run_member_demand_bootstrap(body.get("user_id"))
                 continue
 
             # Follow-import fan-out: catalog-ingest a chunk of followed artists

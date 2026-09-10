@@ -249,6 +249,27 @@ class Settings(BaseSettings):
     LYRICS_DEMAND_CATALOG_RETRY_BASE_SEC: float = 900.0       # 15 minutes
     LYRICS_DEMAND_CATALOG_RETRY_CAP_SEC: float = 86_400.0     # 24 hours
 
+    # FEAT-lyrics-listening-experience Step 4 — the automatic demand producers. Read from
+    # the worker's OWN settings and never from an SQS message, so a stray or replayed
+    # message cannot switch production on. Default TRUE: Step 4's whole purpose is that
+    # member saved albums and recent listening start creating demand without owner action,
+    # and shipping it dormant would need a Terraform apply (which the workspace does not do
+    # automatically) before the step delivered anything.
+    #
+    # ROLLBACK IS NOT A PLAIN REVERT, and this flag alone is not a rollback either. Both
+    # stop *new* production and neither touches what has already been produced: a member's
+    # `saved`/`recent` scope stays `active` and the Step 3 collector keeps serving every
+    # demand row derived from their library. Worse, reverting also removes the disconnect
+    # revoke in the backend's `IntegrationService.disconnect`, so a member who disconnects
+    # AFTER the revert keeps a live scope that nothing can then revoke. Demand is DB state;
+    # `git revert` does not reach it. The order that actually rolls back is:
+    #   1. LYRICS_MEMBER_DEMAND_ENABLED=false      (stop producing)
+    #   2. revoke every member's discovery scopes  (LyricsDemandStore.revoke_scopes over
+    #      DISCOVERY_ORIGINS, or UPDATE lyrics_discovery_scopes SET active=false + delete
+    #      the demand rows) — while the revoking code is still deployed
+    #   3. THEN revert the commits
+    LYRICS_MEMBER_DEMAND_ENABLED: bool = True
+
     # ISRC backfill (FEAT-lyrics-corpus Step 1b, worker EventBridge job). Bounded like every
     # other scheduled job so a run always finishes inside the 120s Lambda timeout: 500 tracks
     # is 10 Spotify chunks of 50, and the budget stops the loop rather than letting a 429
