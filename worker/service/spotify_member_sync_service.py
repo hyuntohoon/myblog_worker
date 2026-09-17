@@ -43,8 +43,10 @@ from myblog_shared_db.lyrics_demand import LyricsDemandStore
 from worker.core.config import settings
 from worker.clients.spotify_member_client import (
     SpotifyInvalidGrant,
+    SpotifyMemberFollowScopeError,
     SpotifyMemberScopeError,
 )
+from worker.service.lyrics_follow_demand_service import sync_follow_demand
 from worker.service.lyrics_member_demand_service import (
     DISCOVERY_ORIGINS,
     sync_member_demand,
@@ -273,8 +275,35 @@ def _produce_demand(session_factory, client, access_token: str, user_id: Any,
     )
 
 
+def _produce_follow_demand(session_factory, client, access_token: str, user_id: Any) -> Dict[str, int]:
+    """Step 5 producer, isolated from Step 4's the same way Step 4 is from the poll.
+
+    Same None-vs-[] rule as the library read, and it matters more here: `user-follow-read`
+    was not in the authorize URL before Step 5, so EVERY member who connected earlier
+    gets the 403 path until they re-consent. Passing `[]` for those members would
+    reconcile away every Spotify-origin edge and every follow demand they have — the
+    failed read must not be able to delete.
+    """
+    followed: Optional[List[Dict[str, Any]]] = None
+    try:
+        followed = client.get_followed_artists(access_token)
+    except SpotifyMemberFollowScopeError:
+        # A missing follow grant is not a broken token: leave status alone, leave the
+        # other two origins running, and let the front prompt for reconsent from the
+        # stored scope string.
+        logger.info(
+            "member follows skipped — grant lacks user-follow-read (user_id=%s)", user_id
+        )
+    except Exception as e:
+        logger.warning(
+            "member follow read failed, follow origin left untouched (user_id=%s): %s",
+            user_id, type(e).__name__,
+        )
+    return sync_follow_demand(session_factory, user_id, followed_artists=followed)
+
+
 def _sync_one(session_factory, client, kms, kms_key_id: str, user_id: Any, payload_raw: str,
-              demand_enabled: bool = False) -> Dict[str, int]:
+              demand_enabled: bool = False, follow_enabled: bool = False) -> Dict[str, int]:
     """One member's full poll. Raises on transient failures (caller isolates);
     returns {"recent": inserted_count, "reauth": 0|1, "demand_*": …}."""
     # -- decrypt (no session held; KMS/parse failure propagates → skip user) --
@@ -353,7 +382,7 @@ def _sync_one(session_factory, client, kms, kms_key_id: str, user_id: Any, paylo
         session.execute(_TOUCH_SYNCED, {"user_id": user_id})
 
     # -- Step 4 demand production (session closed again; never fails the poll) --
-    result = {"recent": inserted, "reauth": 0, "demand_failed": 0}
+    result = {"recent": inserted, "reauth": 0, "demand_failed": 0, "follow_failed": 0}
     if demand_enabled:
         try:
             result.update(_produce_demand(session_factory, client, access_token, user_id, recent_items))
@@ -363,6 +392,20 @@ def _sync_one(session_factory, client, kms, kms_key_id: str, user_id: Any, paylo
             result["demand_failed"] = 1
             logger.error(
                 "member demand production failed (listening sync kept) for user_id=%s",
+                user_id, exc_info=True,
+            )
+
+    # -- Step 5 follow production, isolated from Step 4's as well as from the poll --
+    # Its own switch, not a reuse of LYRICS_MEMBER_DEMAND_ENABLED: this producer is the
+    # expensive one (a member's whole followed back catalogue rather than their saved
+    # albums), so the owner must be able to stop it without also losing saved/recent.
+    if follow_enabled:
+        try:
+            result.update(_produce_follow_demand(session_factory, client, access_token, user_id))
+        except Exception:
+            result["follow_failed"] = 1
+            logger.error(
+                "member follow production failed (listening sync kept) for user_id=%s",
                 user_id, exc_info=True,
             )
     return result
@@ -377,6 +420,7 @@ def run_spotify_member_sync(
     max_users: int = 10,
     only_user_id: Optional[str] = None,
     demand_enabled: Optional[bool] = None,
+    follow_enabled: Optional[bool] = None,
 ) -> Dict[str, int]:
     """Poll each connected member's Spotify listening state. Returns a summary dict.
     Logs only user counts / exception type names — never tokens or ciphertext.
@@ -387,8 +431,8 @@ def run_spotify_member_sync(
     bootstrap message that was never delivered. A member id that is not connected
     selects nothing and is a clean no-op.
 
-    `demand_enabled` defaults to the worker's OWN setting, never a message field, so a
-    stray or replayed SQS message can never switch the producers on.
+    `demand_enabled` and `follow_enabled` default to the worker's OWN settings, never a
+    message field, so a stray or replayed SQS message can never switch the producers on.
     """
     if kms is None:
         kms = _default_kms()
@@ -396,6 +440,8 @@ def run_spotify_member_sync(
         kms_key_id = settings.USER_TOKENS_KMS_KEY_ID
     if demand_enabled is None:
         demand_enabled = settings.LYRICS_MEMBER_DEMAND_ENABLED
+    if follow_enabled is None:
+        follow_enabled = settings.LYRICS_FOLLOW_DEMAND_ENABLED
 
     # Phase 1 — read the connected members, then CLOSE the session.
     with session_factory() as session:
@@ -406,18 +452,22 @@ def run_spotify_member_sync(
     if not users:
         logger.info("spotify member sync: no connected users (only_user_id=%s)", only_user_id)
         return {"users": 0, "recent": 0, "reauth": 0, "skipped": 0,
-                "saved_added": 0, "saved_removed": 0, "recent_albums": 0, "demand_failed": 0}
+                "saved_added": 0, "saved_removed": 0, "recent_albums": 0, "demand_failed": 0,
+                "follow_added": 0, "follow_removed": 0, "follow_artists": 0,
+                "follow_skipped": 0, "follow_failed": 0}
 
     synced = 0
     total_recent = 0
     total_reauth = 0
     skipped = 0
-    demand = {"saved_added": 0, "saved_removed": 0, "recent_albums": 0, "demand_failed": 0}
+    demand = {"saved_added": 0, "saved_removed": 0, "recent_albums": 0, "demand_failed": 0,
+              "follow_added": 0, "follow_removed": 0, "follow_artists": 0,
+              "follow_skipped": 0, "follow_failed": 0}
     for user_id, payload_raw in users:
         try:
             result = _sync_one(
                 session_factory, client, kms, kms_key_id, user_id, payload_raw,
-                demand_enabled=demand_enabled,
+                demand_enabled=demand_enabled, follow_enabled=follow_enabled,
             )
         except Exception as e:
             # Transient (KMS/config/network/5xx) or malformed payload — skip this
@@ -437,13 +487,19 @@ def run_spotify_member_sync(
         demand["saved_removed"] += result.get("saved_removed", 0)
         demand["recent_albums"] += result.get("recent_added", 0)
         demand["demand_failed"] += result.get("demand_failed", 0)
+        for key in ("follow_added", "follow_removed", "follow_artists",
+                    "follow_skipped", "follow_failed"):
+            demand[key] += result.get(key, 0)
 
     logger.info(
         "spotify member sync: users=%d recent=%d reauth=%d skipped=%d "
-        "demand(saved +%d/-%d, recent +%d, failed=%d, enabled=%s)",
+        "demand(saved +%d/-%d, recent +%d, failed=%d, enabled=%s) "
+        "follow(artists=%d, +%d/-%d, no-grant=%d, failed=%d, enabled=%s)",
         synced, total_recent, total_reauth, skipped,
         demand["saved_added"], demand["saved_removed"], demand["recent_albums"],
         demand["demand_failed"], demand_enabled,
+        demand["follow_artists"], demand["follow_added"], demand["follow_removed"],
+        demand["follow_skipped"], demand["follow_failed"], follow_enabled,
     )
     return {"users": synced, "recent": total_recent, "reauth": total_reauth,
             "skipped": skipped, **demand}

@@ -194,6 +194,44 @@ class SpotifyClient:
         r.raise_for_status()
         return r.json().get("items") or []
 
+    def get_artist_albums_page(
+        self,
+        artist_id: str,
+        include_groups: str = "album",
+        offset: int = 0,
+        limit: int = 50,
+        market: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """GET /v1/artists/{id}/albums — ONE page, with its paginator intact.
+
+        Deliberately separate from `get_artist_albums`, which flattens to `items` and
+        is documented as single-page-by-design for the ingest sweep. Step 5 needs the
+        opposite contract: the complete discography, read across bounded worker runs,
+        so the caller must see `next`/`total`/`offset` to checkpoint and resume. Two
+        methods rather than a flag because their callers want different things — the
+        sweep wants "recent releases", this wants "all of them".
+
+        Returns the raw page object ({"items", "total", "next", …}).
+        """
+        params: Dict[str, Any] = {
+            "include_groups": include_groups,
+            "limit": max(1, min(int(limit), 50)),
+            "offset": max(0, int(offset)),
+        }
+        mkt = self._default_market(market)
+        if mkt:
+            params["market"] = mkt
+
+        r = _request_with_retry(
+            "GET",
+            f"{settings.SPOTIFY_API_BASE}/artists/{artist_id}/albums",
+            headers=self._headers(),
+            params=params,
+            timeout=20,
+        )
+        r.raise_for_status()
+        return r.json() or {}
+
     def get_tracks(self, ids: list[str], market: Optional[str] = None) -> list[dict[str, Any]]:
         """GET /v1/tracks?ids=... (<=50 per call).
 

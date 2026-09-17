@@ -361,3 +361,135 @@ def test_sqs_genius_nudge_routed_in_record_loop(mock_run):
     mock_run.assert_called_once_with(
         limit=None, album_id="62bc17c7-962d-4ebd-9fc6-f0f5488487b2"
     )
+
+
+# ── FEAT-lyrics-listening-experience Step 5 — discography enumeration ────────
+#
+# The enumeration job has no EventBridge schedule of its own: it is demand-driven,
+# so the member poll enqueues it only when artists are actually due, and a run that
+# still has work chains its own successor. Both halves are wiring the services cannot
+# see, so they are asserted here.
+
+@pytest.mark.unit
+@patch("worker.handler._run_discography_enumeration")
+def test_sqs_discography_enumeration_routed_in_record_loop(mock_run):
+    """An SQS-delivered message must have its own branch or it is ACKed away silently."""
+    event = {"Records": [{"body": json.dumps(
+        {"job": "lyrics_discography_enumerate", "hops": 3})}]}
+
+    assert lambda_handler(event, None) == {"batchItemFailures": []}
+
+    mock_run.assert_called_once_with(hops=3)
+
+
+@pytest.mark.unit
+@patch("worker.handler.settings")
+@patch("worker.handler.SessionLocal")
+def test_enumeration_nudge_enqueues_only_when_artists_are_due(mock_session, mock_settings):
+    """Zero due artists must cost zero messages — most 15-minute ticks have nothing."""
+    from worker.handler import _nudge_discography_enumeration
+
+    mock_settings.LYRICS_FOLLOW_DEMAND_ENABLED = True
+    with patch("worker.clients.sqs_producer.enqueue_discography_enumeration") as enqueue, \
+         patch("worker.service.lyrics_discography_service.due_count", return_value=0):
+        _nudge_discography_enumeration()
+        enqueue.assert_not_called()
+
+    with patch("worker.clients.sqs_producer.enqueue_discography_enumeration") as enqueue, \
+         patch("worker.service.lyrics_discography_service.due_count", return_value=4):
+        _nudge_discography_enumeration()
+        enqueue.assert_called_once()
+
+
+@pytest.mark.unit
+@patch("worker.handler.settings")
+@patch("worker.handler.SessionLocal")
+def test_enumeration_nudge_is_off_with_the_follow_switch(mock_session, mock_settings):
+    """The kill switch has to reach the producer AND the thing that feeds it."""
+    from worker.handler import _nudge_discography_enumeration
+
+    mock_settings.LYRICS_FOLLOW_DEMAND_ENABLED = False
+    with patch("worker.service.lyrics_discography_service.due_count") as due, \
+         patch("worker.clients.sqs_producer.enqueue_discography_enumeration") as enqueue:
+        _nudge_discography_enumeration()
+        due.assert_not_called()
+        enqueue.assert_not_called()
+
+
+@pytest.mark.unit
+@patch("worker.handler.settings")
+@patch("worker.handler.SessionLocal")
+def test_enumeration_nudge_failure_never_fails_the_poll(mock_session, mock_settings):
+    mock_settings.LYRICS_FOLLOW_DEMAND_ENABLED = True
+    from worker.handler import _nudge_discography_enumeration
+
+    with patch("worker.service.lyrics_discography_service.due_count",
+               side_effect=RuntimeError("db down")):
+        _nudge_discography_enumeration()  # must not raise
+
+
+@pytest.mark.unit
+@patch("worker.handler.settings")
+@patch("worker.handler.spotify")
+@patch("worker.handler.SessionLocal")
+def test_enumeration_chains_while_work_remains_and_stops_at_the_hop_cap(
+        mock_session, mock_spotify, mock_settings):
+    """Self-chaining is what makes a member's join a burst instead of a 15-minute drip.
+
+    The cap is the other half: a permanently-failing artist stays `remaining` forever,
+    and without a bound it would sustain the chain indefinitely.
+    """
+    from worker.handler import _run_discography_enumeration
+
+    mock_settings.LYRICS_DISCOGRAPHY_ARTISTS_PER_RUN = 10
+    mock_settings.LYRICS_DISCOGRAPHY_PAGES_PER_ARTIST = 10
+    mock_settings.LYRICS_DISCOGRAPHY_REFRESH_HOURS = 24
+    mock_settings.LYRICS_DISCOGRAPHY_MAX_HOPS = 5
+
+    with patch("worker.service.lyrics_discography_service.reopen_stale_discographies",
+               return_value=0), \
+         patch("worker.service.lyrics_discography_service.run_discography_enumeration",
+               return_value={"remaining": 7}), \
+         patch("worker.clients.sqs_producer.enqueue_discography_enumeration") as enqueue:
+        _run_discography_enumeration(hops=0)
+        enqueue.assert_called_once_with(hops=1)
+
+    with patch("worker.service.lyrics_discography_service.reopen_stale_discographies",
+               return_value=0), \
+         patch("worker.service.lyrics_discography_service.run_discography_enumeration",
+               return_value={"remaining": 7}), \
+         patch("worker.clients.sqs_producer.enqueue_discography_enumeration") as enqueue:
+        _run_discography_enumeration(hops=4)
+        enqueue.assert_not_called()
+
+    # Nothing left to do ⇒ no successor, whatever the hop count says.
+    with patch("worker.service.lyrics_discography_service.reopen_stale_discographies",
+               return_value=0), \
+         patch("worker.service.lyrics_discography_service.run_discography_enumeration",
+               return_value={"remaining": 0}), \
+         patch("worker.clients.sqs_producer.enqueue_discography_enumeration") as enqueue:
+        _run_discography_enumeration(hops=0)
+        enqueue.assert_not_called()
+
+
+@pytest.mark.unit
+@patch("worker.handler.settings")
+@patch("worker.handler.spotify")
+@patch("worker.handler.SessionLocal")
+def test_a_malformed_hop_counter_does_not_restart_the_budget(
+        mock_session, mock_spotify, mock_settings):
+    """A non-numeric `hops` must not read as hop 0 and hand the chain a fresh budget."""
+    from worker.handler import _run_discography_enumeration
+
+    mock_settings.LYRICS_DISCOGRAPHY_ARTISTS_PER_RUN = 10
+    mock_settings.LYRICS_DISCOGRAPHY_PAGES_PER_ARTIST = 10
+    mock_settings.LYRICS_DISCOGRAPHY_REFRESH_HOURS = 24
+    mock_settings.LYRICS_DISCOGRAPHY_MAX_HOPS = 5
+
+    with patch("worker.service.lyrics_discography_service.reopen_stale_discographies",
+               return_value=0), \
+         patch("worker.service.lyrics_discography_service.run_discography_enumeration",
+               return_value={"remaining": 7}), \
+         patch("worker.clients.sqs_producer.enqueue_discography_enumeration") as enqueue:
+        _run_discography_enumeration(hops="not-a-number")
+        enqueue.assert_not_called()

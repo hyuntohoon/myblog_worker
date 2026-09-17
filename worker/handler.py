@@ -90,6 +90,32 @@ def _run_spotify_member_poll() -> None:
         spotify_member,
         max_users=settings.SPOTIFY_MEMBER_MAX_USERS_PER_TICK,
     )
+    _nudge_discography_enumeration()
+
+
+def _nudge_discography_enumeration() -> None:
+    """Start an enumeration run if, and only if, artists are actually due.
+
+    The check is one indexed count against `lyrics_artist_discographies`; skipping the
+    enqueue when it is zero is what keeps the steady state free — most 15-minute ticks
+    have nothing to enumerate, because a member's follows change far less often than
+    the poll runs. Never allowed to fail the poll: enumeration is recoverable work and
+    the next tick asks again.
+    """
+    if not settings.LYRICS_FOLLOW_DEMAND_ENABLED:
+        return
+    try:
+        from worker.clients.sqs_producer import enqueue_discography_enumeration
+        from worker.service.lyrics_discography_service import due_count
+
+        due = due_count(SessionLocal)
+        if due:
+            logger.info("discography enumeration due for %d artist(s) — enqueuing", due)
+            enqueue_discography_enumeration()
+    except Exception as e:
+        logger.warning(
+            "discography enumeration nudge failed (poll unaffected): %s", type(e).__name__
+        )
 
 
 def _run_member_demand_bootstrap(user_id: Any) -> None:
@@ -129,6 +155,10 @@ def _run_member_demand_bootstrap(user_id: Any) -> None:
         max_users=1,
         only_user_id=member_id,
     )
+    # A join is a burst, not a rate (the Step 4 -> Step 5 measurement): the follow pass
+    # above has just registered every artist this member follows, and none of them is
+    # enumerated yet. Start reading immediately instead of waiting for the next cron.
+    _nudge_discography_enumeration()
 
 
 def _run_follow_import(user_id: Any, rerun: bool = False) -> None:
@@ -161,6 +191,60 @@ def _run_follow_ingest(artist_sids: List[str]) -> None:
     from worker.service.follow_import_service import run_follow_ingest
 
     run_follow_ingest(spotify, enqueue_album_sync, artist_sids)
+
+
+def _run_discography_enumeration(hops: int = 0) -> None:
+    """Read the next batch of due artist discographies (FEAT-lyrics Step 5).
+
+    Triggered by {"job": "lyrics_discography_enumerate"} on the blogSQS queue, which
+    the member poll enqueues whenever it observes due work. Deliberately NOT a new
+    EventBridge schedule: enumeration is demand-driven — it only has work when a member
+    follows someone new — so a fixed cron would be two indexed no-op SELECTs a minute
+    for the months between joins.
+
+    The run is bounded (artists per run x pages per artist) and resumable from each
+    artist's checkpoint, which is D5's distinction: a bound on one invocation is an
+    operational necessity, a bound on total scope would be a product restriction. When
+    work remains, the run chains ONE successor rather than waiting 15 minutes per batch
+    — capped by LYRICS_DISCOGRAPHY_MAX_HOPS so a permanently-failing artist cannot
+    sustain the loop.
+
+    Reads /artists/{id}/albums with the app's client-credentials token, so it needs no
+    member credentials and enumerates each artist once for every member who follows them.
+    """
+    from worker.clients.sqs_producer import enqueue_discography_enumeration
+    from worker.service.lyrics_discography_service import (
+        reopen_stale_discographies,
+        run_discography_enumeration,
+    )
+
+    reopened = reopen_stale_discographies(
+        SessionLocal, settings.LYRICS_DISCOGRAPHY_REFRESH_HOURS
+    )
+    if reopened:
+        logger.info("discography refresh re-opened %d completed artist(s)", reopened)
+
+    metrics = run_discography_enumeration(
+        SessionLocal,
+        spotify,
+        max_artists=settings.LYRICS_DISCOGRAPHY_ARTISTS_PER_RUN,
+        max_pages_per_artist=settings.LYRICS_DISCOGRAPHY_PAGES_PER_ARTIST,
+    )
+
+    try:
+        hops = int(hops)
+    except (TypeError, ValueError):
+        # A malformed counter must not read as "hop 0" and restart the budget; treat
+        # it as exhausted and let the next poll tick re-enqueue from a clean 0.
+        logger.warning("discography enumeration: non-numeric hops — not chaining")
+        return
+    if metrics["remaining"] and hops + 1 < settings.LYRICS_DISCOGRAPHY_MAX_HOPS:
+        enqueue_discography_enumeration(hops=hops + 1)
+    elif metrics["remaining"]:
+        logger.info(
+            "discography enumeration: %d artist(s) still due at the hop cap — "
+            "the next member poll re-enqueues", metrics["remaining"],
+        )
 
 
 def _run_release_upcoming_poll(mode: str) -> None:
@@ -589,6 +673,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             # 15-minute member cron reconciles the same member with the same code.
             if body.get("job") == "lyrics_member_bootstrap":
                 _run_member_demand_bootstrap(body.get("user_id"))
+                continue
+
+            # Complete-discography enumeration (FEAT-lyrics Step 5). Enqueued by the
+            # member poll when due work exists, and self-chained while it remains.
+            if body.get("job") == "lyrics_discography_enumerate":
+                _run_discography_enumeration(hops=body.get("hops") or 0)
                 continue
 
             # Follow-import fan-out: catalog-ingest a chunk of followed artists

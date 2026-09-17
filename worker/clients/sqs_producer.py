@@ -110,6 +110,39 @@ def enqueue_follow_import_rerun(user_id: str) -> bool:
     return True
 
 
+def enqueue_discography_enumeration(hops: int = 0, delay_seconds: int = 0) -> bool:
+    """Ask a worker invocation to read the next batch of due discographies.
+
+    Carries no artist list: the consumer selects due artists itself, so a lost or
+    duplicated message costs at most one batch of latency and never skews *which*
+    artists get read. `hops` is the self-chaining counter — a run that still has due
+    work enqueues its successor with hops+1, and the consumer's cap stops a loop that
+    a permanently-failing artist would otherwise sustain. No-op (False) with no queue.
+    """
+    if not settings.SQS_QUEUE_URL:
+        logger.info("SQS_QUEUE_URL unset; skipping discography enumeration enqueue")
+        return False
+
+    import boto3
+
+    sqs = boto3.client(
+        "sqs",
+        region_name=settings.AWS_DEFAULT_REGION,
+        endpoint_url=(settings.LOCALSTACK_ENDPOINT or None),
+    )
+    kwargs = {
+        "QueueUrl": settings.SQS_QUEUE_URL,
+        "MessageBody": json.dumps(
+            {"job": "lyrics_discography_enumerate", "hops": int(hops)}
+        ),
+    }
+    if delay_seconds > 0:
+        kwargs["DelaySeconds"] = int(delay_seconds)
+    sqs.send_message(**kwargs)
+    logger.info("enqueued discography enumeration (hops=%d)", hops)
+    return True
+
+
 def enqueue_lyrics_incremental() -> None:
     """Chain a near-real-time incremental lyrics pass after an album sync lands new
     tracks (consumed by the handler's SQS branch as {"job": "lyrics_incremental"}).

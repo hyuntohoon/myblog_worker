@@ -199,14 +199,23 @@ def _run(session, client, kms, **kw):
     # Passing it explicitly also keeps these assertions honest: a demand failure here
     # would be swallowed into demand_failed rather than failing a test.
     kw.setdefault("demand_enabled", False)
+    # Same reasoning for Step 5's follow producer, and one sharper reason: with it on,
+    # this module's fake clients have no get_followed_artists at all, so every pass
+    # would quietly report follow_skipped=1 — an exception path standing in for a
+    # decision. Off is what these tests mean.
+    kw.setdefault("follow_enabled", False)
     return run_spotify_member_sync(
         lambda: session, client, kms=kms, kms_key_id=kw.pop("kms_key_id", "key-123"), **kw
     )
 
 
-# Every pass now reports the Step 4 demand counters alongside the listening ones; with
-# the producer off they are all zero.
-_NO_DEMAND = {"saved_added": 0, "saved_removed": 0, "recent_albums": 0, "demand_failed": 0}
+# Every pass reports the demand counters alongside the listening ones; with
+# both producers off they are all zero. These tests are about the listening poll, so
+# Step 5's five follow counters are listed rather than globbed, so a producer that
+# starts reporting under a new key fails here instead of being silently absorbed.
+_NO_DEMAND = {"saved_added": 0, "saved_removed": 0, "recent_albums": 0,
+              "demand_failed": 0, "follow_added": 0, "follow_removed": 0,
+              "follow_artists": 0, "follow_skipped": 0, "follow_failed": 0}
 
 
 class TestSpotifyMemberSync:

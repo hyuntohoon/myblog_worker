@@ -35,7 +35,6 @@ from sqlalchemy.orm import sessionmaker
 from myblog_shared_db.lyrics_demand import LyricsDemandStore, StaleDiscovery
 
 from worker.service.lyrics_member_demand_service import (
-    DISCOVERY_ORIGINS,
     RECENT_ORIGIN,
     SAVED_ORIGIN,
     sync_member_demand,
@@ -526,7 +525,7 @@ def test_revoking_the_app_at_spotify_revokes_the_demand_it_produced(factory, mem
     # never touches ([[feedback-measure-with-a-control]]).
     res = run_spotify_member_sync(
         factory, _RevokedForA(), kms=kms, kms_key_id="k", max_users=10,
-        only_user_id=str(a), demand_enabled=True,
+        only_user_id=str(a), demand_enabled=True, follow_enabled=False,
     )
     assert res["reauth"] == 1
 
@@ -548,11 +547,19 @@ def test_revoking_the_app_at_spotify_revokes_the_demand_it_produced(factory, mem
         b_actives = s.execute(
             text("SELECT count(*) FROM lyrics_discovery_scopes "
                  "WHERE user_id = :u AND active"), {"u": str(b)}).scalar()
-    # One live scope per origin — an empty `recent` page still opens its scope, so the
-    # number to expect here is the origin count, not 1.
-    assert b_actives == len(DISCOVERY_ORIGINS), (
+    # One live scope per origin this pass produced. An empty `recent` page still opens
+    # its scope, so the number is 2 rather than 1 — but NOT len(DISCOVERY_ORIGINS):
+    # Step 5's `follow` scope is opened only when there is a follow observation, and
+    # this pass runs with the follow producer off. Naming the two Step 4 origins keeps
+    # this assertion about what the pass did instead of about the length of a constant.
+    assert b_actives == 2, (
         "the revoke fired for a member who never lost their grant"
     )
+    with factory() as s:
+        b_origins = set(s.execute(
+            text("SELECT origin FROM lyrics_discovery_scopes WHERE user_id = :u AND active"),
+            {"u": str(b)}).scalars())
+    assert b_origins == {SAVED_ORIGIN, RECENT_ORIGIN}
 
 
 def test_a_failing_revoke_rolls_the_reauth_flip_back(factory, members, monkeypatch):

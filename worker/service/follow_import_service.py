@@ -46,6 +46,26 @@ _IMPORT_SQL = text(
     """
 ).bindparams(bindparam("sids", expanding=True))
 
+# V58 provenance for the rows above. Without it the owner's snapshot import creates
+# edges with NO origin row, and the invariant V58 asserts ("an edge always has at least
+# one origin") would hold only for the rows the migration backfilled.
+#
+# 'manual', not 'spotify_follow', and the distinction is the whole contract of this
+# job: the snapshot import is documented as keeping no link back to Spotify —
+# unfollowing there never untracks here. Labelling these 'spotify_follow' would hand
+# them to the Step 5 reconciler, which removes that origin when the provider stops
+# reporting the follow, and would silently convert a snapshot into a live mirror.
+# 'manual' keeps the existing behaviour exactly and makes the edge visible to the
+# follow union, which reads 'manual' rows explicitly and cannot see an edge with none.
+_IMPORT_ORIGIN_SQL = text(
+    """
+    INSERT INTO user_artist_track_origins (user_id, artist_id, origin)
+    SELECT :user_id, id, 'manual' FROM artists WHERE spotify_id IN :sids
+    ORDER BY id
+    ON CONFLICT (user_id, artist_id, origin) DO NOTHING
+    """
+).bindparams(bindparam("sids", expanding=True))
+
 _MATCH_SQL = text(
     "SELECT spotify_id FROM artists WHERE spotify_id IN :sids"
 ).bindparams(bindparam("sids", expanding=True))
@@ -111,6 +131,10 @@ def run_follow_import(
                 _IMPORT_SQL, {"user_id": user_uuid, "sids": sids}
             ).scalars()
         )
+        # Same transaction as the edge insert: an edge that commits without its
+        # provenance is invisible to the Step 5 follow union, which selects 'manual'
+        # rows rather than falling back on their absence.
+        session.execute(_IMPORT_ORIGIN_SQL, {"user_id": user_uuid, "sids": sids})
         session.commit()
 
     metrics["matched"] = len(matched_sids)

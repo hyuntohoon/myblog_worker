@@ -93,6 +93,7 @@ class _FakeSession:
         self.user_exists = user_exists
         self.already = set(already_imported)
         self.committed = False
+        self.origin_writes = []
 
     def __enter__(self):
         return self
@@ -108,6 +109,11 @@ class _FakeSession:
         elif sql.strip().startswith("SELECT spotify_id"):
             hits = [s for s in params["sids"] if s in self.matched]
             result.scalars.return_value = iter(hits)
+        elif "INSERT INTO user_artist_track_origins" in sql:
+            # V58 provenance, written in the same transaction as the edge. Recorded so
+            # the tests below can assert it happened rather than merely tolerate it:
+            # an edge with no origin row is invisible to the Step 5 follow union.
+            self.origin_writes.append(sorted(params["sids"]))
         elif "INSERT INTO user_artist_tracks" in sql:
             inserted = [
                 self.matched[s]
@@ -356,3 +362,24 @@ def test_handler_routes_follow_ingest(mock_run):
     }
     assert lambda_handler(event, None) == {"batchItemFailures": []}
     mock_run.assert_called_once_with(["sp1", "sp2"])
+
+
+@pytest.mark.unit
+def test_import_writes_manual_provenance_in_the_same_transaction_as_the_edge():
+    """V58's invariant is maintained by writers, not by DDL — this is one of them.
+
+    'manual' rather than 'spotify_follow': this import is a SNAPSHOT with no live link
+    back to Spotify, so labelling it a follow would hand it to Step 5's reconciler,
+    which removes that origin as soon as the provider stops reporting the follow. That
+    would quietly turn a snapshot into a mirror.
+    """
+    session = _FakeSession(matched={"sp1": uuid.uuid4(), "sp2": uuid.uuid4()})
+
+    run_follow_import(
+        lambda: session, _user_client_with(["sp1", "sp2"]),
+        enqueue_ingest=MagicMock(return_value=0), enqueue_rerun=MagicMock(return_value=True),
+        user_id=USER_ID,
+    )
+
+    assert session.origin_writes == [["sp1", "sp2"]]
+    assert session.committed, "provenance must land in the same commit as the edge"
