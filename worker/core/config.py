@@ -270,6 +270,34 @@ class Settings(BaseSettings):
     #   3. THEN revert the commits
     LYRICS_MEMBER_DEMAND_ENABLED: bool = True
 
+    # FEAT-lyrics-listening-experience Step 5 — the follow producer's OWN switch, kept
+    # separate from LYRICS_MEMBER_DEMAND_ENABLED on purpose. Step 4's producer costs a
+    # member's saved albums; this one costs their whole followed back catalogue, which
+    # the 2026-09-13 pre-measurement put at roughly 4x that per member. The owner must
+    # be able to stop the expensive half without also losing saved/recent demand.
+    #
+    # Rolling Step 5 back has the same shape as Step 4 and the same trap: the flag stops
+    # NEW production and does not touch what has already been produced. The order is
+    #   1. LYRICS_FOLLOW_DEMAND_ENABLED=false
+    #   2. revoke the 'follow' scope for every member (LyricsDemandStore.revoke_scopes,
+    #      or UPDATE lyrics_discovery_scopes SET active=false WHERE origin='follow'
+    #      + delete its demand rows) — while the revoking code is still deployed
+    #   3. THEN revert the commits
+    LYRICS_FOLLOW_DEMAND_ENABLED: bool = True
+
+    # Bounds for one discography enumeration invocation, so a run always finishes inside
+    # the 120s Lambda. These are operational limits on a single run, NOT a cap on scope
+    # (D5): whatever is left stays due and the next run resumes from its checkpoint.
+    LYRICS_DISCOGRAPHY_ARTISTS_PER_RUN: int = 10
+    LYRICS_DISCOGRAPHY_PAGES_PER_ARTIST: int = 10
+    # How long a completed discography stays trusted before it is re-read for new
+    # releases (D4: "keep future release ingestion connected"). 0 disables the refresh.
+    LYRICS_DISCOGRAPHY_REFRESH_HOURS: int = 24
+    # Self-chaining bound for the bootstrap burst. One member's first pass can owe more
+    # artists than a single run covers; each run enqueues at most one continuation, and
+    # the hop cap stops a loop that a permanently-failing artist would otherwise sustain.
+    LYRICS_DISCOGRAPHY_MAX_HOPS: int = 20
+
     # ISRC backfill (FEAT-lyrics-corpus Step 1b, worker EventBridge job). Bounded like every
     # other scheduled job so a run always finishes inside the 120s Lambda timeout: 500 tracks
     # is 10 Spotify chunks of 50, and the budget stops the loop rather than letting a 429

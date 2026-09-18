@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from worker.core.config import settings
 from worker.clients.spotify_user_client import (
+    FOLLOW_PAGE_LIMIT,
     LIBRARY_PAGE_LIMIT,
     _is_invalid_grant,
     _load_spotify_creds,
@@ -42,6 +43,19 @@ class SpotifyMemberScopeError(RuntimeError):
     renders a library-scope reconsent prompt from the stored scope string
     (`spotifyGrantLacksLibraryScopes`), so the caller just skips the saved-album
     origin for this member and leaves everything else running."""
+
+
+class SpotifyMemberFollowScopeError(RuntimeError):
+    """The member's grant lacks `user-follow-read` (403 on /me/following).
+
+    Deliberately a third class rather than a reuse of SpotifyMemberScopeError.
+    Both mean "the token is fine, one grant is missing", but they gate different
+    origins, and every member who connected before Step 5 has exactly this gap:
+    `user-follow-read` was not in the authorize URL, so their stored grant cannot
+    read follows until they re-consent. Collapsing the two would make the front's
+    library-reconsent prompt fire for a follow-only gap, and would let a follow gap
+    silently skip the saved-album origin as well.
+    """
 
 
 class SpotifyMemberClient:
@@ -133,6 +147,46 @@ class SpotifyMemberClient:
             if isinstance(total, int) and offset >= total:
                 break
         return albums
+
+    def get_followed_artists(self, access_token: str) -> List[Dict[str, Any]]:
+        """GET /me/following?type=artist — the MEMBER's followed artists, cursor-paged.
+
+        Cursor pagination, not offset: Spotify returns `artists.cursors.after` and the
+        page is requested with `after=<last artist id>`. Same contract as the owner
+        client's twin (`spotify_user_client.get_followed_artists`) but stateless — the
+        access token is passed per call because members share no cached token.
+
+        A 403 is a missing `user-follow-read` grant, not a revoked token: raise
+        SpotifyMemberFollowScopeError so the caller skips the follow origin and leaves
+        the member's player, library and recent reads running.
+        """
+        url = f"{settings.SPOTIFY_API_BASE}/me/following"
+        artists: List[Dict[str, Any]] = []
+        after: Optional[str] = None
+        while True:
+            params: Dict[str, Any] = {"type": "artist", "limit": FOLLOW_PAGE_LIMIT}
+            if after:
+                params["after"] = after
+            r = _request_with_retry(
+                "GET", url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                params=params, timeout=20,
+            )
+            if r.status_code == 403:
+                raise SpotifyMemberFollowScopeError(
+                    "Spotify GET /me/following returned 403 (grant lacks user-follow-read)"
+                )
+            r.raise_for_status()
+            block = (r.json() or {}).get("artists") or {}
+            items = block.get("items") or []
+            artists.extend(it for it in items if it and it.get("id"))
+            after = (block.get("cursors") or {}).get("after")
+            # `after` is the authoritative paginator. An empty page or a null cursor
+            # ends it; there is no `total`-based guard because /me/following's total
+            # is not a page bound.
+            if not items or not after:
+                break
+        return artists
 
     def get_recently_played(self, access_token: str, limit: int = 50) -> List[Dict[str, Any]]:
         """GET /me/player/recently-played → raw play items (most recent first).

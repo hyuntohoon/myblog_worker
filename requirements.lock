@@ -7,7 +7,7 @@
 # The target and the freeze are both pinned, so this file does not depend on
 # the machine or the day that produced it: a macOS arm64 laptop and the
 # x86_64 CI runner produce byte-identical output.
-# requirements.txt sha256: 73c38f4aae0bf1d50760d7f1b444d7ca5e22dffa780af196c09cbecb13d4e3dd
+# requirements.txt sha256: 48cfe86cafbb223784328b0c556ed6508e3df5a95f0ed2b62df3a4d78036d94f
 # To regenerate (or to take newer releases, after moving EXCLUDE_NEWER):
 #
 #    ./scripts/compile_requirements.sh
@@ -44,7 +44,7 @@ jmespath==1.1.0
     #   botocore
 musicbrainzngs==0.7.1
     # via -r requirements.txt
-myblog-shared-db @ git+https://github.com/hyuntohoon/myblog_shared_db.git@6c57b78b36981ccc2226235f6d835927964243c7
+myblog-shared-db @ git+https://github.com/hyuntohoon/myblog_shared_db.git@98875c8450388f8b308730206c3e6883ecc87b67
     # via -r requirements.txt
 psycopg==3.2.13
     # via -r requirements.txt

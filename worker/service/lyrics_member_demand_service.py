@@ -54,14 +54,20 @@ logger = logging.getLogger(__name__)
 
 SAVED_ORIGIN = "saved"
 RECENT_ORIGIN = "recent"
+# Step 5's third origin. It lives here beside the other two, and
+# lyrics_follow_demand_service imports it from here rather than spelling it again —
+# a second spelling of "follow" is a revoke that silently misses one scope.
+FOLLOW_ORIGIN = "follow"
 
 # Every discovery origin a Spotify connection feeds, in one place per repo. Both the
 # producer below and the two revoke sites (an API disconnect in the backend, an
 # `invalid_grant` in the poll) must agree on this list: an origin produced here but
 # missing from a revoke keeps consuming a member's library after they have withdrawn it.
-# The backend's twin is `IntegrationService.SPOTIFY_DISCOVERY_ORIGINS`. Step 5 adds
-# 'follow' and must extend BOTH ([[feedback-cross-repo-twin-drift-sweep]]).
-DISCOVERY_ORIGINS = (SAVED_ORIGIN, RECENT_ORIGIN)
+# The backend's twin is `IntegrationService.SPOTIFY_DISCOVERY_ORIGINS`; a change here
+# lands in both in the same PR ([[feedback-cross-repo-twin-drift-sweep]]). Step 5's
+# 'follow' is imported from its own module rather than restated, so the producer and
+# the list cannot disagree about the origin's name.
+DISCOVERY_ORIGINS = (SAVED_ORIGIN, RECENT_ORIGIN, FOLLOW_ORIGIN)
 
 # Both origins key a demand row by the provider album id. It is the only identity we
 # have at production time (the catalog UUID may not exist yet — that is exactly what
