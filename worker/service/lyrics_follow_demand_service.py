@@ -126,6 +126,7 @@ _UPSERT_EDGE_ORIGIN = text(
     INSERT INTO user_artist_track_origins (user_id, artist_id, origin)
     VALUES (:member, :artist, :origin)
     ON CONFLICT (user_id, artist_id, origin) DO NOTHING
+    RETURNING artist_id
     """
 )
 
@@ -179,34 +180,57 @@ def _reconcile_tracked_edges(
     metrics = {"edges_added": 0, "edges_removed": 0, "edges_orphaned": 0}
     wanted = [sid for sid in followed_sids if sid not in excluded_sids]
 
+    # ONE transaction, holding the member's connection row, for the whole reconcile.
+    #
+    # The per-artist transactions this replaced were the real defect: the caller takes
+    # `_CONNECTION_EXISTS ... FOR UPDATE`, commits, and only then reconciles, so a
+    # member with 300 follows left a window hundreds of round-trips wide in which a
+    # disconnect could commit and every remaining edge would still be written — after
+    # consent was withdrawn, and with nothing able to prune them afterwards, because a
+    # disconnected member is no longer selected by the poll.
+    #
+    # Holding the row for the duration closes it in both orderings, the same way Step 4's
+    # producer guard does: a disconnect that commits first leaves no row to find, and one
+    # that commits second blocks until this finishes and then revokes what was written.
+    # Safe to hold because this block is pure DB work — the Spotify read already happened
+    # and no external call is made inside it, so it is not the idle-in-transaction shape.
     with session_factory() as session:
+        if session.execute(_CONNECTION_EXISTS, {"member": user_id}).first() is None:
+            logger.info(
+                "follow edges: connection withdrawn mid-pass (user_id=%s) — writing nothing",
+                user_id,
+            )
+            session.rollback()
+            return metrics
         matched = session.execute(_MATCH_ARTISTS, {"sids": wanted}).all() if wanted else []
         existing = session.execute(_SELECT_SPOTIFY_EDGES, {"member": user_id}).all()
-    by_sid = {sid: artist_id for artist_id, sid in matched}
-    # Sorted by the conflict key so two concurrent passes take rows in one order.
-    for artist_id in sorted(by_sid.values()):
-        with session_factory() as session:
+        by_sid = {sid: artist_id for artist_id, sid in matched}
+
+        # Sorted by the conflict key so two concurrent passes take rows in one order.
+        for artist_id in sorted(by_sid.values()):
             session.execute(_UPSERT_EDGE, {"member": user_id, "artist": artist_id})
-            added = session.execute(
+            # RETURNING, not rowcount: this project has twice recorded prod psycopg
+            # answering -1 for an `INSERT … ON CONFLICT DO NOTHING`, and `1 if -1 else 0`
+            # is 1 — which would report every artist as newly added on every steady-state
+            # pass, in the very metric a rollout is read from.
+            inserted = session.execute(
                 _UPSERT_EDGE_ORIGIN,
                 {"member": user_id, "artist": artist_id, "origin": SPOTIFY_TRACK_ORIGIN},
-            ).rowcount
-            session.commit()
-        metrics["edges_added"] += 1 if added else 0
+            ).first()
+            metrics["edges_added"] += 1 if inserted is not None else 0
 
-    keep = set(by_sid.values())
-    for artist_id, _sid in existing:
-        if artist_id in keep:
-            continue
-        # Unfollowed at Spotify, or newly excluded. Either way only OUR origin goes.
-        with session_factory() as session:
+        keep = set(by_sid.values())
+        for artist_id, _sid in existing:
+            if artist_id in keep:
+                continue
+            # Unfollowed at Spotify, or newly excluded. Either way only OUR origin goes.
             session.execute(_DELETE_EDGE_ORIGIN, {"member": user_id, "artist": artist_id})
             orphaned = session.execute(
                 _DELETE_ORPHAN_EDGE, {"member": user_id, "artist": artist_id}
             ).rowcount
-            session.commit()
-        metrics["edges_removed"] += 1
-        metrics["edges_orphaned"] += 1 if orphaned else 0
+            metrics["edges_removed"] += 1
+            metrics["edges_orphaned"] += 1 if orphaned else 0
+        session.commit()
     return metrics
 
 

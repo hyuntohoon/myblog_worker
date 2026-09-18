@@ -218,6 +218,15 @@ def _run_discography_enumeration(hops: int = 0) -> None:
         run_discography_enumeration,
     )
 
+    # The kill switch has to reach the CONSUMER, not only the thing that enqueues it.
+    # The chain always has a message in flight while work remains, so a switch checked
+    # only in the nudge would let the in-flight message re-open every stale discography
+    # and spend up to the hop cap in further provider reads after the owner threw it —
+    # against a quota this project cannot get back.
+    if not settings.LYRICS_FOLLOW_DEMAND_ENABLED:
+        logger.info("discography enumeration skipped — LYRICS_FOLLOW_DEMAND_ENABLED=false")
+        return
+
     reopened = reopen_stale_discographies(
         SessionLocal, settings.LYRICS_DISCOGRAPHY_REFRESH_HOURS
     )
@@ -232,7 +241,10 @@ def _run_discography_enumeration(hops: int = 0) -> None:
     )
 
     try:
-        hops = int(hops)
+        # Clamped at zero: a negative counter (a replayed or hand-written message) would
+        # make `hops + 1 < MAX_HOPS` true indefinitely and disable the loop bound the cap
+        # exists to provide.
+        hops = max(0, int(hops))
     except (TypeError, ValueError):
         # A malformed counter must not read as "hop 0" and restart the budget; treat
         # it as exhausted and let the next poll tick re-enqueue from a clean 0.

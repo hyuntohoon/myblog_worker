@@ -493,3 +493,54 @@ def test_a_malformed_hop_counter_does_not_restart_the_budget(
          patch("worker.clients.sqs_producer.enqueue_discography_enumeration") as enqueue:
         _run_discography_enumeration(hops="not-a-number")
         enqueue.assert_not_called()
+
+
+@pytest.mark.unit
+@patch("worker.handler.settings")
+@patch("worker.handler.spotify")
+@patch("worker.handler.SessionLocal")
+def test_the_kill_switch_stops_the_enumeration_consumer_not_only_the_nudge(
+        mock_session, mock_spotify, mock_settings):
+    """A switch checked only where messages are PRODUCED is not a switch.
+
+    The chain always has a message in flight while work remains, so an owner throwing
+    the flag during a cost incident would still see that message re-open every stale
+    discography and spend up to the hop cap in further provider reads — against a quota
+    this project cannot get back.
+    """
+    from worker.handler import _run_discography_enumeration
+
+    mock_settings.LYRICS_FOLLOW_DEMAND_ENABLED = False
+    with patch("worker.service.lyrics_discography_service.reopen_stale_discographies") as reopen, \
+         patch("worker.service.lyrics_discography_service.run_discography_enumeration") as run, \
+         patch("worker.clients.sqs_producer.enqueue_discography_enumeration") as enqueue:
+        _run_discography_enumeration(hops=0)
+        reopen.assert_not_called()
+        run.assert_not_called()
+        enqueue.assert_not_called()
+
+
+@pytest.mark.unit
+@patch("worker.handler.settings")
+@patch("worker.handler.spotify")
+@patch("worker.handler.SessionLocal")
+def test_a_negative_hop_counter_cannot_disable_the_loop_bound(
+        mock_session, mock_spotify, mock_settings):
+    """`hops + 1 < MAX_HOPS` is trivially true forever for a negative counter, so a
+    replayed or hand-written message would turn the cap off for that chain."""
+    from worker.handler import _run_discography_enumeration
+
+    mock_settings.LYRICS_FOLLOW_DEMAND_ENABLED = True
+    mock_settings.LYRICS_DISCOGRAPHY_ARTISTS_PER_RUN = 10
+    mock_settings.LYRICS_DISCOGRAPHY_PAGES_PER_ARTIST = 10
+    mock_settings.LYRICS_DISCOGRAPHY_REFRESH_HOURS = 24
+    mock_settings.LYRICS_DISCOGRAPHY_MAX_HOPS = 1
+
+    with patch("worker.service.lyrics_discography_service.reopen_stale_discographies",
+               return_value=0), \
+         patch("worker.service.lyrics_discography_service.run_discography_enumeration",
+               return_value={"remaining": 7}), \
+         patch("worker.clients.sqs_producer.enqueue_discography_enumeration") as enqueue:
+        _run_discography_enumeration(hops=-1_000_000)
+        # Clamped to 0, so 0 + 1 < 1 is false and the chain stops here.
+        enqueue.assert_not_called()

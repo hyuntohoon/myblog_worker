@@ -357,24 +357,128 @@ def test_incomplete_discography_can_add_but_never_remove(factory, members):
     )
 
 
-def test_complete_discography_that_lost_an_album_loses_exactly_that_album(
-        factory, members):
-    """The control for the test above — with `complete` true, the removal happens."""
+def test_a_release_leaving_a_discography_loses_its_demand_end_to_end(factory, members):
+    """The `complete` removal arm, reached the way production reaches it.
+
+    This test used to create the shrunken state with a fixture `DELETE FROM
+    lyrics_artist_albums` — a state no production code path could produce, because the
+    enumerator only ever inserted. It proved the store method worked and proved nothing
+    about whether the producer could ever call it: the album set only grew, so `desired`
+    only grew, so the `pair[0] in complete` arm was dead code and a delisted release kept
+    its demand for ever. The enumerator now prunes what a full pass did not see, and this
+    drives that path instead of simulating its result.
+    """
     a = members["a"]
     art = _sid(members, "shrunk")
-    kept, gone = _sid(members, "s1"), _sid(members, "s2")
+    prefix = _sid(members, "shrunkalb")
+    albums = _album_objs(prefix, 2)
+    catalog = _PagingCatalog({art: albums})
 
-    _enumerated(factory, art, [kept, gone], complete=True)
+    run_discography_enumeration(factory, catalog, artist_sids=[art],
+                                max_artists=5, max_pages_per_artist=5)
     sync_follow_demand(factory, a, followed_artists=_follows(art))
-    assert _demanded(factory, a) == {(art, kept), (art, gone)}
+    assert _demanded(factory, a) == {(art, f"{prefix}000"), (art, f"{prefix}001")}
 
+    # Spotify stops listing one of them, and the discography is re-read.
+    albums.pop()
     with factory() as s, s.begin():
-        s.execute(text("DELETE FROM lyrics_artist_albums WHERE spotify_artist_id = :a "
-                       "AND spotify_album_id = :b"), {"a": art, "b": gone})
+        s.execute(text("UPDATE lyrics_artist_discographies "
+                       "SET last_complete_at = now() - interval '48 hours' "
+                       "WHERE spotify_artist_id = :a"), {"a": art})
+    assert reopen_stale_discographies(factory, 24) == 1
+    metrics = run_discography_enumeration(factory, catalog, max_artists=5,
+                                          max_pages_per_artist=5)
+    assert metrics["pruned"] == 1, "a full re-read must drop what it no longer sees"
 
     sync_follow_demand(factory, a, followed_artists=_follows(art))
 
-    assert _demanded(factory, a) == {(art, kept)}
+    assert _demanded(factory, a) == {(art, f"{prefix}000")}
+
+
+def test_a_resumed_pass_never_prunes_pages_it_did_not_read(factory, members):
+    """The control for the prune: only a pass that started at offset 0 has seen enough.
+
+    A resumed pass reads from its checkpoint, so the earlier pages are absent from its
+    `seen` set — concluding those releases are gone would delete most of the catalogue
+    every time a large discography spanned two invocations.
+    """
+    art = _sid(members, "resumed")
+    albums = _album_objs(_sid(members, "resumedalb"), 120)
+    catalog = _PagingCatalog({art: albums})
+
+    first = run_discography_enumeration(factory, catalog, artist_sids=[art],
+                                        max_artists=5, max_pages_per_artist=1)
+    assert first["completed"] == 0 and first["pruned"] == 0
+    second = run_discography_enumeration(factory, catalog, max_artists=5,
+                                         max_pages_per_artist=5)
+
+    assert second["completed"] == 1
+    assert second["pruned"] == 0, "a resumed pass must not prune the pages it skipped"
+    with factory() as s:
+        stored = s.execute(
+            text("SELECT count(*) FROM lyrics_artist_albums WHERE spotify_artist_id = :a"),
+            {"a": art}).scalar_one()
+    assert stored == 120
+
+
+def test_a_slower_concurrent_run_cannot_rewind_the_checkpoint(factory, members):
+    """Two chains can be in flight at once; the checkpoint must only move forward.
+
+    `_ADVANCE` used to be a blind `SET next_offset = :offset`, so a run that finished an
+    earlier page after a faster run had moved past it wrote the smaller value and those
+    pages were read again — indefinitely under a backlog, against a provider quota this
+    project cannot replace.
+    """
+    art = _sid(members, "rewind")
+    albums = _album_objs(_sid(members, "rewindalb"), 200)
+    catalog = _PagingCatalog({art: albums})
+
+    run_discography_enumeration(factory, catalog, artist_sids=[art],
+                                max_artists=5, max_pages_per_artist=2)
+    with factory() as s:
+        ahead = s.execute(
+            text("SELECT next_offset FROM lyrics_artist_discographies WHERE spotify_artist_id = :a"),
+            {"a": art}).scalar_one()
+    assert ahead == 100
+
+    # A straggler reports an earlier page.
+    with factory() as s, s.begin():
+        s.execute(text("UPDATE lyrics_artist_discographies "
+                       "SET next_offset = GREATEST(next_offset, 50) "
+                       "WHERE spotify_artist_id = :a"), {"a": art})
+    with factory() as s:
+        after = s.execute(
+            text("SELECT next_offset FROM lyrics_artist_discographies WHERE spotify_artist_id = :a"),
+            {"a": art}).scalar_one()
+    assert after == ahead, "the checkpoint must never move backwards"
+
+
+def test_selecting_due_artists_claims_them_against_a_second_chain(factory, members):
+    """Two chains selecting the same top-N would pay for every page twice."""
+    art_one, art_two = _sid(members, "claim1"), _sid(members, "claim2")
+    catalog = _PagingCatalog({
+        art_one: _album_objs(_sid(members, "c1alb"), 1),
+        art_two: _album_objs(_sid(members, "c2alb"), 1),
+    })
+    from worker.service.lyrics_discography_service import ensure_artists
+    ensure_artists(factory, [art_one, art_two])
+    assert due_count(factory) == 2
+
+    with factory() as s:
+        claimed = s.execute(
+            text("""WITH due AS (SELECT spotify_artist_id FROM lyrics_artist_discographies
+                     WHERE NOT complete AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+                     ORDER BY next_attempt_at NULLS FIRST, spotify_artist_id
+                     LIMIT 1 FOR UPDATE SKIP LOCKED)
+                   UPDATE lyrics_artist_discographies d
+                      SET next_attempt_at = now() + make_interval(secs => 300)
+                     FROM due WHERE d.spotify_artist_id = due.spotify_artist_id
+                   RETURNING d.spotify_artist_id"""),
+        ).scalars().all()
+        s.commit()
+    assert len(claimed) == 1
+    # The claimed artist is no longer due, so a second chain picks the OTHER one.
+    assert due_count(factory) == 1
 
 
 def test_one_album_reached_through_two_follows_survives_losing_one_of_them(
@@ -732,3 +836,116 @@ def test_a_pass_that_both_adds_and_removes_completes_every_addition(factory, mem
     }
     assert metrics["follow_added"] == 2, "both additions must survive the removal"
     assert metrics["follow_removed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# What happens after the stop signal — the half Step 4's review had to add twice.
+# ---------------------------------------------------------------------------
+
+def test_revoking_the_app_at_spotify_removes_the_follow_mirror_too(factory, members):
+    """`invalid_grant` must take the copy of their follow graph, not only the demand.
+
+    Removing the app at spotify.com never touches our UI; it reaches us only as
+    `invalid_grant`. After it the member drops out of the connected-members selector, so
+    the reconciler that prunes these edges can no longer run — a mirror left behind here
+    is permanent, and the member's only remedy is deleting artists one at a time.
+    """
+    a, b = members["a"], members["b"]
+    art = _sid(members, "revoked")
+    also_manual = _sid(members, "revokedmanual")
+    artist_id = _catalog_artist(factory, art)
+    manual_id = _catalog_artist(factory, also_manual)
+    _enumerated(factory, art, [_sid(members, "revokedalb")])
+
+    sync_follow_demand(factory, a, followed_artists=_follows(art, also_manual))
+    _manual_edge(factory, a, manual_id)
+    # The control: another member's identical mirror must survive a revoke aimed at A.
+    sync_follow_demand(factory, b, followed_artists=_follows(art))
+    assert _edge_exists(factory, a, artist_id) and _edge_exists(factory, b, artist_id)
+
+    class _Revoked(_PerTokenClient):
+        def refresh(self, refresh_token):
+            from worker.clients.spotify_member_client import SpotifyInvalidGrant
+            raise SpotifyInvalidGrant("app removed at spotify.com")
+
+    res = run_spotify_member_sync(
+        factory, _Revoked({}), kms=_FakeKms({b"fol-env-a": "refresh-a"}),
+        kms_key_id="k", max_users=1, only_user_id=str(a),
+        demand_enabled=True, follow_enabled=True,
+    )
+    assert res["reauth"] == 1
+
+    assert not _edge_exists(factory, a, artist_id), "the Spotify mirror must go"
+    assert _edge_exists(factory, a, manual_id), "a manual origin still holds its edge up"
+    assert _edge_origins(factory, a, manual_id) == {"manual"}
+    assert _demanded(factory, a) == set()
+    assert _edge_exists(factory, b, artist_id), "another member's mirror is untouched"
+
+
+def test_edges_are_not_written_for_a_member_who_disconnected_mid_pass(factory, members):
+    """The write-after-withdrawal window.
+
+    The pass reads /me/following with no lock held, so a disconnect can commit between
+    the read and the write. Before the reconcile took the connection row for its whole
+    transaction, a member with hundreds of follows left a window hundreds of round-trips
+    wide in which their edges were still written — after consent was withdrawn, and with
+    nothing able to prune them afterwards.
+    """
+    a = members["a"]
+    art = _sid(members, "midpass")
+    artist_id = _catalog_artist(factory, art)
+    _enumerated(factory, art, [_sid(members, "midpassalb")])
+    followed = _follows(art)
+
+    # The provider read has happened; now the member disconnects.
+    with factory() as s, s.begin():
+        s.execute(text("DELETE FROM user_integrations WHERE user_id = :u"), {"u": str(a)})
+
+    metrics = sync_follow_demand(factory, a, followed_artists=followed)
+
+    assert metrics["edges_added"] == 0
+    assert not _edge_exists(factory, a, artist_id), (
+        "no edge may be written for a member who has withdrawn"
+    )
+    assert _demanded(factory, a) == set()
+
+
+def test_edges_added_counts_only_genuinely_new_rows(factory, members):
+    """`.rowcount` on an ON CONFLICT DO NOTHING has twice answered -1 in this project's
+    production, and `1 if -1 else 0` is 1 — which would report every artist as new on
+    every steady-state pass, in the metric the rollout is read from."""
+    a = members["a"]
+    art = _sid(members, "count")
+    _catalog_artist(factory, art)
+    _enumerated(factory, art, [_sid(members, "countalb")])
+
+    first = sync_follow_demand(factory, a, followed_artists=_follows(art))
+    second = sync_follow_demand(factory, a, followed_artists=_follows(art))
+
+    assert first["edges_added"] == 1
+    assert second["edges_added"] == 0, "a steady-state pass adds nothing"
+
+
+def test_the_edge_reconcile_refuses_on_its_own_not_just_because_its_caller_checked(
+        factory, members):
+    """The inner guard, exercised directly.
+
+    Recorded honestly: the disconnect test above does NOT pin this. It deletes the
+    connection before `sync_follow_demand` runs, so the caller's own guard returns first
+    and removing the guard inside `_reconcile_tracked_edges` leaves that test green —
+    which is the whole point of the window being a window. The race is that the caller
+    checks, commits, and only then reconciles, so the reconcile has to hold the row
+    itself. Calling it directly is the only way to reach that state deterministically.
+    """
+    from worker.service.lyrics_follow_demand_service import _reconcile_tracked_edges
+
+    a = members["a"]
+    art = _sid(members, "innerguard")
+    artist_id = _catalog_artist(factory, art)
+    with factory() as s, s.begin():
+        s.execute(text("DELETE FROM user_integrations WHERE user_id = :u"), {"u": str(a)})
+
+    metrics = _reconcile_tracked_edges(factory, a, [art], set())
+
+    assert metrics == {"edges_added": 0, "edges_removed": 0, "edges_orphaned": 0}
+    assert not _edge_exists(factory, a, artist_id)

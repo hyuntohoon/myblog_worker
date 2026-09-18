@@ -55,14 +55,29 @@ _PAGE_LIMIT = 50
 # Artists that still owe pages: never enumerated, interrupted mid-way, or a completed
 # discography whose refresh has come due (the producer resets `complete` for those, so
 # "not complete and due" is the single selector for all three).
+# Selecting and CLAIMING in one statement. `next_attempt_at` doubles as the lease: a
+# claimed artist stops being due, so a second chain's `_SELECT_DUE` skips it instead of
+# issuing the same provider pages. Without this the poll's chain and a connect-time
+# chain select the same top-N and pay for every page twice.
+#
+# The lease is short and self-healing: a run that dies without advancing leaves the
+# artist due again after it expires, which is the same recovery a deferred failure gets.
 _SELECT_DUE = text(
     """
-    SELECT spotify_artist_id, next_offset
-      FROM lyrics_artist_discographies
-     WHERE NOT complete
-       AND (next_attempt_at IS NULL OR next_attempt_at <= now())
-     ORDER BY next_attempt_at NULLS FIRST, spotify_artist_id
-     LIMIT :lim
+    WITH due AS (
+        SELECT spotify_artist_id
+          FROM lyrics_artist_discographies
+         WHERE NOT complete
+           AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+         ORDER BY next_attempt_at NULLS FIRST, spotify_artist_id
+         LIMIT :lim
+         FOR UPDATE SKIP LOCKED
+    )
+    UPDATE lyrics_artist_discographies d
+       SET next_attempt_at = now() + make_interval(secs => :lease), updated_at = now()
+      FROM due
+     WHERE d.spotify_artist_id = due.spotify_artist_id
+    RETURNING d.spotify_artist_id, d.next_offset
     """
 )
 
@@ -92,11 +107,15 @@ _INSERT_ALBUM = text(
     """
 )
 
+# GREATEST, not a blind SET: two chains can be in flight at once (the 15-minute poll
+# and a member connecting), and a slower one finishing an EARLIER page would otherwise
+# write a smaller offset and rewind the checkpoint, so those pages get read again — for
+# ever, under a sustained backlog, against a provider quota this project cannot replace.
 _ADVANCE = text(
     """
     UPDATE lyrics_artist_discographies
-       SET next_offset = :offset, album_total = :total, last_reason = NULL,
-           next_attempt_at = NULL, updated_at = now()
+       SET next_offset = GREATEST(next_offset, :offset), album_total = :total,
+           last_reason = NULL, next_attempt_at = NULL, updated_at = now()
      WHERE spotify_artist_id = :artist
     """
 )
@@ -107,6 +126,19 @@ _FINISH = text(
        SET next_offset = 0, complete = true, album_total = :total, last_reason = NULL,
            next_attempt_at = NULL, last_complete_at = now(), updated_at = now()
      WHERE spotify_artist_id = :artist
+    """
+)
+
+# Releases that were in this artist's discography and are not any more — delisted, or
+# re-issued under a new id. Without this the table only ever grows, and `complete` never
+# authorises a removal because the desired set never shrinks: the producer could add but
+# never subtract, which is the one-way ratchet the store's `remove_demand` was added to
+# break. Run ONLY after a pass that read the discography from offset 0 in one invocation;
+# a resumed pass has not seen the earlier pages and must not conclude they are gone.
+_PRUNE_UNSEEN = text(
+    """
+    DELETE FROM lyrics_artist_albums
+     WHERE spotify_artist_id = :artist AND NOT (spotify_album_id = ANY(:seen))
     """
 )
 
@@ -205,8 +237,13 @@ def _enumerate_one(
     Returns {'pages', 'albums', 'complete', 'deferred'}. Never raises for a provider
     failure: one dead artist must not cost the rest of the run its progress.
     """
-    result = {"pages": 0, "albums": 0, "complete": 0, "deferred": 0}
+    result = {"pages": 0, "albums": 0, "complete": 0, "deferred": 0, "pruned": 0}
     offset = max(0, int(start_offset))
+    # Only a pass that starts at the beginning sees the whole discography, so only that
+    # pass may conclude a release has disappeared. A resumed pass skips the prune; the
+    # next refresh resets the checkpoint to 0 and picks it up.
+    full_pass = offset == 0
+    seen: List[str] = []
 
     for _ in range(max_pages):
         # --- provider read, NO session held -------------------------------
@@ -250,6 +287,7 @@ def _enumerate_one(
 
         # Sorted by the conflict key before insert (bulk-upsert deadlock rule).
         rows.sort(key=lambda r: r["album"])
+        seen.extend(row["album"] for row in rows)
         offset += len(items)
         # `next` is the authoritative paginator, exactly as in the library clients;
         # `total` only guards a never-null `next`.
@@ -262,6 +300,10 @@ def _enumerate_one(
             for row in rows:
                 session.execute(_INSERT_ALBUM, row)
             if finished:
+                if full_pass:
+                    result["pruned"] = session.execute(
+                        _PRUNE_UNSEEN, {"artist": artist_sid, "seen": seen or [""]}
+                    ).rowcount or 0
                 session.execute(_FINISH, {"artist": artist_sid, "total": total})
             else:
                 session.execute(
@@ -287,6 +329,7 @@ def run_discography_enumeration(
     max_artists: int = 10,
     max_pages_per_artist: int = 10,
     retry_seconds: int = 900,
+    lease_seconds: int = 300,
 ) -> Dict[str, int]:
     """Enumerate due artists' discographies, bounded and resumable.
 
@@ -300,13 +343,16 @@ def run_discography_enumeration(
     """
     metrics = {
         "requested": 0, "artists": 0, "pages": 0, "albums": 0,
-        "completed": 0, "deferred": 0, "remaining": 0,
+        "completed": 0, "deferred": 0, "pruned": 0, "remaining": 0,
     }
     if artist_sids:
         metrics["requested"] = ensure_artists(session_factory, artist_sids)
 
     with session_factory() as session:
-        due = session.execute(_SELECT_DUE, {"lim": max_artists}).fetchall()
+        due = session.execute(
+            _SELECT_DUE, {"lim": max_artists, "lease": lease_seconds}
+        ).fetchall()
+        session.commit()
     if not due:
         logger.info("discography enumeration: nothing due")
         return metrics
@@ -321,6 +367,7 @@ def run_discography_enumeration(
         metrics["albums"] += one["albums"]
         metrics["completed"] += one["complete"]
         metrics["deferred"] += one["deferred"]
+        metrics["pruned"] += one["pruned"]
 
     metrics["remaining"] = due_count(session_factory)
     logger.info("discography enumeration metrics: %s", metrics)

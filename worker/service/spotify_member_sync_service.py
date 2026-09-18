@@ -339,9 +339,14 @@ def _sync_one(session_factory, client, kms, kms_key_id: str, user_id: Any, paylo
         # member has no scope rows.
         with session_factory() as session, session.begin():
             session.execute(_UPDATE_REAUTH, {"user_id": user_id})
-            LyricsDemandStore(session.connection()).revoke_scopes(
-                user_id, list(DISCOVERY_ORIGINS)
-            )
+            store = LyricsDemandStore(session.connection())
+            store.revoke_scopes(user_id, list(DISCOVERY_ORIGINS))
+            # Step 5's second artefact. `revoke_scopes` removes the member's demand;
+            # this removes the copy of WHOM THEY FOLLOW that Step 5 writes into their
+            # site tracking. Withdrawing at the provider is the strongest "stop using my
+            # account" signal there is, and after it the reconciler can no longer run —
+            # so a mirror left behind here is permanent, not merely stale.
+            store.revoke_provider_follows(user_id)
         return {"recent": 0, "reauth": 1}
 
     access_token = token_body["access_token"]
