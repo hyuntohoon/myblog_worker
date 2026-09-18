@@ -68,10 +68,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: hyuntohoon/myblog_shared_db
-          # FEAT-lyrics-listening-experience Step 2: runtime and canonical
-          # schema both pin V57. The dormant repository is available to later
-          # producers; no handler or automatic dispatch is activated here.
-          ref: 6c57b78b36981ccc2226235f6d835927964243c7
+          # FEAT-lyrics-listening-experience Step 5: runtime and canonical schema
+          # both pin V58. This ref is a SECOND copy of the pin in requirements.txt and
+          # must move with it — a bump that touches only the lock leaves CI loading a
+          # schema without the new tables, which fails as "relation does not exist" and
+          # reads like a missing migration rather than a stale workflow.
+          ref: 5bd22c492fd505094e72339c2e6fbd4c57f744a8
           token: ${{ secrets.SHARED_DB_PAT }}
           persist-credentials: false
           path: shared-db-schema
