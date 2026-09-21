@@ -50,6 +50,8 @@ from worker.service.lyrics_member_demand_service import (
     FOLLOW_ORIGIN,
     SAVED_ORIGIN,
 )
+
+from myblog_shared_db.lyrics_demand import LyricsDemandStore
 from worker.service.spotify_member_sync_service import run_spotify_member_sync
 
 _TEST_DB_URL = os.environ.get("TEST_DB_URL")
@@ -949,3 +951,279 @@ def test_the_edge_reconcile_refuses_on_its_own_not_just_because_its_caller_check
 
     assert metrics == {"edges_added": 0, "edges_removed": 0, "edges_orphaned": 0}
     assert not _edge_exists(factory, a, artist_id)
+
+
+# ---------------------------------------------------------------------------
+# The consumer fence (Step 5 residual, 2026-09-21).
+#
+# `_SELECT_DUE` used to ask only whether an artist still owed pages, and `_REOPEN_STALE`
+# put completed ones back into that state on a timer, so an unfollowed or site-excluded
+# artist was paged for ever with nobody consuming the result. One real case (a classical
+# artist, 3,108 tracks) had its rows deleted BY HAND on 2026-09-19.
+#
+# The remedy is a fence on the READ paths, not a delete. `invalid_grant` — a token
+# expiring, or the member removing the app at spotify.com — revokes their follow demand
+# AND their `spotify_follow` edges in the same transaction as the reauth flip, so every
+# registration only that member held loses both signals at once. Deleting then cascades
+# `lyrics_artist_albums` and the page checkpoints, and the reconnect the front badge asks
+# for would cost a full re-enumeration out of a quota this project cannot replace. Fencing
+# stops the spend and keeps the corpus. Owner decision, 2026-09-21.
+#
+# Every test here SETTLES the row first (`_settled`), because `_enumerated` leaves
+# `last_complete_at` NULL and that alone satisfies the deadlock-break arm — without it
+# each of these would pass for a reason that has nothing to do with the fence.
+# ---------------------------------------------------------------------------
+
+def _settled(factory, artist_sid, hours_ago=48):
+    """Mark a completed pass in the past: the state a real steady-state row is in."""
+    with factory() as s, s.begin():
+        s.execute(
+            text("UPDATE lyrics_artist_discographies "
+                 "SET complete = true, next_offset = 0, next_attempt_at = NULL, "
+                 "    last_complete_at = now() - make_interval(hours => :h) "
+                 "WHERE spotify_artist_id = :a"),
+            {"h": int(hours_ago), "a": artist_sid},
+        )
+
+
+def _exclude(factory, user_id, artist_id):
+    with factory() as s, s.begin():
+        s.execute(
+            text("INSERT INTO user_artist_follow_exclusions (user_id, artist_id) "
+                 "VALUES (:u, :a) ON CONFLICT DO NOTHING"),
+            {"u": str(user_id), "a": str(artist_id)},
+        )
+
+
+def _is_complete(factory, artist_sid):
+    with factory() as s:
+        return s.execute(
+            text("SELECT complete FROM lyrics_artist_discographies "
+                 "WHERE spotify_artist_id = :a"), {"a": artist_sid}).scalar_one()
+
+
+def _albums_kept(factory, artist_sid):
+    with factory() as s:
+        return s.execute(
+            text("SELECT count(*) FROM lyrics_artist_albums WHERE spotify_artist_id = :a"),
+            {"a": artist_sid}).scalar_one()
+
+
+def _read_artists(factory, *artist_sids):
+    """Which of these artists a real enumeration run actually asks the provider for."""
+    catalog = _PagingCatalog({sid: [] for sid in artist_sids})
+    run_discography_enumeration(factory, catalog, max_artists=50, max_pages_per_artist=1)
+    return {sid for sid, _g, _o in catalog.calls}
+
+
+def test_removing_an_artist_on_the_site_stops_the_refresh_re_opening_them(
+        factory, members):
+    """The case that actually happened. A site removal writes an exclusion and leaves the
+    manual edge standing, so the edge cannot be the signal — the exclusion has to beat it.
+    The control artist in the same pass proves the timer still works."""
+    a = members["a"]
+    gone, kept = _sid(members, "fexcl"), _sid(members, "fkept")
+    gone_id = _catalog_artist(factory, gone)
+    _catalog_artist(factory, kept)
+    _enumerated(factory, gone, [_sid(members, "fexclalb")])
+    _enumerated(factory, kept, [_sid(members, "fkeptalb")])
+    sync_follow_demand(factory, a, followed_artists=_follows(gone, kept))
+    _manual_edge(factory, a, gone_id)
+
+    _exclude(factory, a, gone_id)
+    sync_follow_demand(factory, a, followed_artists=_follows(gone, kept))
+    _settled(factory, gone)
+    _settled(factory, kept)
+    reopen_stale_discographies(factory, 24)
+
+    assert _is_complete(factory, gone), "an excluded artist must not be re-opened"
+    assert not _is_complete(factory, kept), "the control: still followed, still refreshed"
+    assert _albums_kept(factory, gone) == 1, "the enumeration is kept, not deleted"
+
+
+def test_unfollowing_stops_the_enumeration_and_re_following_resumes_it_for_free(
+        factory, members):
+    """The property that justifies fencing instead of deleting: the corpus survives, so
+    coming back costs no provider reads."""
+    a = members["a"]
+    art = _sid(members, "funfol")
+    _catalog_artist(factory, art)
+    _enumerated(factory, art, [_sid(members, "funfolalb")])
+    sync_follow_demand(factory, a, followed_artists=_follows(art))
+    _settled(factory, art)
+
+    sync_follow_demand(factory, a, followed_artists=[])
+    reopen_stale_discographies(factory, 24)
+    assert _is_complete(factory, art), "nobody follows them: no re-open"
+    assert art not in _read_artists(factory, art), "and no provider read"
+    assert _albums_kept(factory, art) == 1, "but the albums are still here"
+
+    sync_follow_demand(factory, a, followed_artists=_follows(art))
+    assert reopen_stale_discographies(factory, 24) >= 1
+    assert not _is_complete(factory, art), "re-followed: the timer applies again"
+
+
+def test_an_uncatalogued_followed_artist_is_still_refreshed(factory, members):
+    """The trap: an artist the catalog does not have gets NO tracked edge at all, so the
+    edge cannot be the only signal. Demand carries it, because `origin_key` IS the artist
+    id."""
+    a = members["a"]
+    art = _sid(members, "funcat")          # deliberately no _catalog_artist
+    _enumerated(factory, art, [_sid(members, "funcatalb")])
+    metrics = sync_follow_demand(factory, a, followed_artists=_follows(art))
+    assert metrics["edges_added"] == 0 and metrics["follow_added"] == 1
+    _settled(factory, art)
+
+    assert reopen_stale_discographies(factory, 24) >= 1
+    assert not _is_complete(factory, art)
+
+
+def test_a_manually_tracked_artist_with_no_releases_is_still_refreshed(factory, members):
+    """The mirror trap: an empty discography produces NO demand, so demand cannot be the
+    only signal either. Here the edge is all there is."""
+    a = members["a"]
+    art = _sid(members, "fempty")
+    artist_id = _catalog_artist(factory, art)
+    _enumerated(factory, art, [])
+    _manual_edge(factory, a, artist_id)
+    assert sync_follow_demand(factory, a, followed_artists=[])["follow_added"] == 0
+    _settled(factory, art)
+
+    assert reopen_stale_discographies(factory, 24) >= 1
+    assert not _is_complete(factory, art), "a manual edge is a consumer on its own"
+
+
+def test_a_first_pass_runs_to_completion_before_the_fence_applies(factory, members):
+    """The deadlock break. A registration nobody has read has no albums, so no demand, and
+    if the artist is uncatalogued no edge either — the fence would starve it for ever.
+    `last_complete_at IS NULL` and not "never read a page": a first pass spans runs, and
+    demand for what it already found is only written by the next member poll."""
+    art = _sid(members, "ffirst")
+    albums = _album_objs(_sid(members, "ffirstalb"), 120)
+    catalog = _PagingCatalog({art: albums})
+
+    run_discography_enumeration(factory, catalog, artist_sids=[art],
+                               max_artists=5, max_pages_per_artist=1)
+    second = run_discography_enumeration(factory, catalog, max_artists=5,
+                                        max_pages_per_artist=1)
+    assert [o for _a, _g, o in catalog.calls] == [0, 50], "the first pass resumes"
+    assert second["deferred"] == 0
+
+    run_discography_enumeration(factory, catalog, max_artists=5, max_pages_per_artist=5)
+    assert _is_complete(factory, art)
+
+    # Completed once, with nobody consuming it: from here the fence holds.
+    _settled(factory, art)
+    assert reopen_stale_discographies(factory, 24) == 0
+    assert art not in _read_artists(factory, art)
+
+
+def test_a_member_who_is_not_connected_stops_holding_enumerations_open(factory, members):
+    """The fence is `status = 'connected'`, the twin of `_SELECT_CONNECTED`: a universe
+    only exists for members that selector returns. Reauth is recoverable, which is exactly
+    why this may not delete anything — reconnecting restores the artist at zero cost."""
+    a = members["a"]
+    art = _sid(members, "freauth")
+    artist_id = _catalog_artist(factory, art)
+    _enumerated(factory, art, [_sid(members, "freauthalb")])
+    _manual_edge(factory, a, artist_id)
+    _settled(factory, art)
+    assert reopen_stale_discographies(factory, 24) >= 1, "connected: the edge holds it"
+    _settled(factory, art)
+
+    with factory() as s, s.begin():
+        s.execute(text("UPDATE user_integrations SET status = 'reauth' "
+                       "WHERE user_id = :u AND provider = 'spotify'"), {"u": str(a)})
+    assert reopen_stale_discographies(factory, 24) == 0
+    assert _albums_kept(factory, art) == 1, "reauth is recoverable: keep the corpus"
+
+    with factory() as s, s.begin():
+        s.execute(text("UPDATE user_integrations SET status = 'connected' "
+                       "WHERE user_id = :u AND provider = 'spotify'"), {"u": str(a)})
+    assert reopen_stale_discographies(factory, 24) >= 1, "reconnect costs no reads"
+
+
+def test_a_connected_row_with_no_payload_is_not_a_consumer(factory, members):
+    """`payload IS NOT NULL` is in `_SELECT_CONNECTED` too — a row without credentials is
+    never polled, so it has no universe."""
+    a = members["a"]
+    art = _sid(members, "fnopay")
+    artist_id = _catalog_artist(factory, art)
+    _enumerated(factory, art, [])
+    _manual_edge(factory, a, artist_id)
+    _settled(factory, art)
+
+    with factory() as s, s.begin():
+        s.execute(text("UPDATE user_integrations SET payload = NULL "
+                       "WHERE user_id = :u AND provider = 'spotify'"), {"u": str(a)})
+
+    assert reopen_stale_discographies(factory, 24) == 0
+
+
+def test_demand_on_another_origin_is_not_a_follow_consumer(factory, members):
+    """`saved` and `recent` key `origin_key` by the ALBUM. Counting any origin would let a
+    library album whose id happened to match an artist id hold an enumeration open."""
+    a = members["a"]
+    art = _sid(members, "fsaved")
+    _enumerated(factory, art, [])
+    _settled(factory, art)
+    with factory() as s, s.begin():
+        store = LyricsDemandStore(s.connection())
+        scope = store.reset_scope(a, SAVED_ORIGIN)
+        store.add_demand(a, scope["id"], scope["generation"], art, art)
+
+    assert _demanded(factory, a, origin=SAVED_ORIGIN), "the saved-origin row really exists"
+    assert reopen_stale_discographies(factory, 24) == 0
+
+
+def test_one_members_unfollow_does_not_stop_an_artist_another_member_follows(
+        factory, members):
+    """The table is GLOBAL — two members who follow the same artist share one enumeration.
+    Reconciling one member's follows must not reach the other's."""
+    a, b = members["a"], members["b"]
+    art = _sid(members, "fshared")
+    _catalog_artist(factory, art)
+    _enumerated(factory, art, [_sid(members, "fsharedalb")])
+    sync_follow_demand(factory, a, followed_artists=_follows(art))
+    sync_follow_demand(factory, b, followed_artists=_follows(art))
+    _settled(factory, art)
+
+    sync_follow_demand(factory, a, followed_artists=[])
+    assert reopen_stale_discographies(factory, 24) >= 1, "member b still follows them"
+    assert not _is_complete(factory, art)
+
+
+def _make_due(factory, artist_sid):
+    """The state `_REOPEN_STALE` leaves behind: owes pages, and has completed before."""
+    with factory() as s, s.begin():
+        s.execute(text("UPDATE lyrics_artist_discographies SET complete = false, "
+                       "next_offset = 0, next_attempt_at = NULL, "
+                       "last_complete_at = now() - interval '48 hours' "
+                       "WHERE spotify_artist_id = :a"), {"a": artist_sid})
+
+
+def test_the_due_count_agrees_with_what_a_run_will_claim(factory, members):
+    """The nudge enqueues on `due_count` and the self-chain hops on `remaining`, which is
+    the same count. A looser count would produce a message every 15 minutes for work the
+    run then declines, and hop to the cap doing nothing.
+
+    The baseline is taken BEFORE the row is made due — measuring it afterwards compares the
+    fenced count with itself and asserts nothing, which is how the first draft of this test
+    let a mutant that removed `_COUNT_DUE`'s fence pass.
+    """
+    a = members["a"]
+    art = _sid(members, "fagree")
+    artist_id = _catalog_artist(factory, art)
+    _enumerated(factory, art, [])
+    _settled(factory, art)
+    baseline = due_count(factory)
+
+    _make_due(factory, art)
+    assert due_count(factory) == baseline, "no consumer: owes pages but is not due"
+    assert art not in _read_artists(factory, art), "and a real run does not claim it"
+
+    # Control: the identical row, now with a consumer, IS counted and IS claimed.
+    _manual_edge(factory, a, artist_id)
+    _make_due(factory, art)
+    assert due_count(factory) == baseline + 1
+    assert art in _read_artists(factory, art)
