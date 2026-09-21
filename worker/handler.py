@@ -96,11 +96,13 @@ def _run_spotify_member_poll() -> None:
 def _nudge_discography_enumeration() -> None:
     """Start an enumeration run if, and only if, artists are actually due.
 
-    The check is one indexed count against `lyrics_artist_discographies`; skipping the
-    enqueue when it is zero is what keeps the steady state free — most 15-minute ticks
-    have nothing to enumerate, because a member's follows change far less often than
-    the poll runs. Never allowed to fail the poll: enumeration is recoverable work and
-    the next tick asks again.
+    Skipping the enqueue when nothing is due is what keeps the steady state free — most
+    15-minute ticks have nothing to enumerate, because a member's follows change far less
+    often than the poll runs. The count is NOT a single index probe: `_COUNT_DUE` carries
+    the same consumer fence as `_SELECT_DUE` (it has to, or this would enqueue work the
+    run then declines), so it is a scan of the registration table with two anti-joins —
+    cheap at the current scale and worth measuring before the table grows. Never allowed
+    to fail the poll: enumeration is recoverable work and the next tick asks again.
     """
     if not settings.LYRICS_FOLLOW_DEMAND_ENABLED:
         return

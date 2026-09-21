@@ -56,6 +56,13 @@ logger = logging.getLogger(__name__)
 
 # Connected Spotify members, stalest-synced first so a bounded tick eventually
 # rotates through everyone (same fairness as the lastfm poll).
+#
+# THIS PREDICATE HAS A TWIN. `lyrics_discography_service._CONSUMED` repeats
+# `provider='spotify' AND status='connected' AND payload IS NOT NULL` to decide whether a
+# member still has a follow universe, because an artist nobody's universe contains must
+# stop being enumerated. Narrowing or widening this selector without the other lets an
+# artist be enumerated for a member who is never polled, or stop being enumerated for one
+# who is. Change both in the same commit.
 _SELECT_CONNECTED = text(
     """
     SELECT ui.user_id AS user_id, ui.payload AS payload
