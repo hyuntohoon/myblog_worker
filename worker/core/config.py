@@ -128,7 +128,11 @@ class Settings(BaseSettings):
     ALBUM_POP_MIN: int = 20
     SWEEP_ARTISTS_PER_TICK: int = 30
     MAX_ENQUEUE_PER_TICK: int = 60
-    MAX_CATALOG_ALBUMS: int = 5000
+    # 5000 -> 8000 (OPS-project-stabilization Step 2C, owner 2026-10-01). The cap is a
+    # curation checkpoint, not a storage limit, and run_album_ingest returns before
+    # sweeping once it is reached — which also stops release-calendar confirmation.
+    # The catalog reached 5000 on 2026-10-05 growing ~190/week; 8000 is ~14 weeks.
+    MAX_CATALOG_ALBUMS: int = 8000
     # RFC DATA-catalog-noise-and-lyrics-coverage Step 2. Reversible by flipping
     # this flag; the ingest filter deletes nothing from the catalog.
     INGEST_EXCLUDE_CLASSICAL: bool = True
