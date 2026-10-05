@@ -128,7 +128,12 @@ class Settings(BaseSettings):
     ALBUM_POP_MIN: int = 20
     SWEEP_ARTISTS_PER_TICK: int = 30
     MAX_ENQUEUE_PER_TICK: int = 60
-    MAX_CATALOG_ALBUMS: int = 5000
+    # 5000 -> 8000 (OPS-project-stabilization Step 2C, owner 2026-10-01): the cap is a
+    # curation checkpoint, not a storage limit. The catalog grows ~190/week on its own and
+    # the approved back-catalogue adds ~374, so 5000 would have stopped run_album_ingest —
+    # and with it the daily new-release sweep and release-calendar confirmation — within
+    # days. 8000 leaves roughly 14 weeks at the current rate.
+    MAX_CATALOG_ALBUMS: int = 8000
     # RFC DATA-catalog-noise-and-lyrics-coverage Step 2. Reversible by flipping
     # this flag; the ingest filter deletes nothing from the catalog.
     INGEST_EXCLUDE_CLASSICAL: bool = True
@@ -297,6 +302,21 @@ class Settings(BaseSettings):
     # artists than a single run covers; each run enqueues at most one continuation, and
     # the hop cap stops a loop that a permanently-failing artist would otherwise sustain.
     LYRICS_DISCOGRAPHY_MAX_HOPS: int = 20
+
+    # OPS-project-stabilization Step 2C — back-catalogue ingest for follow demand. Reads
+    # the releases a follow wants that `albums` does not hold and writes the ones at or
+    # above ALBUM_POP_MIN (owner decision 2026-10-01: the existing curation gate, not a
+    # new one). It has no switch of its own: LYRICS_FOLLOW_DEMAND_ENABLED stops it, in
+    # both the nudge and the consumer, and 0 batches disables it alone.
+    #
+    # One batch is one GET /albums call (20 ids). At 2 per 15-minute poll the 686
+    # releases waiting on 2026-10-01 take about four and a half hours — a bound on one
+    # invocation, not on scope: whatever is left is still waiting on the next tick.
+    LYRICS_BACKCATALOGUE_BATCHES_PER_RUN: int = 2
+    # How long a release under the gate (or one Spotify no longer serves) rests before
+    # it is read again. Popularity moves, so "never" would strand a release that later
+    # clears the bar; 30 days costs 1/20 of a provider call per resting release.
+    LYRICS_BACKCATALOGUE_REST_DAYS: int = 30
 
     # ISRC backfill (FEAT-lyrics-corpus Step 1b, worker EventBridge job). Bounded like every
     # other scheduled job so a run always finishes inside the 120s Lambda timeout: 500 tracks

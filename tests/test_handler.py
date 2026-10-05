@@ -391,11 +391,13 @@ def test_enumeration_nudge_enqueues_only_when_artists_are_due(mock_session, mock
 
     mock_settings.LYRICS_FOLLOW_DEMAND_ENABLED = True
     with patch("worker.clients.sqs_producer.enqueue_discography_enumeration") as enqueue, \
+         patch("worker.service.lyrics_discography_service.refresh_due_count", return_value=0), \
          patch("worker.service.lyrics_discography_service.due_count", return_value=0):
         _nudge_discography_enumeration()
         enqueue.assert_not_called()
 
     with patch("worker.clients.sqs_producer.enqueue_discography_enumeration") as enqueue, \
+         patch("worker.service.lyrics_discography_service.refresh_due_count", return_value=0), \
          patch("worker.service.lyrics_discography_service.due_count", return_value=4):
         _nudge_discography_enumeration()
         enqueue.assert_called_once()
@@ -544,3 +546,117 @@ def test_a_negative_hop_counter_cannot_disable_the_loop_bound(
         _run_discography_enumeration(hops=-1_000_000)
         # Clamped to 0, so 0 + 1 < 1 is false and the chain stops here.
         enqueue.assert_not_called()
+
+
+# ── OPS-project-stabilization Step 2C — refresh reachability + back-catalogue ingest ──
+
+@pytest.mark.unit
+@patch("worker.handler.settings")
+@patch("worker.handler.SessionLocal")
+def test_enumeration_nudge_fires_on_a_due_refresh_with_nothing_due(mock_session, mock_settings):
+    """The steady state: every registration complete, so `due_count` is 0 for ever. The
+    refresh is only reachable if the nudge also asks whether one is due — with the
+    configured interval, so REFRESH_HOURS=0 still turns it off."""
+    from worker.handler import _nudge_discography_enumeration
+
+    mock_settings.LYRICS_FOLLOW_DEMAND_ENABLED = True
+    mock_settings.LYRICS_DISCOGRAPHY_REFRESH_HOURS = 12
+    with patch("worker.clients.sqs_producer.enqueue_discography_enumeration") as enqueue, \
+         patch("worker.service.lyrics_discography_service.due_count", return_value=0), \
+         patch("worker.service.lyrics_discography_service.refresh_due_count",
+               return_value=34) as stale:
+        _nudge_discography_enumeration()
+        enqueue.assert_called_once()
+        stale.assert_called_once_with(mock_session, 12)
+
+
+@pytest.mark.unit
+@patch("worker.handler._run_backcatalogue_ingest")
+def test_sqs_backcatalogue_ingest_routed_in_record_loop(mock_run):
+    event = {"Records": [{"body": json.dumps({"job": "lyrics_backcatalogue_ingest"})}]}
+
+    assert lambda_handler(event, None) == {"batchItemFailures": []}
+
+    mock_run.assert_called_once_with()
+
+
+@pytest.mark.unit
+@patch("worker.handler.settings")
+@patch("worker.handler.SessionLocal")
+def test_backcatalogue_nudge_enqueues_only_while_releases_wait(mock_session, mock_settings):
+    from worker.handler import _nudge_backcatalogue_ingest
+
+    mock_settings.LYRICS_FOLLOW_DEMAND_ENABLED = True
+    mock_settings.LYRICS_BACKCATALOGUE_BATCHES_PER_RUN = 2
+    with patch("worker.clients.sqs_producer.enqueue_backcatalogue_ingest") as enqueue, \
+         patch("worker.service.lyrics_backcatalogue_service.waiting_count", return_value=0):
+        _nudge_backcatalogue_ingest()
+        enqueue.assert_not_called()
+
+    with patch("worker.clients.sqs_producer.enqueue_backcatalogue_ingest") as enqueue, \
+         patch("worker.service.lyrics_backcatalogue_service.waiting_count", return_value=686):
+        _nudge_backcatalogue_ingest()
+        enqueue.assert_called_once()
+
+    with patch("worker.service.lyrics_backcatalogue_service.waiting_count",
+               side_effect=RuntimeError("db down")):
+        _nudge_backcatalogue_ingest()  # must not raise: the poll is unaffected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("enabled,batches", [(False, 2), (True, 0)])
+@patch("worker.handler.settings")
+@patch("worker.handler.SessionLocal")
+def test_backcatalogue_nudge_is_off_with_the_switch_or_zero_batches(
+        mock_session, mock_settings, enabled, batches):
+    from worker.handler import _nudge_backcatalogue_ingest
+
+    mock_settings.LYRICS_FOLLOW_DEMAND_ENABLED = enabled
+    mock_settings.LYRICS_BACKCATALOGUE_BATCHES_PER_RUN = batches
+    with patch("worker.service.lyrics_backcatalogue_service.waiting_count") as waiting, \
+         patch("worker.clients.sqs_producer.enqueue_backcatalogue_ingest") as enqueue:
+        _nudge_backcatalogue_ingest()
+        waiting.assert_not_called()
+        enqueue.assert_not_called()
+
+
+@pytest.mark.unit
+@patch("worker.handler.settings")
+@patch("worker.handler.SessionLocal")
+def test_backcatalogue_consumer_honours_the_switch_and_passes_the_owner_gate(
+        mock_session, mock_settings):
+    """A message already in flight must not read after the switch is thrown; and the gate
+    and cap the run is given are the configured ones, not literals."""
+    from worker.handler import _run_backcatalogue_ingest
+
+    mock_settings.LYRICS_FOLLOW_DEMAND_ENABLED = False
+    with patch("worker.service.lyrics_backcatalogue_service.run_backcatalogue_ingest") as run:
+        _run_backcatalogue_ingest()
+        run.assert_not_called()
+
+    mock_settings.LYRICS_FOLLOW_DEMAND_ENABLED = True
+    mock_settings.ALBUM_POP_MIN = 20
+    mock_settings.MAX_CATALOG_ALBUMS = 7000
+    mock_settings.LYRICS_BACKCATALOGUE_BATCHES_PER_RUN = 2
+    mock_settings.LYRICS_BACKCATALOGUE_REST_DAYS = 30
+    with patch("worker.service.lyrics_backcatalogue_service.run_backcatalogue_ingest") as run:
+        _run_backcatalogue_ingest()
+        kwargs = run.call_args.kwargs
+        assert (kwargs["pop_min"], kwargs["max_catalog_albums"]) == (20, 7000)
+        assert (kwargs["max_batches"], kwargs["rest_days"]) == (2, 30)
+
+
+@pytest.mark.unit
+@patch("worker.handler._nudge_backcatalogue_ingest")
+@patch("worker.handler._nudge_discography_enumeration")
+@patch("worker.handler.settings")
+@patch("worker.handler.SessionLocal")
+def test_the_member_poll_asks_both_nudges(mock_session, mock_settings, enum_nudge, back_nudge):
+    from worker.handler import _run_spotify_member_poll
+
+    with patch("worker.service.spotify_member_sync_service.run_spotify_member_sync"), \
+         patch("worker.clients.spotify_member_client.spotify_member"):
+        _run_spotify_member_poll()
+
+    enum_nudge.assert_called_once_with()
+    back_nudge.assert_called_once_with()

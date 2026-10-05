@@ -57,6 +57,7 @@ from myblog_shared_db.lyrics_demand import LyricsDemandStore, StaleDiscovery
 
 from worker.clients.lrclib_client import LrclibClient
 from worker.core.config import settings
+from worker.service.lyrics_backcatalogue_service import BELOW_GATE, UNAVAILABLE
 from worker.service.lyrics_eval_core import PRIMARY_ARTIST_NAMES_LATERAL, run_eval_batch
 from worker.service.lyrics_matcher import MatchOutcome
 from worker.service.lyrics_reassessment_service import should_replace
@@ -246,12 +247,22 @@ class LyricsDemandSourceService:
                 FROM lyrics_album_jobs j
                 WHERE {LIVE_DEMAND_SQL}
                   AND (j.album_id IS NULL OR NOT j.enumeration_complete)
-                  AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= now())
+                  AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= now()
+                       -- A release the back-catalogue ingest left resting is not
+                       -- re-checked for LYRICS_BACKCATALOGUE_REST_DAYS. If the album
+                       -- reaches the catalog some other way in the meantime (a member
+                       -- saves or plays it), waiting out the rest would hide it for
+                       -- weeks, so its arrival ends the rest. Only for those two
+                       -- reasons: every other deferral keeps its ladder.
+                       OR (j.album_id IS NULL
+                           AND j.last_reason IN (:below_gate, :unavailable)
+                           AND EXISTS (SELECT 1 FROM albums a
+                                        WHERE a.spotify_id = j.spotify_album_id)))
                 ORDER BY j.next_attempt_at NULLS FIRST, j.created_at
                 LIMIT :limit
                 """
             ),
-            {"limit": job_limit},
+            {"limit": job_limit, "below_gate": BELOW_GATE, "unavailable": UNAVAILABLE},
         ).mappings().all()
         if not rows:
             return counts

@@ -143,6 +143,32 @@ def enqueue_discography_enumeration(hops: int = 0, delay_seconds: int = 0) -> bo
     return True
 
 
+def enqueue_backcatalogue_ingest() -> bool:
+    """Ask a worker invocation to read the next batch of waiting follow releases.
+
+    Carries no album list, for the reason `enqueue_discography_enumeration` carries no
+    artist list: the consumer claims waiting jobs itself, so a lost or duplicated message
+    costs latency and never decides *which* releases are read. No-op (False) with no queue.
+    """
+    if not settings.SQS_QUEUE_URL:
+        logger.info("SQS_QUEUE_URL unset; skipping back-catalogue ingest enqueue")
+        return False
+
+    import boto3
+
+    sqs = boto3.client(
+        "sqs",
+        region_name=settings.AWS_DEFAULT_REGION,
+        endpoint_url=(settings.LOCALSTACK_ENDPOINT or None),
+    )
+    sqs.send_message(
+        QueueUrl=settings.SQS_QUEUE_URL,
+        MessageBody=json.dumps({"job": "lyrics_backcatalogue_ingest"}),
+    )
+    logger.info("enqueued back-catalogue ingest")
+    return True
+
+
 def enqueue_lyrics_incremental() -> None:
     """Chain a near-real-time incremental lyrics pass after an album sync lands new
     tracks (consumed by the handler's SQS branch as {"job": "lyrics_incremental"}).
