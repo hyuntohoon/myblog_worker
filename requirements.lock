@@ -7,7 +7,7 @@
 # The target and the freeze are both pinned, so this file does not depend on
 # the machine or the day that produced it: a macOS arm64 laptop and the
 # x86_64 CI runner produce byte-identical output.
-# requirements.txt sha256: 48cfe86cafbb223784328b0c556ed6508e3df5a95f0ed2b62df3a4d78036d94f
+# requirements.txt sha256: 4b527a172afc219751b56b594b8ddefb5f609e7fdf6c35749fe640142e0ba47a
 # To regenerate (or to take newer releases, after moving EXCLUDE_NEWER):
 #
 #    ./scripts/compile_requirements.sh
