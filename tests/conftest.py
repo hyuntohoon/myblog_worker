@@ -149,3 +149,13 @@ def sample_spotify_albums(sample_spotify_album):
         },
     }
     return [sample_spotify_album, album2]
+
+
+@pytest.fixture(autouse=True)
+def _owner_pause_off(request, monkeypatch):
+    """Handler tests mock SessionLocal with MagicMock, whose rows read as truthy —
+    i.e. as "paused" (FEAT-automation-admin 3b). The pause check is stubbed to
+    "not paused" everywhere except tests marked `pause_check`, which exercise it."""
+    if request.node.get_closest_marker("pause_check"):
+        return
+    monkeypatch.setattr("worker.handler.skip_if_paused", lambda event, session_factory: False)
