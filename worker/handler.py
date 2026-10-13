@@ -8,6 +8,7 @@ from worker.core.config import settings
 from worker.clients.spotify_client import spotify
 
 from worker.infra.db import SessionLocal
+from worker.service.automation_control import skip_if_paused
 from worker.service.sync_service import AlbumSyncService, generate_and_save_aliases
 from worker.service.listening_sync_service import run_listening_sync
 
@@ -499,6 +500,11 @@ def _run_youtube_ref_refresh(limit: int | None = None) -> None:
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    # Owner pause (FEAT-automation-admin 3b). Top-level events only — EventBridge
+    # crons and direct invokes. SQS messages are user/owner actions and never paused.
+    if "Records" not in event and skip_if_paused(event, SessionLocal):
+        return {"skipped": "paused"}
+
     # EventBridge daily cron — YouTube mapping retention sweep + re-verification
     # (FEAT-youtube-playback-provider Step A5). Constant input
     # {"job": "youtube_ref_refresh"}, routed with the other job-keyed branches.
@@ -707,6 +713,11 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             # eventbridge.tf comments promise the manual blogSQS path, and the
             # near-real-time chain below relies on it).
             if body.get("job") == "lyrics_incremental":
+                # The one SQS twin the owner's pause covers: the worker itself enqueues it
+                # after every album sync, so exempting it would make the pause a no-op.
+                # A skipped pass is harmless — the cron catches up after resume.
+                if skip_if_paused({"job": "lyrics_incremental"}, SessionLocal):
+                    continue
                 _run_lyrics_incremental(limit=body.get("limit"))
                 continue
 
