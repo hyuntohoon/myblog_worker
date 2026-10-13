@@ -63,7 +63,7 @@ def test_paused_cron_is_skipped_and_its_job_never_runs():
     run.assert_not_called()
     db.commit.assert_called_once()
     sql = str(db.execute.call_args_list[-1].args[0])
-    assert "honored_at = now()" in sql and "AND paused" in sql
+    assert "honored_at = clock_timestamp()" in sql and "AND paused" in sql
     assert db.execute.call_args_list[-1].args[1] == {"key": "spotify_listening"}
 
 

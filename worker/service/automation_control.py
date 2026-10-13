@@ -84,8 +84,10 @@ def all_control_keys() -> frozenset:
 # One statement checks the flag and stamps the skip, so "paused" and "honoured"
 # cannot disagree. READ WRITE first: a pooler session can carry a leaked
 # read-only default, which would turn every check into a fail-open error.
+# clock_timestamp(), not now(): a stamp taken after waiting on the row lock must
+# not predate the owner's changed_at, or a real skip reads as "not yet confirmed".
 _CLAIM_SKIP = text(
-    "UPDATE automation_controls SET honored_at = now() "
+    "UPDATE automation_controls SET honored_at = clock_timestamp() "
     "WHERE job_key = :key AND paused RETURNING job_key"
 )
 
