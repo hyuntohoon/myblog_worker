@@ -161,6 +161,11 @@ def _service(client, tracks):
     session = MagicMock()
     svc = LyricsReassessmentService(session, client=client)
     svc._fetch_unresolved_tracks = MagicMock(return_value=tracks)
+    # FEAT-lyrics-match-correction Step 2: the sweep arm and the body attach are selection
+    # side and stubbed like the queue selection; their SQL has its own coverage below and
+    # the real-Postgres round trip lives in tests/integration/test_lyrics_resweep_db.py.
+    svc._fetch_stale_version_tracks = MagicMock(return_value=[])
+    svc._attach_stored_bodies = lambda rows: rows
     return svc, session
 
 
@@ -291,6 +296,7 @@ def _album_service(client, tracks):
     session = MagicMock()
     svc = LyricsReassessmentService(session, client=client)
     svc._fetch_album_tracks = MagicMock(return_value=tracks)
+    svc._attach_stored_bodies = lambda rows: rows
     return svc, session
 
 

@@ -198,6 +198,13 @@ class Settings(BaseSettings):
     LYRICS_REASSESS_BATCH_LIMIT: int = 150
     LYRICS_REASSESS_CONCURRENCY: int = 20
     LYRICS_REASSESS_TIME_BUDGET_SEC: float = 90.0
+    # FEAT-lyrics-match-correction Step 2: how many RESOLVED rows written by another matcher
+    # version the daily reassessment re-judges under the running one, on top of its regular
+    # queue (best-of backlog + unresolved pool). 0 disables the arm. Each row costs one
+    # LRCLIB search and is stamped so it is judged once per matcher version; a bump re-opens
+    # every row by itself, and the one-off drain after a bump is fired by hand
+    # ({"job":"lyrics_reassessment","limit":0,"sweep_limit":N}).
+    LYRICS_RESWEEP_BATCH_LIMIT: int = 100
 
     # How long a best-of-* matched row rests between supersession re-checks
     # (DATA-catalog-noise Step 3b). The reassessment queue puts the best-of backlog AHEAD of

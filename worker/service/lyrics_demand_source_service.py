@@ -371,7 +371,9 @@ class LyricsDemandSourceService:
             )
 
     # ── source evaluation ──────────────────────────────────────────────────────────────
-    def _write_gate(self, row: Dict[str, Any], outcome: MatchOutcome) -> bool:
+    def _write_gate(
+        self, row: Dict[str, Any], outcome: MatchOutcome, candidates: Any = None
+    ) -> bool:
         """Per-arm write gate: first-fetch rows use a concurrency guard, parked rows the
         canonical replacement guard.
 
@@ -391,7 +393,9 @@ class LyricsDemandSourceService:
                 ).first()
                 is None
             )
-        return should_replace(row, outcome)
+        # This job's rows carry no ``existing_matcher_version``, so the Step 2 lateral rule
+        # fails closed here: a parked row can be promoted, a resolved one only superseded.
+        return should_replace(row, outcome, candidates)
 
     def _fetch_due_tracks(self, limit: int) -> List[Dict[str, Any]]:
         """Due tracks of demanded albums, in both arms, with their V57 observation keys.
