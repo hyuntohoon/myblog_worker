@@ -38,7 +38,7 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
-MATCHER_VERSION = "step3-v1"
+MATCHER_VERSION = "step4-v1"
 
 # Duration tolerance. LRCLIB's own /api/get docs gate on +/-2s; we mirror it.
 DURATION_TOLERANCE_SEC = 2.0
@@ -54,12 +54,34 @@ _VERSION_TOKENS_EN = {
     "rerecorded", "instrumental", "acoustic", "radio", "club", "extended",
     "version", "unplugged", "session", "karaoke", "orchestral", "symphonic",
     "plur", "bonustrack",
+    # FEAT-lyrics-match-correction RC2: ``ver`` marks a rendition on its own, so
+    # ``2023 Ver.`` / ``Japanese Ver.`` / any future ``X Ver.`` is kept and gated
+    # without listing X. Folded onto ``version`` by _TOKEN_ALIASES.
+    "ver",
 }
 _VERSION_TOKENS_KO = {
     "리믹스", "라이브", "데모", "커버", "어쿠스틱", "리마스터", "재녹음", "편곡",
-    "반주", "오케스트라",
+    "반주", "오케스트라", "버전",
 }
-_VERSION_TOKENS = _VERSION_TOKENS_EN | _VERSION_TOKENS_KO
+_VERSION_TOKENS_JA = {"バージョン"}
+_VERSION_TOKENS = _VERSION_TOKENS_EN | _VERSION_TOKENS_KO | _VERSION_TOKENS_JA
+
+# Spellings of the same rendition marker, so ``(English Ver.)`` and
+# ``- English Version`` agree instead of parking on a ver/version asymmetry.
+_TOKEN_ALIASES = {"ver": "version", "버전": "version", "バージョン": "version"}
+
+# Language names mark a language rendition (BTS ``Go Go (Japanese Ver.)``) ONLY
+# inside a parenthesis/bracket or trailing dash segment — never in the base
+# title, so ``English Girl`` stays a title. Deliberately NOT in _VERSION_TOKENS:
+# they stay part of the base title, so a language version never collapses into
+# the original's exact-title group (RC2).
+_LANGUAGE_TOKENS = {
+    "japanese", "english", "chinese", "korean", "spanish", "french", "german",
+    "portuguese", "italian", "thai", "vietnamese", "indonesian", "mandarin",
+    "cantonese", "taiwanese",
+    "일본어", "영어", "중국어", "한국어", "스페인어", "일본", "중국",
+    "日本語", "英語", "中国語", "韓国語",
+}
 
 # Match-status vocabulary (mirrors the RFC + V33 CHECK constraint).
 STATUS_MATCHED = "matched"
@@ -95,11 +117,36 @@ class TitleNormalizer:
         return SequenceMatcher(None, a, b).ratio()
 
 
+def _words(value: str) -> Set[str]:
+    return set(re.split(r"[\s'\-]+", TitleNormalizer.normalize(value or "")))
+
+
+def _canon_tokens(tokens: Set[str]) -> Set[str]:
+    return {_TOKEN_ALIASES.get(t, t) for t in tokens}
+
+
+def _segment_rendition_tokens(segment: str) -> Set[str]:
+    """Rendition tokens of ONE parenthesis/dash segment (language names count here)."""
+    return _canon_tokens(_words(segment) & (_VERSION_TOKENS | _LANGUAGE_TOKENS))
+
+
+def _title_segments(value: str) -> List[str]:
+    """Inner texts of ``(...)`` / ``[...]`` segments plus trailing dash segments."""
+    segs = [m.group(1) if m.group(1) is not None else m.group(2)
+            for m in _PAREN_SEGMENT_RE.finditer(value or "")]
+    segs.extend(_DASH_SPLIT_RE.split(value or "")[1:])
+    return [s for s in segs if s]
+
+
 def extract_version_tokens(value: str) -> Set[str]:
-    """Return the rendition tokens present in ``value`` (lowercase, normalized)."""
-    norm = TitleNormalizer.normalize(value)
-    words = set(re.split(r"[\s'\-]+", norm))
-    return words & _VERSION_TOKENS
+    """Return the rendition tokens present in ``value`` (lowercase, normalized).
+
+    Rendition words count anywhere; language names count only inside a segment.
+    """
+    tokens = _canon_tokens(_words(value) & _VERSION_TOKENS)
+    for seg in _title_segments(value):
+        tokens |= _segment_rendition_tokens(seg)
+    return tokens
 
 
 def _strip_version_tokens(norm_title: str) -> str:
@@ -140,13 +187,13 @@ def _strip_noise(raw_title: str) -> str:
 
     def _drop_non_rendition(m: "re.Match[str]") -> str:
         inner = m.group(1) if m.group(1) is not None else m.group(2)
-        return m.group(0) if extract_version_tokens(inner or "") else " "
+        return m.group(0) if _segment_rendition_tokens(inner or "") else " "
 
     out = _PAREN_SEGMENT_RE.sub(_drop_non_rendition, out)
 
     parts = _DASH_SPLIT_RE.split(out)
     if len(parts) > 1:
-        kept = [parts[0]] + [p for p in parts[1:] if extract_version_tokens(p)]
+        kept = [parts[0]] + [p for p in parts[1:] if _segment_rendition_tokens(p)]
         out = " - ".join(p for p in kept if p.strip())
 
     out = " ".join(out.split())
@@ -192,6 +239,47 @@ def duration_matches(catalog_sec: Optional[float], candidate_sec: Optional[float
         return abs(float(catalog_sec) - float(candidate_sec)) <= tolerance
     except (TypeError, ValueError):
         return False
+
+
+# Content consensus (FEAT-lyrics-match-correction RC1). LRCLIB metadata and body
+# are uploaded independently, so metadata agreement does not prove the body is
+# right (Bad Habit: correct title/artist/duration, Ed Sheeran's lyric). Bodies
+# are compared as word 3-shingle sets over the whole body (capped), ignoring LRC
+# timestamps and parenthesised ad-libs, with the overlap coefficient
+# (|A∩B| / min(|A|,|B|)) so a missing intro line or a truncated upload still
+# agrees. Calibrated 2026-10-16 on real LRCLIB data (tests/fixtures/
+# lyrics_consensus.json): the lowest same-song pair scored 0.55 (Big Poe, two
+# transcriptions with different section order), the same song in Korean vs
+# Japanese 0.22, unrelated songs <= 0.01. A leading window was rejected: at 150
+# words the Big Poe pair fell to 0.32.
+CONTENT_WINDOW_WORDS = 2000
+CONTENT_SHINGLE = 3
+CONTENT_AGREE_THRESHOLD = 0.4
+
+_LRC_TIMESTAMP_RE = re.compile(r"\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]")
+_LYRIC_PAREN_RE = re.compile(r"\([^()]*\)|\[[^\[\]]*\]")
+
+
+def content_shingles(cand: "Candidate") -> Optional[frozenset]:
+    """Normalized content fingerprint of a candidate's body, or None if it has none."""
+    body = cand.synced_lyrics or cand.plain_lyrics or ""
+    body = _LRC_TIMESTAMP_RE.sub(" ", body)
+    body = _LYRIC_PAREN_RE.sub(" ", body)
+    # apostrophes vary by transcriber (creepin / creepin'), unlike in titles
+    words = TitleNormalizer.normalize(body).replace("'", "").split()[:CONTENT_WINDOW_WORDS]
+    if not words:
+        return None
+    if len(words) < CONTENT_SHINGLE:
+        return frozenset((w,) for w in words)
+    return frozenset(
+        tuple(words[i:i + CONTENT_SHINGLE]) for i in range(len(words) - CONTENT_SHINGLE + 1)
+    )
+
+
+def content_similarity(a: Optional[frozenset], b: Optional[frozenset]) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
 
 
 _ARTICLE_NOISE = {"the", "a", "an"}
@@ -382,25 +470,53 @@ def decide_match(
     # canonical title equals the track's (pick stability for pre-fix matches),
     # then the richest lyric (FIX-lyrics-matcher-noise: richness is the
     # tiebreak, not the criterion).
+    #
+    # Content consensus (FEAT-lyrics-match-correction RC1) ranks right after
+    # version agreement: among candidates of the same version stance, the one
+    # whose body most of them share wins, so one bad upload with good metadata
+    # cannot beat many good ones on richness. Version agreement stays first so a
+    # larger cluster of a different rendition never outranks the agreeing one.
     groups: Dict[str, List[tuple]] = {}
     for cand, kind, sim, stripped_cand in plausible:
         groups.setdefault(stripped_cand, []).append((cand, kind, sim))
 
+    def _agrees(cand: Candidate) -> bool:
+        return not (extract_version_tokens(cand.title) ^ track_tokens)
+
+    def _support(entries: List[tuple]) -> Dict[int, int]:
+        """Per entry: how many same-stance candidates (itself included) share its body."""
+        shingles = [content_shingles(e[0]) for e in entries]
+        stance = [_agrees(e[0]) for e in entries]
+        out: Dict[int, int] = {}
+        for i, si in enumerate(shingles):
+            out[i] = 0 if si is None else sum(
+                1 for j, sj in enumerate(shingles)
+                if sj is not None and stance[j] == stance[i]
+                and (i == j or content_similarity(si, sj) >= CONTENT_AGREE_THRESHOLD)
+            )
+        return out
+
     def _representative(entries: List[tuple]) -> tuple:
-        def _key(e: tuple):
-            cand = e[0]
-            agrees = not (extract_version_tokens(cand.title) ^ track_tokens)
+        support = _support(entries)
+
+        def _key(i: int):
+            cand, kind = entries[i][0], entries[i][1]
             full_equal = plain_base_title(cand.title) == plain_track
-            return (agrees, e[1] == "exact", full_equal,
+            return (_agrees(cand), support[i], kind == "exact", full_equal,
                     bool(cand.synced_lyrics), bool(cand.plain_lyrics))
-        return sorted(entries, key=_key, reverse=True)[0]
+        best = sorted(range(len(entries)), key=_key, reverse=True)[0]
+        peers_with_body = sum(
+            1 for i, e in enumerate(entries)
+            if support[i] > 0 and _agrees(e[0]) == _agrees(entries[best][0])
+        )
+        return entries[best] + (support[best], peers_with_body)
 
     reps = [_representative(g) for g in groups.values()]
 
     if len(reps) > 1:
         previews = [
             {"title": c.title, "artist": c.artist, "duration_sec": c.duration_sec}
-            for c, _, _ in reps[:3]
+            for c, *_ in reps[:3]
         ]
         return _build(
             track_id, STATUS_AMBIGUOUS,
@@ -408,7 +524,23 @@ def decide_match(
             track_tokens=track_tokens,
         )
 
-    cand, kind, sim = reps[0]
+    cand, kind, sim, cluster_size, peers_with_body = reps[0]
+    consensus_ev = {"content_cluster_size": cluster_size, "plausible_count": len(plausible)}
+
+    # Every same-stance candidate with a body disagrees with every other one:
+    # there is no majority to trust, so park instead of picking the richest.
+    if peers_with_body >= 2 and cluster_size == 1:
+        previews = [
+            {"lrclib_id": c.id, "title": c.title, "artist": c.artist,
+             "duration_sec": c.duration_sec}
+            for c, *_ in groups[next(iter(groups))][:5]
+        ]
+        return _build(
+            track_id, STATUS_REVIEW_REQUIRED,
+            {"reason": "content_disagreement", "candidates": previews, **consensus_ev},
+            track_tokens=track_tokens,
+        )
+
     cand_tokens = extract_version_tokens(cand.title)
     symmetric = set(track_tokens) ^ set(cand_tokens)  # tokens in one but not both
     version_agrees = len(symmetric) == 0
@@ -466,6 +598,7 @@ def decide_match(
         "lrclib_title": cand.title,
         "lrclib_album": cand.album,
         "lrclib_duration_sec": cand.duration_sec,
+        **consensus_ev,
     }
     noise_stripped = [
         side for side, raw in (("track", title or ""), ("candidate", cand.title))

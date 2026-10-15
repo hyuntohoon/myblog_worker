@@ -186,13 +186,14 @@ class TestDecideMatch:
         out = decide_match(
             uuid.uuid4(), "Crazy", ["Gnarls Barkley"], None, 180.0,
             [
-                _cand("Crazy", "Gnarls Barkley", 180.0, cid=1, plain="v1"),
-                _cand("Crazy", "Gnarls Barkley", 179.5, cid=2, plain="v2", synced="[00:00]v2"),
+                _cand("Crazy", "Gnarls Barkley", 180.0, cid=1, plain="I remember when"),
+                _cand("Crazy", "Gnarls Barkley", 179.5, cid=2, plain="I remember when",
+                      synced="[00:00.00]I remember when"),
             ],
         )
         assert out.match_status == "matched"
-        # representative = richest (synced preferred)
-        assert out.lyric_synced == "[00:00]v2"
+        # representative = richest (synced preferred) among same-content uploads
+        assert out.lyric_synced == "[00:00.00]I remember when"
 
     def test_version_token_mismatch_parks_to_review(self):
         # track is the album version; candidate is a Remix -> never auto-merge
@@ -410,7 +411,7 @@ class TestNoiseFixesDecideMatch:
             [
                 _cand("Blood Sweat & Tears", "BTS", 217.0, cid=1),
                 _cand("Blood Sweat & Tears", "방탄소년단", 217.0, cid=2,
-                      synced="[00:01.00] x"),
+                      synced="[00:01.00] lyrics..."),
             ],
         )
         assert out.match_status == "matched"
@@ -447,7 +448,7 @@ class TestNoiseFixesDecideMatch:
             uuid.uuid4(), "Trust Me - Dialogue", ["X Artist"], None, 30.0,
             [
                 _cand("Trust Me", "X Artist", 30.0, cid=50,
-                      synced="[00:01.00] other"),
+                      synced="[00:01.00] dialogue words"),
                 _cand("Trust Me - Dialogue", "X Artist", 30.0, cid=51,
                       plain="dialogue words"),
             ],
@@ -484,7 +485,7 @@ class TestCandidateAdapters:
 class TestMatchOutcomeDefaults:
     def test_matcher_version(self):
         out = MatchOutcome(track_id=uuid.uuid4(), match_status="matched", evidence={})
-        assert out.matcher_version == "step3-v1"
+        assert out.matcher_version == "step4-v1"
 
 
 # --------------------------------------------------------------------------
