@@ -366,6 +366,35 @@ class TestShadowMode:
         assert (v.write, v.counter) == (True, "resweep_superseded")
         assert v.evidence["resweep_shadow"]["verdict"] == "superseded"
 
+    def test_best_of_lateral_swap_is_shadowed(self):
+        """Review R1: a same-rung best-of → best-of body swap is the Step 2 lateral rule,
+        not a pre-Step-2 supersession — it must stay shadowed."""
+        row = _synthetic_row(_BODY_A, 1, existing_basis="best-of-ambiguous",
+                             existing_matcher_version="step2-v2+best-of-v1")
+        outcome = _picked(_BODY_B, 3, 2)
+        outcome.match_basis = "best-of-review"
+        cands = [_c(1, _BODY_A), _c(3, _BODY_B), _c(4, _BODY_B)]
+        assert should_replace(row, outcome, cands) is True
+        v = replacement_verdict(row, outcome, cands)
+        assert (v.write, v.counter) == (False, "resweep_would_replace")
+
+    def test_best_of_no_lyrics_supersession_is_shadowed(self):
+        """The queue's best-of arm only ever selected MATCHED best-of rows; a best-of
+        no_lyrics row is reached by the sweep alone."""
+        row = _synthetic_row(None, None, existing_status="no_lyrics",
+                             existing_basis="best-of-all_instrumental")
+        v = replacement_verdict(row, _picked(_BODY_B, 3, 1), [_c(3, _BODY_B)])
+        assert (v.write, v.counter) == (False, "resweep_would_supersede")
+
+    def test_exact_title_row_superseded_by_a_stronger_basis_is_shadowed(self):
+        """Only best-of rows were in the pre-Step-2 queue; an exact-title row reaches the
+        ladder through the sweep alone."""
+        row = _synthetic_row(_BODY_A, 1)
+        outcome = _picked(_BODY_A, 1, 1)
+        outcome.match_basis = "isrc"
+        v = replacement_verdict(row, outcome, [_c(1, _BODY_A)])
+        assert (v.write, v.counter) == (False, "resweep_would_supersede")
+
     def test_kept_rows_stamp_the_shadow_key(self):
         row = _synthetic_row(_BODY_A, 1)
         v = replacement_verdict(row, _picked(_BODY_A, 1, 1), [_c(1, _BODY_A)])
@@ -432,6 +461,20 @@ class TestConsistencyViolation:
         assert (m["consistency_errors"], m["evaluated"]) == (1, 0)
         [(sql, _)] = _statements(session)
         assert sql == "UPDATE track_lyrics SET updated_at = NOW() WHERE track_id = :track_id"
+
+
+    def test_incremental_and_demand_callers_do_not_rotate_violations(self, monkeypatch):
+        """Review Y-a: the demand-source job reads a touch as "evaluated" and would advance
+        its backoff ladder; only reassessment callers opt in."""
+        import worker.service.lyrics_eval_core as core
+        monkeypatch.setattr(core, "_consistency_ok", lambda outcome: False)
+        session = MagicMock()
+        m = core.run_eval_batch(
+            session, [_bh_row(_bh_wrong())], concurrency=1, time_budget_sec=30,
+            client=_FakeClient(_bh_cands()), touch_on_guard_kept=True,
+        )
+        assert m["consistency_errors"] == 1
+        session.execute.assert_not_called()
 
 
 class TestReassessSweep:

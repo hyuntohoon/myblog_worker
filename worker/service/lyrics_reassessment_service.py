@@ -204,6 +204,18 @@ def should_replace(
     return lateral is not None and lateral.upgrade
 
 
+def _queue_supersession(row: Dict[str, Any], verdict: str) -> bool:
+    """The one rewrite shadow mode lets through: a ``matched`` best-of row superseded by a
+    strictly stronger basis — exactly what the regular queue's best-of arm did before Step 2.
+    A same-rung lateral swap of a best-of row (``replaced``) and any supersession of a
+    ``no_lyrics`` row are new with Step 2 and stay shadowed."""
+    return (
+        verdict == "superseded"
+        and row.get("existing_status") == STATUS_MATCHED
+        and (row.get("existing_basis") or "").startswith("best-of-")
+    )
+
+
 def resweep_stamp_key() -> str:
     """The evidence key the re-sweep stamps and its selection excludes on.
 
@@ -220,7 +232,7 @@ def replacement_verdict(
     """The reassessment write gate: ``should_replace`` plus the Step 2 re-sweep record.
 
     For a RESOLVED row produced by another matcher version the verdict also carries an
-    ``evidence["resweep"]`` block — stamped onto the row whether it is replaced or kept —
+    ``evidence["resweep"]`` block (``evidence["resweep_shadow"]`` in shadow mode) — stamped onto the row whether it is replaced or kept —
     and a metrics counter. The stamp is what makes the sweep terminate: the selection
     excludes rows already judged under the running version, so each row costs one LRCLIB
     call per matcher version, and a later bump re-opens all of them by itself. Unresolved
@@ -265,11 +277,7 @@ def replacement_verdict(
         verdict = "unchanged"
     else:
         verdict = "kept"
-    if (
-        write
-        and settings.LYRICS_RESWEEP_SHADOW
-        and not (row.get("existing_basis") or "").startswith("best-of-")
-    ):
+    if write and settings.LYRICS_RESWEEP_SHADOW and not _queue_supersession(row, verdict):
         write = False
         verdict = {"replaced": "would_replace", "superseded": "would_supersede"}[verdict]
     block["verdict"] = verdict
@@ -383,6 +391,7 @@ class LyricsReassessmentService:
             client=self._client,
             should_write=replacement_verdict,
             touch_on_guard_kept=True,
+            touch_on_consistency_error=True,
             log_prefix="Lyrics reassessment",
         )
         metrics["exclusions"] = exclusions
@@ -421,6 +430,7 @@ class LyricsReassessmentService:
             client=self._client,
             should_write=replacement_verdict,
             touch_on_guard_kept=True,
+            touch_on_consistency_error=True,
             log_prefix=f"Lyrics expedite (track {track_id})",
         )
         metrics["track_id"] = str(track_id)
@@ -473,6 +483,7 @@ class LyricsReassessmentService:
             client=self._client,
             should_write=replacement_verdict,
             touch_on_guard_kept=True,
+            touch_on_consistency_error=True,
             log_prefix=f"Lyrics expedite (album {album_id})",
         )
         metrics["album_id"] = str(album_id)

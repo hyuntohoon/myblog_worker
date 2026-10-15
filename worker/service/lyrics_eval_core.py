@@ -196,6 +196,7 @@ def run_eval_batch(
     client: Optional[LrclibClient] = None,
     should_write: Optional[WriteGate] = None,
     touch_on_guard_kept: bool = False,
+    touch_on_consistency_error: bool = False,
     log_prefix: str = "Lyrics eval",
 ) -> Dict[str, Any]:
     """Evaluate ``tracks`` against LRCLIB and persist outcomes, bounded by a wall clock.
@@ -293,9 +294,11 @@ def run_eval_batch(
                 logger.error("%s: CONSISTENCY VIOLATION track %s matched (basis=%s) "
                              "but invariant failed — row NOT written",
                              log_prefix, row["id"], outcome.match_basis)
-                if touch_on_guard_kept:
-                    # Rotate it like a guard-kept row: a deterministic violation must not
-                    # hold the head of a stalest-first queue (or the re-sweep) every run.
+                if touch_on_consistency_error:
+                    # Reassessment only: rotate it like a guard-kept row so a deterministic
+                    # violation does not hold the head of a stalest-first queue (or the
+                    # re-sweep) every run. The demand-source job reads a touch as "evaluated"
+                    # and would advance its backoff ladder, so it does not opt in.
                     writer.touch(row["id"])
                 continue
 
