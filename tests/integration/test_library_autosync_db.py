@@ -19,6 +19,7 @@ from sqlalchemy.orm import sessionmaker
 from worker.service.library_sync_service import (
     RESEARCH_PROMPT_VERSION,
     _claim_run,
+    _finish_run,
     _enqueue_research,
     _stamp_added_at,
 )
@@ -106,42 +107,42 @@ def _run(session, bucket_id, **cols):
 
 def test_first_claim_creates_the_row_and_a_second_concurrent_claim_is_refused(db):
     b = _bucket(db)
-    assert _claim_run(db, b) is True
+    assert _claim_run(db, b) is not None
     assert db.execute(text("SELECT started_at IS NOT NULL FROM spotify_library_sync_runs WHERE bucket_id=:b"), {"b": b}).scalar()
     # started, not finished → a second delivery must not run alongside it
-    assert _claim_run(db, b) is False
+    assert _claim_run(db, b) is None
 
 
 def test_a_stale_unfinished_run_is_reclaimed(db):
     b = _bucket(db)
-    assert _claim_run(db, b) is True
-    _run(db, b, started_at="now() - interval '10 minutes'")
-    assert _claim_run(db, b) is True
+    assert _claim_run(db, b) is not None
+    _run(db, b, started_at="now() - interval '3 minutes'")
+    assert _claim_run(db, b) is not None
 
 
 def test_a_request_serviced_moments_ago_is_skipped(db):
     """Duplicate SQS delivery: the request was already served by a pass that just ended."""
     b = _bucket(db)
-    _claim_run(db, b)
+    assert _claim_run(db, b) is not None
     _run(db, b, requested_at="now() - interval '20 seconds'",
          started_at="now() - interval '15 seconds'", finished_at="now() - interval '5 seconds'")
-    assert _claim_run(db, b) is False
+    assert _claim_run(db, b) is None
 
 
 def test_a_new_request_after_the_last_finish_runs_even_inside_the_window(db):
     b = _bucket(db)
-    _claim_run(db, b)
+    assert _claim_run(db, b) is not None
     _run(db, b, started_at="now() - interval '15 seconds'",
          finished_at="now() - interval '10 seconds'", requested_at="now() - interval '1 second'")
-    assert _claim_run(db, b) is True
+    assert _claim_run(db, b) is not None
 
 
 def test_an_old_finish_does_not_block(db):
     b = _bucket(db)
-    _claim_run(db, b)
+    assert _claim_run(db, b) is not None
     _run(db, b, requested_at="now() - interval '3 minutes'",
          started_at="now() - interval '2 minutes'", finished_at="now() - interval '1 minute'")
-    assert _claim_run(db, b) is True
+    assert _claim_run(db, b) is not None
 
 
 # ── saved time ────────────────────────────────────────────────────────────────
@@ -208,3 +209,37 @@ def test_selected_and_off_modes(db):
     a_off = _album(db)
     _item(db, off, a_off)
     assert _enqueue_research(db, off) == 0
+
+
+def test_a_pass_still_inside_the_lambda_timeout_is_not_reclaimed(db):
+    b = _bucket(db)
+    assert _claim_run(db, b) is not None
+    _run(db, b, started_at="now() - interval '100 seconds'")
+    assert _claim_run(db, b) is None
+
+
+# ── finish ────────────────────────────────────────────────────────────────────
+
+def test_finish_stamps_the_claim_time_and_reports_a_mid_pass_request(factory):
+    """finished_at = the pass's claim time; a request made after it is still pending,
+    so the caller runs again. Uses _finish_run's own session (it commits), so the rows
+    are committed and removed at the end."""
+    with factory() as s, s.begin():
+        b = _bucket(s)
+        started = _claim_run(s, b)
+    try:
+        assert _finish_run(factory, b, "added=0", started) is False
+        with factory() as s:
+            fin, out = s.execute(text("SELECT finished_at, last_outcome FROM spotify_library_sync_runs WHERE bucket_id=:b"), {"b": b}).one()
+        assert fin == started and out == "added=0"
+        # a request lands mid-pass
+        with factory() as s, s.begin():
+            s.execute(text("UPDATE spotify_library_sync_runs SET requested_at = :t + interval '1 second' WHERE bucket_id=:b"),
+                      {"t": started, "b": b})
+        assert _finish_run(factory, b, "added=0", started) is True
+        # and the follow-up pass is claimable despite the 30 s window
+        with factory() as s, s.begin():
+            assert _claim_run(s, b) is not None
+    finally:
+        with factory() as s, s.begin():
+            s.execute(text("DELETE FROM users WHERE id = (SELECT user_id FROM review_buckets WHERE id = :b)"), {"b": b})

@@ -50,6 +50,7 @@ class _FakeStore:
         self.run_blocked = False
         self.claims = 0
         self.finished: List[str] = []
+        self.pending_after: List[bool] = []        # per finish: a request landed mid-pass
         self.added_at: Dict[Any, str] = {}        # album uuid -> spotify_added_at
         self.research_calls = 0
 
@@ -80,7 +81,8 @@ class _FakeSession:
 
         if "UPDATE spotify_library_sync_runs SET finished_at" in sql:
             s.finished.append(p["o"])
-            return _Result()
+            pending = s.pending_after.pop(0) if s.pending_after else False
+            return _Result([_Row(pending=pending)])
 
         if "SET spotify_added_at" in sql:
             for aid, ts in zip(p["ids"], p["ts"]):
@@ -615,3 +617,31 @@ def test_saved_time_is_stamped_for_saved_catalog_albums_and_research_runs():
     assert store.added_at == {a1: "2026-10-01T00:00:00Z", a2: "2026-10-02T00:00:00Z"}
     assert store.research_calls == 1
     assert "research_queued" in res
+
+
+@pytest.mark.unit
+def test_a_request_landing_mid_pass_gets_one_more_pass_not_more():
+    """The running pass's claim refuses the new request's own message, so the pass
+    itself must go again — once (MAX_PASSES), never in a loop."""
+    store = _FakeStore()
+    store.bucket_id = uuid.uuid4()
+    store.pending_after = [True, True, True]
+    client = _FakeSpotify(saved=[])
+    run_library_sync(_session_factory(store), client, writes_enabled=True)
+    assert store.claims == 2 and len(store.finished) == 2
+
+
+@pytest.mark.unit
+def test_a_failing_research_enqueue_keeps_the_pulls():
+    store = _FakeStore()
+    store.bucket_id = uuid.uuid4()
+    store.add_album("s1")
+
+    class _Session(_FakeSession):
+        def execute(self, stmt, params=None):
+            if "INSERT INTO album_research" in str(stmt):
+                raise RuntimeError("research table drifted")
+            return super().execute(stmt, params)
+
+    res = run_library_sync(lambda: _Session(store), _FakeSpotify(saved=["s1"]), writes_enabled=True)
+    assert res["pulled"] == 1 and len(store.items) == 1
