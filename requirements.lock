@@ -44,7 +44,7 @@ jmespath==1.1.0
     #   botocore
 musicbrainzngs==0.7.1
     # via -r requirements.txt
-myblog-shared-db @ git+https://github.com/hyuntohoon/myblog_shared_db.git@08b2ee72630ef6d6db714b3fef0ddd8c0c907733
+myblog-shared-db @ git+https://github.com/hyuntohoon/myblog_shared_db.git@4544da2383bd5e5006670aef7883753e395aafb6
     # via -r requirements.txt
 psycopg==3.2.13
     # via -r requirements.txt
