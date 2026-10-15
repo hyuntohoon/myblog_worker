@@ -674,8 +674,10 @@ class LyricsReassessmentService:
             row.setdefault("existing_lyric_synced", None)
         if not ids:
             return tracks
+        # Keyed by str: callers hand in UUID objects (selections) or strings (a track id
+        # from an SQS body), and the driver returns UUIDs.
         bodies = {
-            r[0]: (r[1], r[2])
+            str(r[0]): (r[1], r[2])
             for r in self.session.execute(
                 text(
                     "SELECT track_id, lyric_plain, lyric_synced FROM track_lyrics "
@@ -685,7 +687,7 @@ class LyricsReassessmentService:
             ).fetchall()
         }
         for row in tracks:
-            plain, synced = bodies.get(row["id"], (None, None))
+            plain, synced = bodies.get(str(row["id"]), (None, None))
             row["existing_lyric_plain"] = plain
             row["existing_lyric_synced"] = synced
         return tracks
