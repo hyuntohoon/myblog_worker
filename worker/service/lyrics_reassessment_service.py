@@ -19,10 +19,20 @@ guard is the tested, defensive proof of the never-downgrade rule (and future-pro
 ISRC / MusicBrainz-recording evidence lets a re-check legitimately supersede a title+duration
 match). Bounded to the 120s worker Lambda by the same batch-limit + wall-clock budget as
 Step 3 (shared ``run_eval_batch``). RFC: ``docs/rfcs/FEAT-lyrics-corpus.md`` (Step 4).
+
+FEAT-lyrics-match-correction Step 2 adds the **re-sweep**: resolved rows written by another
+matcher version are re-judged under the running one (``_fetch_stale_version_tracks``, oldest
+version first, a bounded share of the same daily batch), and the guard gains exactly one
+lateral path — same basis, different body, strictly larger content cluster — so a matcher
+fix finally reaches the rows an older version wrote (RC5). Every re-judged row is stamped
+(``evidence["resweep"]``) whether replaced or kept, which is what makes the sweep terminate
+and what re-opens it on the next version bump with no one-off script. A hand-fixed row
+(``evidence["manual_fix"]``, later the Step 3a ``basis='manual'``) is locked: never replaced.
 """
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import text
@@ -30,19 +40,28 @@ from sqlalchemy.orm import Session
 
 from worker.clients.lrclib_client import LrclibClient
 from worker.core.config import settings
-from worker.service.lyrics_eval_core import PRIMARY_ARTIST_NAMES_LATERAL, run_eval_batch
+from worker.service.lyrics_eval_core import PRIMARY_ARTIST_NAMES_LATERAL, Verdict, run_eval_batch
 from worker.service.lyrics_label_yield import sync_exclusions
 from worker.service.lyrics_matcher import (
+    CONTENT_AGREE_THRESHOLD,
+    MATCHER_VERSION,
     STATUS_AMBIGUOUS,
     STATUS_MATCHED,
+    STATUS_NO_LYRICS,
     STATUS_NOT_FOUND,
     STATUS_REVIEW_REQUIRED,
+    Candidate,
     MatchOutcome,
+    body_shingles,
+    content_shingles,
+    content_similarity,
+    plausible_candidates,
 )
 
 logger = logging.getLogger(__name__)
 
 _UNRESOLVED = (STATUS_NOT_FOUND, STATUS_AMBIGUOUS, STATUS_REVIEW_REQUIRED)
+_RESOLVED = (STATUS_MATCHED, STATUS_NO_LYRICS)
 
 # Evidence-strength ladder for the replacement guard. A resolved (matched / no_lyrics) row is
 # replaced only when a NEW matched outcome carries a STRICTLY higher basis. The conservative
@@ -62,14 +81,104 @@ def _basis_strength(basis: Optional[str]) -> int:
     return _BASIS_STRENGTH_MAP.get(basis, 0)
 
 
-def should_replace(row: Dict[str, Any], outcome: MatchOutcome) -> bool:
+def _base_version(version: Optional[str]) -> str:
+    """``step2-v2+best-of-v1`` → ``step2-v2``: the decision core's version, promotion suffix off."""
+    return (version or "").split("+", 1)[0]
+
+
+def produced_by_other_matcher(row: Dict[str, Any]) -> bool:
+    """True when the row's stored outcome came from a matcher other than the running one.
+
+    Keyed on ``existing_matcher_version`` (the ``track_lyrics.matcher_version`` column).
+    Rows selected without it — the demand-source job, the workspace backfill tool — are
+    never eligible, so the lateral rule fails closed for them. The test is *different*,
+    not *older*: the deployed matcher is the authority, and a sweep after a rollback should
+    equally re-judge the rows the rolled-back version wrote.
+    """
+    if "existing_matcher_version" not in row:
+        return False
+    return _base_version(row.get("existing_matcher_version")) != MATCHER_VERSION
+
+
+@dataclass(frozen=True)
+class LateralAssessment:
+    """How the running matcher's pick compares with the body a row already stores."""
+
+    same_content: bool
+    existing_cluster_size: int
+    new_cluster_size: int
+
+    @property
+    def upgrade(self) -> bool:
+        """The Step 2 lateral rule: a different body in a strictly larger content cluster."""
+        return not self.same_content and self.new_cluster_size > self.existing_cluster_size
+
+
+def assess_lateral(
+    row: Dict[str, Any], outcome: MatchOutcome, candidates: Optional[List[Candidate]]
+) -> Optional[LateralAssessment]:
+    """Measure the stored body against today's candidates (FEAT-lyrics-match-correction Step 2).
+
+    None when the rule cannot be applied: the outcome is not ``matched``, carries no
+    consensus evidence, or there are no candidates to measure against. Otherwise:
+
+    * ``new_cluster_size`` is the outcome's own ``content_cluster_size`` — the number of
+      same-stance plausible candidates sharing the picked body, itself included.
+    * ``existing_cluster_size`` is the same count for the STORED body: today's plausible
+      candidates (``plausible_candidates``, the matcher's own gate) whose body agrees with it
+      at ``CONTENT_AGREE_THRESHOLD``, plus the stored row's own vote when LRCLIB no longer
+      returns that row (``/api/search`` caps at 20 and old ids do drop out — Bad Habit's
+      8996695 had). Counted across both version stances, which can only inflate the
+      existing side: the comparison is biased towards keeping.
+    * ``same_content`` — the stored body and the new pick agree; a same-song transcription
+      swap is never an upgrade.
+
+    A ``no_lyrics`` sentinel stores no body: its cluster is 0, so a matched pick of any
+    cluster size at the same basis counts as an upgrade.
+    """
+    if outcome.match_status != STATUS_MATCHED or not candidates:
+        return None
+    new_cluster = (outcome.evidence or {}).get("content_cluster_size")
+    if not isinstance(new_cluster, int):
+        return None
+    stored = body_shingles(row.get("existing_lyric_synced"), row.get("existing_lyric_plain"))
+    if stored is None:
+        return LateralAssessment(False, 0, new_cluster)
+    picked = body_shingles(outcome.lyric_synced, outcome.lyric_plain)
+    plausible = plausible_candidates(
+        row.get("title") or "", list(row.get("artist_names") or []),
+        list(row.get("aliases") or []), row.get("duration_sec"), candidates,
+    )
+    existing_id = row.get("existing_lrclib_id")
+    agreeing = 0
+    returned = False
+    for cand, *_ in plausible:
+        if existing_id is not None and str(cand.id) == str(existing_id):
+            returned = True
+        if content_similarity(stored, content_shingles(cand)) >= CONTENT_AGREE_THRESHOLD:
+            agreeing += 1
+    existing_cluster = agreeing + (0 if returned else 1)
+    same = content_similarity(stored, picked) >= CONTENT_AGREE_THRESHOLD
+    return LateralAssessment(same, existing_cluster, new_cluster)
+
+
+def should_replace(
+    row: Dict[str, Any], outcome: MatchOutcome, candidates: Optional[List[Candidate]] = None
+) -> bool:
     """Replacement guard consulted before persisting a re-evaluated outcome.
 
     ``row`` carries ``existing_status`` + ``existing_basis`` (the current row's state).
     Unresolved rows carry no good match to protect and are always rewritten (promote on
     success, refresh + rotate otherwise). A resolved good row is protected: only a NEW
-    ``matched`` outcome with strictly stronger evidence may replace it.
+    ``matched`` outcome with strictly stronger evidence may replace it — or, since
+    FEAT-lyrics-match-correction Step 2, one at the SAME basis that passes the lateral rule
+    (``assess_lateral``) on a row another matcher version wrote. A locked row never moves.
     """
+    if row.get("existing_locked"):
+        # A hand-fixed row (evidence.manual_fix; the Step 3a basis='manual') is the owner's
+        # verdict. Nothing automatic replaces it, not even a stronger basis — the panel's
+        # unlock is the only way back. Checked first: ``reassess_track`` selects any status.
+        return False
     existing_status = row.get("existing_status")
     if existing_status in _UNRESOLVED:
         return True
@@ -80,7 +189,145 @@ def should_replace(row: Dict[str, Any], outcome: MatchOutcome) -> bool:
     # ladder lets an exact-title / mb-recording / isrc match supersede it, refuses a
     # lateral best-of→best-of swap (both at rung 2), and never lets a best-of displace an
     # exact-title (3 > 3 is False) — the RFC's supersession-without-churn rule.
-    return _basis_strength(outcome.match_basis) > _basis_strength(row.get("existing_basis"))
+    new_strength = _basis_strength(outcome.match_basis)
+    old_strength = _basis_strength(row.get("existing_basis"))
+    if new_strength != old_strength:
+        return new_strength > old_strength
+    # Same rung. Before Step 2 every lateral swap was refused. Step 2 opens exactly one:
+    # a row written by a DIFFERENT matcher version, whose stored body the running matcher
+    # would not pick, and whose pick sits in a strictly larger content cluster than the
+    # stored body does among today's candidates. Same-version rows, and rows selected
+    # without version info, stay refused — that is still the no-churn rule.
+    if not produced_by_other_matcher(row):
+        return False
+    lateral = assess_lateral(row, outcome, candidates)
+    return lateral is not None and lateral.upgrade
+
+
+def _queue_supersession(row: Dict[str, Any], verdict: str) -> bool:
+    """The one rewrite shadow mode lets through: a ``matched`` best-of row superseded by a
+    strictly stronger basis — exactly what the regular queue's best-of arm did before Step 2.
+    A same-rung lateral swap of a best-of row (``replaced``) and any supersession of a
+    ``no_lyrics`` row are new with Step 2 and stay shadowed."""
+    return (
+        verdict == "superseded"
+        and row.get("existing_status") == STATUS_MATCHED
+        and (row.get("existing_basis") or "").startswith("best-of-")
+    )
+
+
+def resweep_stamp_key() -> str:
+    """The evidence key the re-sweep stamps and its selection excludes on.
+
+    Shadow mode (``LYRICS_RESWEEP_SHADOW``) stamps ``resweep_shadow`` instead of
+    ``resweep``, so a full shadow drain neither writes a body nor uses up the real pass:
+    turning shadow off re-opens every row for the real verdict.
+    """
+    return "resweep_shadow" if settings.LYRICS_RESWEEP_SHADOW else "resweep"
+
+
+def replacement_verdict(
+    row: Dict[str, Any], outcome: MatchOutcome, candidates: Optional[List[Candidate]] = None
+) -> Verdict:
+    """The reassessment write gate: ``should_replace`` plus the Step 2 re-sweep record.
+
+    For a RESOLVED row produced by another matcher version the verdict also carries an
+    ``evidence["resweep"]`` block (``evidence["resweep_shadow"]`` in shadow mode) — stamped onto the row whether it is replaced or kept —
+    and a metrics counter. The stamp is what makes the sweep terminate: the selection
+    excludes rows already judged under the running version, so each row costs one LRCLIB
+    call per matcher version, and a later bump re-opens all of them by itself. Unresolved
+    rows are rewritten on every pass anyway and get no block.
+
+    **Shadow mode** (``LYRICS_RESWEEP_SHADOW``, on until the owner has read a full shadow
+    drain): a swept row the guard would rewrite is kept instead, and the block records
+    ``would_replace`` / ``would_supersede`` under ``evidence["resweep_shadow"]``. The one
+    exception is a ``matched`` best-of row superseded by a strictly stronger basis
+    (``_queue_supersession``) — that predates Step 2 and runs from the regular queue anyway. Why: the lateral rule compares the STORED body
+    with today's pick, so a row an older matcher got right by picking a minority body (the
+    Korean ``Go Go`` among Japanese uploads) would be overwritten by the majority; how many
+    such rows exist is unknown until a shadow drain counts them.
+    """
+    write = should_replace(row, outcome, candidates)
+    if row.get("existing_status") not in _RESOLVED or not produced_by_other_matcher(row):
+        return Verdict(write)
+    lateral = assess_lateral(row, outcome, candidates)
+    ev = outcome.evidence or {}
+    block: Dict[str, Any] = {
+        "matcher_version": MATCHER_VERSION,
+        "previous_matcher_version": row.get("existing_matcher_version"),
+        "outcome_status": outcome.match_status,
+        "outcome_basis": outcome.match_basis,
+        "outcome_lrclib_id": ev.get("lrclib_id"),
+    }
+    if ev.get("reason"):
+        block["outcome_reason"] = ev["reason"]
+    if lateral is not None:
+        block["same_content"] = lateral.same_content
+        block["existing_cluster_size"] = lateral.existing_cluster_size
+        block["new_cluster_size"] = lateral.new_cluster_size
+    if row.get("existing_locked"):
+        verdict = "locked"
+    elif write and _basis_strength(outcome.match_basis) > _basis_strength(row.get("existing_basis")):
+        verdict = "superseded"
+    elif write:
+        verdict = "replaced"
+    elif outcome.match_status != STATUS_MATCHED:
+        verdict = "parked"
+    elif lateral is not None and lateral.same_content:
+        verdict = "unchanged"
+    else:
+        verdict = "kept"
+    if write and settings.LYRICS_RESWEEP_SHADOW and not _queue_supersession(row, verdict):
+        write = False
+        verdict = {"replaced": "would_replace", "superseded": "would_supersede"}[verdict]
+    block["verdict"] = verdict
+    if write or verdict.startswith("would_"):
+        block["replaced_lrclib_id"] = row.get("existing_lrclib_id")
+    return Verdict(write, counter=f"resweep_{verdict}", evidence={resweep_stamp_key(): block})
+
+
+# The columns every selection here projects from the existing ``track_lyrics`` row, so the
+# replacement guard and the Step 2 re-sweep see one shape whichever arm selected the row.
+# ``tl.track_id`` is in each GROUP BY, so these are functionally dependent on it. The
+# lyric bodies are NOT here: they are attached afterwards for the chosen rows only
+# (``_attach_stored_bodies``), so a pool-wide sort never carries 18k lyric texts.
+_EXISTING_ROW_COLUMNS = """\
+                       tl.match_status                     AS existing_status,
+                       (tl.evidence ->> 'match_basis')     AS existing_basis,
+                       tl.matcher_version                  AS existing_matcher_version,
+                       ((tl.evidence ? 'manual_fix')
+                        OR (tl.evidence ->> 'match_basis') = 'manual') AS existing_locked,
+                       COALESCE(tl.evidence ->> 'lrclib_id',
+                                tl.evidence #>> '{promotion,lrclib_id}') AS existing_lrclib_id"""
+
+
+def _rows(rows) -> List[Dict[str, Any]]:
+    return [
+        {
+            "id": r[0],
+            "title": r[1],
+            "duration_sec": r[2],
+            "artist_names": list(r[3] or []),
+            "aliases": list(r[4] or []),
+            "existing_status": r[5],
+            "existing_basis": r[6],
+            "existing_matcher_version": r[7],
+            "existing_locked": bool(r[8]),
+            "existing_lrclib_id": r[9],
+        }
+        for r in rows
+    ]
+
+
+def _dedupe(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    out = []
+    for row in tracks:
+        if row["id"] in seen:
+            continue
+        seen.add(row["id"])
+        out.append(row)
+    return out
 
 
 class LyricsReassessmentService:
@@ -101,8 +348,12 @@ class LyricsReassessmentService:
             time_budget_sec if time_budget_sec is not None else settings.LYRICS_REASSESS_TIME_BUDGET_SEC
         )
 
-    def reassess(self, limit: Optional[int] = None) -> Dict[str, Any]:
-        """Re-check up to ``limit`` rows — best-of backlog first, then unresolved (stalest first).
+    def reassess(
+        self, limit: Optional[int] = None, sweep_limit: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Re-check up to ``limit`` queue rows — best-of backlog first, then unresolved
+        (stalest first) — plus up to ``sweep_limit`` resolved rows another matcher version
+        wrote (FEAT-lyrics-match-correction Step 2), in one bounded LRCLIB batch.
 
         Reading the metrics: ``matched`` / ``no_lyrics`` are rows that left the unresolved
         pool (*promotions*); ``not_found`` / ``ambiguous`` / ``review_required`` are
@@ -110,27 +361,80 @@ class LyricsReassessmentService:
         rows, for which the story is different — ``bestof_superseded`` counts the ones
         upgraded to a stronger basis, and ``guard_kept`` counts the ones whose content the
         replacement guard protected (those are re-checked and rotated, never overwritten).
+        The ``resweep_*`` counters are the Step 2 verdicts, one per re-judged resolved row;
+        ``resweep_selected`` is how many the sweep arm selected this run.
+
+        ``None`` means the setting; ``0`` means that arm runs empty, so
+        ``reassess(limit=0, sweep_limit=N)`` is the sweep alone — the by-hand drain of the
+        backlog a version bump re-opens, over the documented SQS fire path.
         """
-        limit = limit or settings.LYRICS_REASSESS_BATCH_LIMIT
+        limit = limit if limit is not None else settings.LYRICS_REASSESS_BATCH_LIMIT
+        sweep_limit = (
+            sweep_limit if sweep_limit is not None else settings.LYRICS_RESWEEP_BATCH_LIMIT
+        )
         # Recompute label-yield exclusions before selecting. This is what makes rule F
         # self-correcting: a label that starts matching releases its own rows here, in
         # the same pass that a newly-dead label claims its rows. It also repairs marks
         # that the matcher's `ON CONFLICT ... evidence = EXCLUDED.evidence` overwrote.
         exclusions = sync_exclusions(self.session)
-        tracks = self._fetch_unresolved_tracks(limit)
-        # `_fetch_unresolved_tracks` opens a read transaction. Release it before
-        # `run_eval_batch` starts the external LRCLIB loop.
+        sweep = self._fetch_stale_version_tracks(sweep_limit) if sweep_limit > 0 else []
+        queue = self._fetch_unresolved_tracks(limit) if limit > 0 else []
+        # A best-of row can be due in both arms; the sweep's copy carries the same fields.
+        tracks = self._attach_stored_bodies(_dedupe(sweep + queue))
+        # The selections open a read transaction. Release it before `run_eval_batch`
+        # starts the external LRCLIB loop.
         self.session.commit()
         metrics = run_eval_batch(
             self.session, tracks,
             concurrency=self.concurrency,
             time_budget_sec=self.time_budget_sec,
             client=self._client,
-            should_write=should_replace,
+            should_write=replacement_verdict,
             touch_on_guard_kept=True,
+            touch_on_consistency_error=True,
             log_prefix="Lyrics reassessment",
         )
         metrics["exclusions"] = exclusions
+        metrics["resweep_selected"] = len(sweep)
+        if sweep:
+            # WARNING, not INFO: prod Lambdas run LOG_LEVEL=WARNING, and this summary is
+            # the only per-run signal the sweep leaves besides the stamps themselves.
+            logger.warning(
+                "Lyrics re-sweep under %s: selected=%d %s",
+                MATCHER_VERSION, len(sweep),
+                {k: v for k, v in metrics.items() if k.startswith("resweep_")},
+            )
+        return metrics
+
+    def reassess_track(
+        self, track_id: str, cooldown_sec: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """Re-judge ONE row of any status, now (FEAT-lyrics-match-correction Step 2).
+
+        The first-run check the RFC asks for before a bulk sweep: fire it at a known track,
+        read the ``resweep`` verdict it leaves. Same matcher, same guard, same stamp as the
+        scheduled pass; the label-yield exclusion and the sweep's lock filter are bypassed
+        at selection (an explicit request is re-judged even when it would not be swept) —
+        but not at the guard, so a locked row is judged, recorded as ``locked`` and never
+        rewritten. ``cooldown_sec`` as in ``reassess_album``; pass ``0`` to force it.
+        """
+        cooldown_sec = (
+            cooldown_sec if cooldown_sec is not None else settings.LYRICS_EXPEDITE_COOLDOWN_SEC
+        )
+        tracks = self._attach_stored_bodies(self._fetch_track(track_id, cooldown_sec))
+        self.session.commit()
+        metrics = run_eval_batch(
+            self.session, tracks,
+            concurrency=1,
+            time_budget_sec=self.time_budget_sec,
+            client=self._client,
+            should_write=replacement_verdict,
+            touch_on_guard_kept=True,
+            touch_on_consistency_error=True,
+            log_prefix=f"Lyrics expedite (track {track_id})",
+        )
+        metrics["track_id"] = str(track_id)
+        logger.warning("Lyrics track re-check %s: %s", track_id, metrics)  # prod LOG_LEVEL=WARNING
         return metrics
 
     def reassess_album(
@@ -169,7 +473,7 @@ class LyricsReassessmentService:
         cooldown_sec = (
             cooldown_sec if cooldown_sec is not None else settings.LYRICS_EXPEDITE_COOLDOWN_SEC
         )
-        tracks = self._fetch_album_tracks(album_id, limit, cooldown_sec)
+        tracks = self._attach_stored_bodies(self._fetch_album_tracks(album_id, limit, cooldown_sec))
         # As above, do not leave the selection transaction open across LRCLIB.
         self.session.commit()
         metrics = run_eval_batch(
@@ -177,8 +481,9 @@ class LyricsReassessmentService:
             concurrency=self.concurrency,
             time_budget_sec=self.time_budget_sec,
             client=self._client,
-            should_write=should_replace,
+            should_write=replacement_verdict,
             touch_on_guard_kept=True,
+            touch_on_consistency_error=True,
             log_prefix=f"Lyrics expedite (album {album_id})",
         )
         metrics["album_id"] = str(album_id)
@@ -213,8 +518,7 @@ class LyricsReassessmentService:
                 SELECT t.id, t.title, t.duration_sec,
                        primary_artists.artist_names                     AS artist_names,
                        ARRAY_REMOVE(ARRAY_AGG(DISTINCT al.alias), NULL) AS aliases,
-                       tl.match_status                     AS existing_status,
-                       (tl.evidence ->> 'match_basis')     AS existing_basis
+{_EXISTING_ROW_COLUMNS}
                 FROM track_lyrics tl
                 JOIN tracks t         ON t.id = tl.track_id
                 JOIN track_artists ta ON ta.track_id = t.id
@@ -226,8 +530,7 @@ class LyricsReassessmentService:
                   AND (tl.match_status IN ('not_found', 'ambiguous', 'review_required')
                        OR (tl.match_status = 'matched'
                            AND tl.evidence ->> 'match_basis' LIKE 'best-of-%'))
-                GROUP BY t.id, t.title, t.duration_sec,
-                         tl.match_status, (tl.evidence ->> 'match_basis'), tl.updated_at,
+                GROUP BY tl.track_id, t.id, t.title, t.duration_sec,
                          primary_artists.artist_names
                 ORDER BY
                     CASE WHEN tl.match_status IN ('not_found', 'ambiguous', 'review_required')
@@ -238,18 +541,7 @@ class LyricsReassessmentService:
             ),
             {"album_id": album_id, "cooldown_sec": cooldown_sec, "limit": limit},
         ).fetchall()
-        return [
-            {
-                "id": r[0],
-                "title": r[1],
-                "duration_sec": r[2],
-                "artist_names": list(r[3] or []),
-                "aliases": list(r[4] or []),
-                "existing_status": r[5],
-                "existing_basis": r[6],
-            }
-            for r in rows
-        ]
+        return _rows(rows)
 
     def _fetch_unresolved_tracks(self, limit: int) -> List[Dict[str, Any]]:
         """Reassessment targets: best-of-* matched rows first, then the unresolved pool.
@@ -299,8 +591,7 @@ class LyricsReassessmentService:
                 SELECT t.id, t.title, t.duration_sec,
                        primary_artists.artist_names                     AS artist_names,
                        ARRAY_REMOVE(ARRAY_AGG(DISTINCT al.alias), NULL) AS aliases,
-                       tl.match_status                     AS existing_status,
-                       (tl.evidence ->> 'match_basis')     AS existing_basis
+{_EXISTING_ROW_COLUMNS}
                 FROM track_lyrics tl
                 JOIN tracks t         ON t.id = tl.track_id
                 JOIN track_artists ta ON ta.track_id = t.id
@@ -313,8 +604,7 @@ class LyricsReassessmentService:
                            AND tl.evidence ->> 'match_basis' LIKE 'best-of-%'
                            AND tl.updated_at
                                < NOW() - make_interval(days => :bestof_rest_days)))
-                GROUP BY t.id, t.title, t.duration_sec,
-                         tl.match_status, (tl.evidence ->> 'match_basis'), tl.updated_at,
+                GROUP BY tl.track_id, t.id, t.title, t.duration_sec,
                          primary_artists.artist_names
                 ORDER BY
                     CASE WHEN tl.match_status = 'matched' THEN 0 ELSE 1 END,
@@ -324,15 +614,119 @@ class LyricsReassessmentService:
             ),
             {"limit": limit, "bestof_rest_days": settings.LYRICS_BESTOF_RECHECK_INTERVAL_DAYS},
         ).fetchall()
-        return [
-            {
-                "id": r[0],
-                "title": r[1],
-                "duration_sec": r[2],
-                "artist_names": list(r[3] or []),
-                "aliases": list(r[4] or []),
-                "existing_status": r[5],
-                "existing_basis": r[6],
-            }
-            for r in rows
-        ]
+        return _rows(rows)
+
+
+    def _fetch_stale_version_tracks(self, limit: int) -> List[Dict[str, Any]]:
+        """Re-sweep targets (FEAT-lyrics-match-correction Step 2): RESOLVED rows whose decision
+        core version is not the running one, oldest version first.
+
+        Same joins and projection as the scheduled selection, so a swept row is judged exactly
+        like a queued one. The filters are the point:
+
+        * ``matched`` / ``no_lyrics`` only — unresolved rows are the queue's job and are
+          rewritten (and re-versioned) on every pass anyway;
+        * the decision core's version differs from ``MATCHER_VERSION`` (the ``+best-of-v1``
+          promotion suffix is dropped first, so a ``step2-v2+best-of-v1`` row is swept too);
+        * not already stamped under the running version (``evidence.resweep.matcher_version``,
+          or ``evidence.resweep_shadow`` in shadow mode — ``resweep_stamp_key``)
+          — the stamp is what makes this arm terminate, and a version bump invalidates every
+          stamp at once, which is how the sweep re-opens itself;
+        * not hand-fixed (``manual_fix`` / ``basis='manual'``): the guard would keep such a
+          row anyway, so the LRCLIB call is not spent. ``reassess_track`` bypasses this one.
+
+        Ordering parses ``stepN-vM`` out of the version string (``substring(... from
+        pattern)`` returns the first capture group; unparseable ⇒ 0, i.e. first) so
+        ``step10-v1`` sorts after ``step9-v1`` — lexical order would not. Within a version,
+        stalest first.
+        """
+        stamp_key = resweep_stamp_key()  # a constant, never caller input
+        rows = self.session.execute(
+            text(
+                f"""
+                SELECT t.id, t.title, t.duration_sec,
+                       primary_artists.artist_names                     AS artist_names,
+                       ARRAY_REMOVE(ARRAY_AGG(DISTINCT al.alias), NULL) AS aliases,
+{_EXISTING_ROW_COLUMNS}
+                FROM track_lyrics tl
+                JOIN tracks t         ON t.id = tl.track_id
+                JOIN track_artists ta ON ta.track_id = t.id
+                JOIN artists a        ON a.id = ta.artist_id
+                LEFT JOIN LATERAL jsonb_array_elements_text(a.aliases) AS al(alias) ON true
+{PRIMARY_ARTIST_NAMES_LATERAL}
+                WHERE NOT (tl.evidence ? 'excluded_by')
+                  AND tl.match_status IN ('matched', 'no_lyrics')
+                  AND split_part(COALESCE(tl.matcher_version, ''), '+', 1) <> :current_version
+                  AND COALESCE(tl.evidence #>> '{{{stamp_key},matcher_version}}', '')
+                      <> :current_version
+                  AND NOT (tl.evidence ? 'manual_fix')
+                  AND COALESCE(tl.evidence ->> 'match_basis', '') <> 'manual'
+                GROUP BY tl.track_id, t.id, t.title, t.duration_sec,
+                         primary_artists.artist_names
+                ORDER BY
+                    COALESCE(substring(tl.matcher_version FROM '^step(\\d+)')::int, 0),
+                    COALESCE(substring(tl.matcher_version FROM '^step\\d+-v(\\d+)')::int, 0),
+                    tl.updated_at ASC
+                LIMIT :limit
+                """
+            ),
+            {"current_version": MATCHER_VERSION, "limit": limit},
+        ).fetchall()
+        return _rows(rows)
+
+    def _fetch_track(self, track_id: str, cooldown_sec: float) -> List[Dict[str, Any]]:
+        """One explicitly requested row, any status; exclusion and lock filters bypassed."""
+        rows = self.session.execute(
+            text(
+                f"""
+                SELECT t.id, t.title, t.duration_sec,
+                       primary_artists.artist_names                     AS artist_names,
+                       ARRAY_REMOVE(ARRAY_AGG(DISTINCT al.alias), NULL) AS aliases,
+{_EXISTING_ROW_COLUMNS}
+                FROM track_lyrics tl
+                JOIN tracks t         ON t.id = tl.track_id
+                JOIN track_artists ta ON ta.track_id = t.id
+                JOIN artists a        ON a.id = ta.artist_id
+                LEFT JOIN LATERAL jsonb_array_elements_text(a.aliases) AS al(alias) ON true
+{PRIMARY_ARTIST_NAMES_LATERAL}
+                WHERE t.id = :track_id
+                  AND tl.updated_at < NOW() - make_interval(secs => :cooldown_sec)
+                GROUP BY tl.track_id, t.id, t.title, t.duration_sec,
+                         primary_artists.artist_names
+                """
+            ),
+            {"track_id": track_id, "cooldown_sec": cooldown_sec},
+        ).fetchall()
+        return _rows(rows)
+
+    def _attach_stored_bodies(self, tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Add ``existing_lyric_plain`` / ``existing_lyric_synced`` to the chosen rows.
+
+        Only ``matched`` rows store a body and only the Step 2 lateral rule reads it, so the
+        pool-wide selections stay body-free and this one short query fetches the texts for
+        the rows that were actually chosen. Runs inside the selection transaction, before the
+        caller commits it ahead of the LRCLIB loop.
+        """
+        ids = [row["id"] for row in tracks if row.get("existing_status") == STATUS_MATCHED]
+        for row in tracks:
+            row.setdefault("existing_lyric_plain", None)
+            row.setdefault("existing_lyric_synced", None)
+        if not ids:
+            return tracks
+        # Keyed by str: callers hand in UUID objects (selections) or strings (a track id
+        # from an SQS body), and the driver returns UUIDs.
+        bodies = {
+            str(r[0]): (r[1], r[2])
+            for r in self.session.execute(
+                text(
+                    "SELECT track_id, lyric_plain, lyric_synced FROM track_lyrics "
+                    "WHERE track_id = ANY(:ids)"
+                ),
+                {"ids": ids},
+            ).fetchall()
+        }
+        for row in tracks:
+            plain, synced = bodies.get(str(row["id"]), (None, None))
+            row["existing_lyric_plain"] = plain
+            row["existing_lyric_synced"] = synced
+        return tracks

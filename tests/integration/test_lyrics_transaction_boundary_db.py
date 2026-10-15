@@ -61,7 +61,7 @@ def _track():
     }
 
 
-@pytest.mark.parametrize("entrypoint", ["incremental", "reassess", "album"])
+@pytest.mark.parametrize("entrypoint", ["incremental", "reassess", "sweep", "album", "track"])
 def test_collector_selection_transaction_is_closed_before_provider_call(factory, entrypoint):
     """Every ``run_eval_batch`` caller releases its selection transaction first."""
     states: list[str] = []
@@ -97,7 +97,14 @@ def test_collector_selection_transaction_is_closed_before_provider_call(factory,
             if entrypoint == "reassess":
                 # The selection transaction, rather than exclusion policy, is under test.
                 service._fetch_unresolved_tracks = fetch
-                service.reassess(limit=1)
+                service.reassess(limit=1, sweep_limit=0)
+            elif entrypoint == "sweep":
+                # FEAT-lyrics-match-correction Step 2: the re-sweep arm + body attach.
+                service._fetch_stale_version_tracks = fetch
+                service.reassess(limit=0, sweep_limit=1)
+            elif entrypoint == "track":
+                service._fetch_track = fetch
+                service.reassess_track(str(uuid.uuid4()), cooldown_sec=0)
             else:
                 service._fetch_album_tracks = fetch
                 service.reassess_album(str(uuid.uuid4()), limit=1, cooldown_sec=0)
@@ -184,8 +191,8 @@ def test_incremental_lost_race_closes_guard_transaction_before_next_provider_cal
 
             original_guard = service._still_uncorpused
 
-            def guard(row, outcome):
-                keep = original_guard(row, outcome)
+            def guard(row, outcome, candidates=None):
+                keep = original_guard(row, outcome, candidates)
                 if row["id"] == first_id:
                     released_second.set()
                 return keep

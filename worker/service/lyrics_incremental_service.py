@@ -78,7 +78,9 @@ class LyricsIncrementalService:
             log_prefix="Lyrics incremental",
         )
 
-    def _still_uncorpused(self, row: Dict[str, Any], outcome: Any) -> bool:
+    def _still_uncorpused(
+        self, row: Dict[str, Any], outcome: Any, candidates: Any = None
+    ) -> bool:
         """Concurrent-run guard (near-real-time SQS chaining). The selection is
         materialized before the slow LRCLIB loop, so a chained peer invocation may
         corpus a track while this run is still fetching; without a gate the writer's

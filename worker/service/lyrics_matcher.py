@@ -260,9 +260,17 @@ _LRC_TIMESTAMP_RE = re.compile(r"\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]")
 _LYRIC_PAREN_RE = re.compile(r"\([^()]*\)|\[[^\[\]]*\]")
 
 
-def content_shingles(cand: "Candidate") -> Optional[frozenset]:
-    """Normalized content fingerprint of a candidate's body, or None if it has none."""
-    body = cand.synced_lyrics or cand.plain_lyrics or ""
+def body_shingles(
+    synced_lyrics: Optional[str], plain_lyrics: Optional[str]
+) -> Optional[frozenset]:
+    """Normalized content fingerprint of one lyric body (synced preferred), or None if empty.
+
+    Shared by ``content_shingles`` (a candidate's body) and the FEAT-lyrics-match-correction
+    Step 2 re-sweep, which fingerprints the body already STORED on a ``track_lyrics`` row
+    with the same precedence, so a stored body and today's candidates are compared under
+    exactly one normalization.
+    """
+    body = synced_lyrics or plain_lyrics or ""
     body = _LRC_TIMESTAMP_RE.sub(" ", body)
     body = _LYRIC_PAREN_RE.sub(" ", body)
     # apostrophes vary by transcriber (creepin / creepin'), unlike in titles
@@ -274,6 +282,11 @@ def content_shingles(cand: "Candidate") -> Optional[frozenset]:
     return frozenset(
         tuple(words[i:i + CONTENT_SHINGLE]) for i in range(len(words) - CONTENT_SHINGLE + 1)
     )
+
+
+def content_shingles(cand: "Candidate") -> Optional[frozenset]:
+    """Normalized content fingerprint of a candidate's body, or None if it has none."""
+    return body_shingles(cand.synced_lyrics, cand.plain_lyrics)
 
 
 def content_similarity(a: Optional[frozenset], b: Optional[frozenset]) -> float:
@@ -397,36 +410,36 @@ def _build(
     )
 
 
-def decide_match(
-    track_id: uuid.UUID,
+def _identity_norms(artist_names: List[str], aliases: Optional[List[str]]) -> List[str]:
+    """Normalized artist identities (credited names + catalog aliases) for the artist gate."""
+    identity_norms = [TitleNormalizer.normalize(n) for n in (artist_names or []) if n]
+    for a in (aliases or []):
+        if isinstance(a, str) and a:
+            identity_norms.append(TitleNormalizer.normalize(a))
+    return identity_norms
+
+
+def plausible_candidates(
     title: str,
     artist_names: List[str],
     aliases: Optional[List[str]],
     duration_sec: Optional[float],
     candidates: List[Candidate],
-) -> MatchOutcome:
-    """Pure, no-I/O conservative match decision.
+) -> List[tuple]:
+    """The candidates ``decide_match`` considers for this track, each with its title kind.
 
-    Evidence priority: (1) artist identity via ``artist_names`` + ``aliases``,
-    (2) normalized title exact / fuzzy, (3) duration within tolerance,
-    (4) version-token agreement. Outcomes: matched / no_lyrics / not_found /
-    ambiguous / review_required.
+    An entry is ``(candidate, kind, similarity, stripped_base_title)``: the artist identity
+    gate passed, the title is an exact base-title match (``kind == "exact"``, collapsed onto
+    the track's own base so same-song uploads group together) or a plain-canonical fuzzy
+    match at or above ``TITLE_FUZZY_THRESHOLD``, and the duration is within tolerance.
+    Pure. Factored out of ``decide_match`` for the FEAT-lyrics-match-correction Step 2
+    re-sweep, which measures how many of today's plausible candidates still share a body a
+    row already STORES — the same gate, so the stored side and the picked side are counted
+    over one population. ``decide_match`` is unchanged in behaviour.
     """
-    track_tokens = extract_version_tokens(title or "")
     stripped_track = canonical_base_title(title or "")
     plain_track = plain_base_title(title or "")
-
-    identity_norms = [TitleNormalizer.normalize(n) for n in (artist_names or []) if n]
-    for a in (aliases or []):
-        if isinstance(a, str) and a:
-            identity_norms.append(TitleNormalizer.normalize(a))
-
-    if not artist_names:
-        return _build(
-            track_id, STATUS_NOT_FOUND,
-            {"reason": "no_artist_data"}, track_tokens=track_tokens,
-        )
-
+    identity_norms = _identity_norms(artist_names, aliases)
     plausible: List[tuple] = []  # (candidate, kind, similarity, stripped_cand_title)
     for cand in candidates:
         if not _artist_identity_ok(TitleNormalizer.normalize(cand.artist), identity_norms):
@@ -451,6 +464,35 @@ def decide_match(
         if not duration_matches(duration_sec, cand.duration_sec):
             continue
         plausible.append((cand, kind, sim, stripped_cand))
+    return plausible
+
+
+def decide_match(
+    track_id: uuid.UUID,
+    title: str,
+    artist_names: List[str],
+    aliases: Optional[List[str]],
+    duration_sec: Optional[float],
+    candidates: List[Candidate],
+) -> MatchOutcome:
+    """Pure, no-I/O conservative match decision.
+
+    Evidence priority: (1) artist identity via ``artist_names`` + ``aliases``,
+    (2) normalized title exact / fuzzy, (3) duration within tolerance,
+    (4) version-token agreement. Outcomes: matched / no_lyrics / not_found /
+    ambiguous / review_required.
+    """
+    track_tokens = extract_version_tokens(title or "")
+    plain_track = plain_base_title(title or "")
+    identity_norms = _identity_norms(artist_names, aliases)
+
+    if not artist_names:
+        return _build(
+            track_id, STATUS_NOT_FOUND,
+            {"reason": "no_artist_data"}, track_tokens=track_tokens,
+        )
+
+    plausible = plausible_candidates(title, artist_names, aliases, duration_sec, candidates)
 
     if not plausible:
         return _build(
@@ -728,6 +770,37 @@ class TrackLyricsWriter:
             return True
         except Exception as exc:  # noqa: BLE001 - isolation: matches write_outcomes
             logger.error("Failed to touch track %s: %s", track_id, exc)
+            self.session.rollback()
+            return False
+
+    def patch_evidence(self, track_id, patch: Dict) -> bool:
+        """Merge ``patch`` into a row's evidence and bump ``updated_at``; content untouched.
+
+        FEAT-lyrics-match-correction Step 2: the re-sweep's record of a row it re-judged under
+        the current matcher and deliberately KEPT (``evidence["resweep"]``). Like ``touch`` it
+        writes no status, lyric or ``matcher_version`` — the stored outcome is still the old
+        matcher's — but unlike ``touch`` it leaves a stamp the sweep selection excludes, so a
+        kept row costs one LRCLIB call per matcher version instead of one per run. ``||`` is
+        a shallow jsonb merge: the patch's top-level keys replace, every other key survives
+        (``manual_fix``, ``promotion``, ``excluded_by`` are never lost).
+        """
+        try:
+            self.session.execute(
+                text(
+                    "UPDATE track_lyrics "
+                    "SET evidence = COALESCE(evidence, '{}'::jsonb) || CAST(:patch AS jsonb), "
+                    "updated_at = NOW() "
+                    "WHERE track_id = :track_id"
+                ),
+                {
+                    "track_id": track_id,
+                    "patch": json.dumps(_strip_nul(patch), ensure_ascii=False),
+                },
+            )
+            self.session.commit()
+            return True
+        except Exception as exc:  # noqa: BLE001 - isolation: matches write_outcomes
+            logger.error("Failed to patch evidence for track %s: %s", track_id, exc)
             self.session.rollback()
             return False
 

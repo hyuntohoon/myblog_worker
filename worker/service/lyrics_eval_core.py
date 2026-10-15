@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -23,6 +24,7 @@ from worker.service.lyrics_matcher import (
     STATUS_AMBIGUOUS,
     STATUS_MATCHED,
     STATUS_REVIEW_REQUIRED,
+    Candidate,
     MatchOutcome,
     TrackLyricsWriter,
     decide_match,
@@ -35,8 +37,30 @@ from worker.service.lyrics_promote import (
 
 logger = logging.getLogger(__name__)
 
-# should_write(row, outcome) -> bool. ``row`` may carry 'existing_status'/'existing_basis'.
-WriteGate = Callable[[Dict[str, Any], MatchOutcome], bool]
+# should_write(row, outcome, candidates) -> bool | Verdict. ``row`` may carry
+# 'existing_status' / 'existing_basis' (+ the Step 2 'existing_*' fields); ``candidates``
+# are the LRCLIB rows the outcome was decided from. A plain bool is the original contract;
+# a ``Verdict`` can additionally carry an evidence patch and a metrics counter.
+WriteGate = Callable[[Dict[str, Any], MatchOutcome, List[Candidate]], Any]
+
+
+@dataclass
+class Verdict:
+    """A write gate's decision plus optional bookkeeping (FEAT-lyrics-match-correction Step 2).
+
+    ``write`` is the gate's answer. ``evidence`` is a patch merged into the row's evidence —
+    into the new outcome when it is written, onto the existing row (``patch_evidence``) when
+    it is kept — so a re-judged row records what the current matcher found either way.
+    ``counter`` names a metrics key to increment. Truthiness is ``write``, so the loop treats
+    a Verdict exactly like the bool the other gates return.
+    """
+
+    write: bool
+    counter: Optional[str] = None
+    evidence: Optional[Dict[str, Any]] = None
+
+    def __bool__(self) -> bool:
+        return self.write
 
 # ── Primary-artist selection (shared by every selection query that feeds this loop) ────
 #
@@ -147,6 +171,19 @@ def new_metrics() -> Dict[str, Any]:
         # reachable. Distinct from `promoted_*` (which count rows lifted OUT of the parked
         # pool INTO a best-of basis); this counts rows leaving that basis for a real match.
         "bestof_superseded": 0,
+        # FEAT-lyrics-match-correction Step 2 — RESOLVED rows written by another matcher
+        # version, re-judged under the running one (lyrics_reassessment_service
+        # .replacement_verdict). One of these fires per such row; the stamp it leaves is what
+        # stops the row being selected again before the next version bump.
+        "resweep_replaced": 0,    # lateral: different body in a strictly larger cluster
+        "resweep_superseded": 0,  # strictly stronger basis (a best-of row counts in bestof_superseded too)
+        "resweep_unchanged": 0,   # the running matcher picks the same body
+        "resweep_kept": 0,        # different body, but not a strictly larger cluster
+        "resweep_parked": 0,      # the running matcher could not match; stored row kept
+        "resweep_locked": 0,      # hand-fixed row; never replaced
+        # shadow mode (LYRICS_RESWEEP_SHADOW): what the real pass would rewrite; nothing written
+        "resweep_would_replace": 0,
+        "resweep_would_supersede": 0,
     }
 
 
@@ -159,6 +196,7 @@ def run_eval_batch(
     client: Optional[LrclibClient] = None,
     should_write: Optional[WriteGate] = None,
     touch_on_guard_kept: bool = False,
+    touch_on_consistency_error: bool = False,
     log_prefix: str = "Lyrics eval",
 ) -> Dict[str, Any]:
     """Evaluate ``tracks`` against LRCLIB and persist outcomes, bounded by a wall clock.
@@ -168,8 +206,11 @@ def run_eval_batch(
     selection and owns the session; per-row commits keep the connection warm through the slow
     LRCLIB loop (reference-db-session-across-long-external-loop).
 
-    ``should_write``: consulted before persisting each outcome (default: always write).
-    Returning False leaves the existing row intact and counts it under ``guard_kept``.
+    ``should_write``: consulted before persisting each outcome (default: always write), with
+    the row, the outcome and the candidates it was decided from. A falsy answer leaves the
+    existing row intact and counts it under ``guard_kept``. A ``Verdict`` may also carry an
+    evidence patch — merged into the outcome when written, stamped onto the kept row
+    otherwise — and a metrics counter to bump (FEAT-lyrics-match-correction Step 2).
 
     ``touch_on_guard_kept``: bump ``updated_at`` on a guard-kept row. OFF by default because
     the two callers mean different things by a kept row. For **reassessment**, the row was
@@ -253,17 +294,35 @@ def run_eval_batch(
                 logger.error("%s: CONSISTENCY VIOLATION track %s matched (basis=%s) "
                              "but invariant failed — row NOT written",
                              log_prefix, row["id"], outcome.match_basis)
+                if touch_on_consistency_error:
+                    # Reassessment only: rotate it like a guard-kept row so a deterministic
+                    # violation does not hold the head of a stalest-first queue (or the
+                    # re-sweep) every run. The demand-source job reads a touch as "evaluated"
+                    # and would advance its backoff ladder, so it does not opt in.
+                    writer.touch(row["id"])
                 continue
 
-            if should_write is not None and not should_write(row, outcome):
+            verdict = should_write(row, outcome, candidates) if should_write is not None else True
+            patch = getattr(verdict, "evidence", None)
+            counter = getattr(verdict, "counter", None)
+            if counter:
+                metrics[counter] = metrics.get(counter, 0) + 1
+            if not verdict:
                 metrics["guard_kept"] += 1
-                if touch_on_guard_kept:
+                if patch:
+                    # Step 2: re-judged under the running matcher and kept. Stamp the verdict
+                    # on the row (this also advances its rotation cursor) so the sweep does
+                    # not select it again before the next matcher version.
+                    writer.patch_evidence(row["id"], patch)
+                elif touch_on_guard_kept:
                     # The row was re-checked; only its CONTENT is protected. Advance the
                     # rotation cursor so a permanently-unsupersedable row cannot pin the
                     # head of a stalest-first queue (DATA-catalog-noise Step 3b).
                     writer.touch(row["id"])
                 continue
 
+            if patch:
+                outcome.evidence = {**(outcome.evidence or {}), **patch}
             writer.write_outcomes([outcome])  # per-row commit (sentinel included)
             metrics["evaluated"] += 1
             metrics[outcome.match_status] = metrics.get(outcome.match_status, 0) + 1

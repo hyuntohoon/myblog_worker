@@ -409,6 +409,8 @@ def _run_lyrics_reassessment(
     limit: int | None = None,
     album_id: str | None = None,
     cooldown_sec: float | None = None,
+    track_id: str | None = None,
+    sweep_limit: int | None = None,
 ) -> None:
     """Periodic reassessment of unresolved lyrics rows (FEAT-lyrics-corpus Step 4). Re-checks
     not_found / ambiguous / review_required tracks (stalest first) against current LRCLIB
@@ -418,16 +420,24 @@ def _run_lyrics_reassessment(
 
     With "album_id" the same evaluation runs album-scoped and out of turn (DATA-catalog-noise
     Step 4 expedite) — same matcher, same guard, but the label-yield exclusion is bypassed and
-    a cooldown makes an SQS redelivery cheap."""
+    a cooldown makes an SQS redelivery cheap. With "track_id" it is scoped to one row of any
+    status (FEAT-lyrics-match-correction Step 2's first-run check). "sweep_limit" caps the
+    scheduled pass's re-sweep arm (rows written by another matcher version); "limit": 0 with
+    a "sweep_limit" runs the sweep alone, which is how the backlog after a version bump is
+    drained by hand."""
     from worker.service.lyrics_reassessment_service import LyricsReassessmentService
 
     with SessionLocal() as session:
         svc = LyricsReassessmentService(session)
+        if track_id:
+            metrics = svc.reassess_track(track_id, cooldown_sec=cooldown_sec)
+            logger.info("Lyrics track re-check metrics: %s", metrics)
+            return
         if album_id:
             metrics = svc.reassess_album(album_id, limit=limit, cooldown_sec=cooldown_sec)
             logger.info("Lyrics expedite metrics: %s", metrics)
             return
-        metrics = svc.reassess(limit=limit)
+        metrics = svc.reassess(limit=limit, sweep_limit=sweep_limit)
         logger.info("Lyrics reassessment metrics: %s", metrics)
 
 
@@ -593,15 +603,19 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # the alias source check). Bounded per invocation; optional "limit" overrides the setting.
     # An optional "album_id" switches the same job to the album-scoped expedite (Step 4 of
     # DATA-catalog-noise); "cooldown_sec": 0 forces a re-run inside the cooldown window.
+    # "track_id" scopes it to one row; "sweep_limit" caps the Step 2 re-sweep arm
+    # (FEAT-lyrics-match-correction).
     if event.get("job") == "lyrics_reassessment":
         limit = event.get("limit")
         album_id = event.get("album_id")
         logger.info(
-            "EventBridge/SQS trigger: running lyrics reassessment (limit=%s, album_id=%s)",
-            limit, album_id,
+            "EventBridge/SQS trigger: running lyrics reassessment "
+            "(limit=%s, album_id=%s, track_id=%s, sweep_limit=%s)",
+            limit, album_id, event.get("track_id"), event.get("sweep_limit"),
         )
         _run_lyrics_reassessment(
-            limit=limit, album_id=album_id, cooldown_sec=event.get("cooldown_sec")
+            limit=limit, album_id=album_id, cooldown_sec=event.get("cooldown_sec"),
+            track_id=event.get("track_id"), sweep_limit=event.get("sweep_limit"),
         )
         return {}
 
@@ -733,6 +747,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     limit=body.get("limit"),
                     album_id=body.get("album_id"),
                     cooldown_sec=body.get("cooldown_sec"),
+                    track_id=body.get("track_id"),
+                    sweep_limit=body.get("sweep_limit"),
                 )
                 continue
 
