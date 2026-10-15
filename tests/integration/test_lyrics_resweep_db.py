@@ -48,6 +48,13 @@ _WRONG_ID = str(_BAD_HABIT["wrong_id"])
 _ALL = 1_000_000  # selection limit: "everything", so only our own rows are asserted on
 
 
+@pytest.fixture(autouse=True)
+def _real_pass(monkeypatch):
+    """The round trips below describe the real pass (shadow off); shadow has its own test."""
+    from worker.core.config import settings
+    monkeypatch.setattr(settings, "LYRICS_RESWEEP_SHADOW", False)
+
+
 @pytest.fixture(scope="module")
 def factory():
     eng = create_engine(_TEST_DB_URL, pool_pre_ping=True, future=True)
@@ -276,3 +283,25 @@ def test_locked_row_is_judged_but_never_rewritten(factory):
         assert str(after["evidence"]["lrclib_id"]) == _WRONG_ID
         assert after["evidence"]["manual_fix"] == {"by": "owner"}
         assert after["evidence"]["resweep"]["verdict"] == "locked"
+
+
+def test_shadow_drain_writes_nothing_and_leaves_the_real_pass_open(factory, monkeypatch):
+    """The owner's 2026-10-16 decision: drain in shadow first. The wrong Bad Habit body is
+    judged would_replace, nothing is rewritten, and the row is out of the shadow sweep but
+    still due for the real one."""
+    from worker.core.config import settings
+    with factory() as s:
+        with s.begin():
+            t = _seed_bad_habit(s, "bh_shadow", _wrong_upload())
+        monkeypatch.setattr(settings, "LYRICS_RESWEEP_SHADOW", True)
+        svc = LyricsReassessmentService(s, client=_FakeClient(_BAD_HABIT["candidates"]))
+        m = svc.reassess_track(t, cooldown_sec=0)
+        assert (m["resweep_would_replace"], m["evaluated"]) == (1, 0)
+        after = _stored(s, t)
+        assert after["version"] == "step2-v2"
+        assert str(after["evidence"]["lrclib_id"]) == _WRONG_ID
+        assert after["evidence"]["resweep_shadow"]["verdict"] == "would_replace"
+        assert "resweep" not in after["evidence"]
+        assert _swept_ids(s, {t}) == []                 # shadow sweep: done
+        monkeypatch.setattr(settings, "LYRICS_RESWEEP_SHADOW", False)
+        assert _swept_ids(s, {t}) == [t]                # real sweep: still due

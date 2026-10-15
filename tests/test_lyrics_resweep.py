@@ -48,6 +48,12 @@ _OLD = "step2-v2"
 
 
 @pytest.fixture(autouse=True)
+def _real_pass(monkeypatch):
+    """Most tests describe the real pass; TestShadowMode switches shadow back on."""
+    monkeypatch.setattr(settings, "LYRICS_RESWEEP_SHADOW", False)
+
+
+@pytest.fixture(autouse=True)
 def _no_exclusion_sync(monkeypatch):
     """As in test_lyrics_reassessment.py: the exclusion sync is not under test here."""
     monkeypatch.setattr(
@@ -126,7 +132,8 @@ def _picked(body, cid, cluster):
 # The lateral rule on the real Bad Habit response
 # --------------------------------------------------------------------------
 class TestBadHabitLateral:
-    """The row the RFC names: stored with Ed Sheeran's body (8996695) by step2-v2."""
+    """The row the RFC names: stored with Ed Sheeran's body (8996695) by an older matcher
+    (prod's row is ``step3-v1``; any version other than the running one behaves the same)."""
 
     def test_wrong_stored_body_is_replaced_by_the_majority(self):
         cands = _bh_cands()
@@ -310,6 +317,83 @@ class TestClusterBoundary:
 
 
 # --------------------------------------------------------------------------
+# Shadow mode (the owner's 2026-10-16 decision after review Y1/Y5)
+# --------------------------------------------------------------------------
+_GO_GO = _FIXTURE["go_go"]
+
+
+class TestShadowMode:
+    @pytest.fixture(autouse=True)
+    def _shadow(self, monkeypatch):
+        monkeypatch.setattr(settings, "LYRICS_RESWEEP_SHADOW", True)
+
+    def test_go_go_correct_minority_body_would_be_overwritten(self):
+        """Review Y1, on real data: an older matcher stored the Korean original; today's
+        pick is the Japanese majority (cluster 16 vs 1). The real rule would replace it —
+        which is exactly why the drain runs in shadow first."""
+        cands = [Candidate.from_api(r) for r in _GO_GO["candidates"]]
+        kor = next(c for c in cands if str(c.id) == str(_GO_GO["korean_id"]))
+        outcome = decide_match(uuid.uuid4(), "Go Go", ["BTS"], None, kor.duration_sec, cands)
+        row = {
+            "id": uuid.uuid4(), "title": "Go Go", "duration_sec": kor.duration_sec,
+            "artist_names": ["BTS"], "aliases": [],
+            "existing_status": STATUS_MATCHED, "existing_basis": "exact-title",
+            "existing_matcher_version": "step3-v1", "existing_locked": False,
+            "existing_lrclib_id": str(kor.id),
+            "existing_lyric_plain": kor.plain_lyrics, "existing_lyric_synced": kor.synced_lyrics,
+        }
+        assert should_replace(row, outcome, cands) is True       # the rule itself
+        v = replacement_verdict(row, outcome, cands)
+        assert (v.write, v.counter) == (False, "resweep_would_replace")
+        block = v.evidence["resweep_shadow"]
+        assert block["verdict"] == "would_replace"
+        assert block["replaced_lrclib_id"] == str(kor.id)
+        assert "resweep" not in v.evidence                        # the real pass stays open
+
+    def test_no_lyrics_ladder_supersession_is_shadowed(self):
+        """Review Y5: a no_lyrics row (basis None) loses to any matched pick via the ladder,
+        not the lateral rule. The sweep newly reaches these rows, so it is shadowed too."""
+        row = _synthetic_row(None, None, existing_status="no_lyrics", existing_basis=None)
+        outcome = _picked(_BODY_B, 3, 1)
+        assert should_replace(row, outcome, [_c(3, _BODY_B)]) is True
+        v = replacement_verdict(row, outcome, [_c(3, _BODY_B)])
+        assert (v.write, v.counter) == (False, "resweep_would_supersede")
+
+    def test_best_of_supersession_still_writes(self):
+        """Pre-Step-2 behaviour from the regular queue; shadow must not pause it."""
+        row = _synthetic_row(_BODY_A, 1, existing_basis="best-of-ambiguous")
+        v = replacement_verdict(row, _picked(_BODY_A, 1, 1), [_c(1, _BODY_A)])
+        assert (v.write, v.counter) == (True, "resweep_superseded")
+        assert v.evidence["resweep_shadow"]["verdict"] == "superseded"
+
+    def test_kept_rows_stamp_the_shadow_key(self):
+        row = _synthetic_row(_BODY_A, 1)
+        v = replacement_verdict(row, _picked(_BODY_A, 1, 1), [_c(1, _BODY_A)])
+        assert (v.write, v.counter) == (False, "resweep_unchanged")
+        assert list(v.evidence) == ["resweep_shadow"]
+
+    def test_selection_excludes_on_the_shadow_stamp(self):
+        session = MagicMock()
+        session.execute.return_value.fetchall.return_value = []
+        LyricsReassessmentService(session, client=_FakeClient())._fetch_stale_version_tracks(5)
+        sql = " ".join(str(session.execute.call_args[0][0]).split())
+        assert "'{resweep_shadow,matcher_version}'" in sql
+        assert "'{resweep,matcher_version}'" not in sql
+
+    def test_shadow_is_the_shipped_default(self, monkeypatch):
+        from worker.core.config import Settings
+        assert Settings.model_fields["LYRICS_RESWEEP_SHADOW"].default is True
+
+
+class TestLockedBeatsEverything:
+    def test_locked_unresolved_row_is_not_rewritten(self):
+        """Review G1: reassess_track selects any status; a lock must win over 'unresolved
+        rows are always rewritable'."""
+        row = _synthetic_row(None, None, existing_status="not_found", existing_locked=True)
+        assert should_replace(row, _picked(_BODY_B, 3, 2), [_c(3, _BODY_B)]) is False
+
+
+# --------------------------------------------------------------------------
 # Orchestration
 # --------------------------------------------------------------------------
 class _FakeClient:
@@ -335,6 +419,19 @@ def _service(client, *, sweep=(), queue=()):
 def _statements(session):
     return [(" ".join(str(c[0][0]).split()), c[0][1] if len(c[0]) > 1 else None)
             for c in session.execute.call_args_list]
+
+
+class TestConsistencyViolation:
+    def test_violating_row_is_rotated_not_left_at_the_head(self, monkeypatch):
+        """Review Y4: a deterministic invariant violation is never written, but it must
+        rotate like a guard-kept row or it holds a stalest-first slot every run."""
+        import worker.service.lyrics_eval_core as core
+        monkeypatch.setattr(core, "_consistency_ok", lambda outcome: False)
+        svc, session = _service(_FakeClient(_bh_cands()), sweep=[_bh_row(_bh_wrong())])
+        m = svc.reassess()
+        assert (m["consistency_errors"], m["evaluated"]) == (1, 0)
+        [(sql, _)] = _statements(session)
+        assert sql == "UPDATE track_lyrics SET updated_at = NOW() WHERE track_id = :track_id"
 
 
 class TestReassessSweep:

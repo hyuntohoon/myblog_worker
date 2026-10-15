@@ -174,14 +174,14 @@ def should_replace(
     FEAT-lyrics-match-correction Step 2, one at the SAME basis that passes the lateral rule
     (``assess_lateral``) on a row another matcher version wrote. A locked row never moves.
     """
-    existing_status = row.get("existing_status")
-    if existing_status in _UNRESOLVED:
-        return True
     if row.get("existing_locked"):
         # A hand-fixed row (evidence.manual_fix; the Step 3a basis='manual') is the owner's
         # verdict. Nothing automatic replaces it, not even a stronger basis — the panel's
-        # unlock is the only way back.
+        # unlock is the only way back. Checked first: ``reassess_track`` selects any status.
         return False
+    existing_status = row.get("existing_status")
+    if existing_status in _UNRESOLVED:
+        return True
     if outcome.match_status != STATUS_MATCHED:
         return False  # never downgrade a resolved good row to an unresolved/no_lyrics state
     # A best-of-* matched row is now re-selected by the widened _fetch_unresolved_tracks
@@ -204,6 +204,16 @@ def should_replace(
     return lateral is not None and lateral.upgrade
 
 
+def resweep_stamp_key() -> str:
+    """The evidence key the re-sweep stamps and its selection excludes on.
+
+    Shadow mode (``LYRICS_RESWEEP_SHADOW``) stamps ``resweep_shadow`` instead of
+    ``resweep``, so a full shadow drain neither writes a body nor uses up the real pass:
+    turning shadow off re-opens every row for the real verdict.
+    """
+    return "resweep_shadow" if settings.LYRICS_RESWEEP_SHADOW else "resweep"
+
+
 def replacement_verdict(
     row: Dict[str, Any], outcome: MatchOutcome, candidates: Optional[List[Candidate]] = None
 ) -> Verdict:
@@ -215,6 +225,15 @@ def replacement_verdict(
     excludes rows already judged under the running version, so each row costs one LRCLIB
     call per matcher version, and a later bump re-opens all of them by itself. Unresolved
     rows are rewritten on every pass anyway and get no block.
+
+    **Shadow mode** (``LYRICS_RESWEEP_SHADOW``, on until the owner has read a full shadow
+    drain): a swept row the guard would rewrite is kept instead, and the block records
+    ``would_replace`` / ``would_supersede`` under ``evidence["resweep_shadow"]``. The one
+    exception is a ``best-of-*`` row — its supersession by a stronger basis predates Step 2
+    and runs from the regular queue anyway. Why: the lateral rule compares the STORED body
+    with today's pick, so a row an older matcher got right by picking a minority body (the
+    Korean ``Go Go`` among Japanese uploads) would be overwritten by the majority; how many
+    such rows exist is unknown until a shadow drain counts them.
     """
     write = should_replace(row, outcome, candidates)
     if row.get("existing_status") not in _RESOLVED or not produced_by_other_matcher(row):
@@ -246,10 +265,17 @@ def replacement_verdict(
         verdict = "unchanged"
     else:
         verdict = "kept"
+    if (
+        write
+        and settings.LYRICS_RESWEEP_SHADOW
+        and not (row.get("existing_basis") or "").startswith("best-of-")
+    ):
+        write = False
+        verdict = {"replaced": "would_replace", "superseded": "would_supersede"}[verdict]
     block["verdict"] = verdict
-    if write:
+    if write or verdict.startswith("would_"):
         block["replaced_lrclib_id"] = row.get("existing_lrclib_id")
-    return Verdict(write, counter=f"resweep_{verdict}", evidence={"resweep": block})
+    return Verdict(write, counter=f"resweep_{verdict}", evidence={resweep_stamp_key(): block})
 
 
 # The columns every selection here projects from the existing ``track_lyrics`` row, so the
@@ -591,7 +617,8 @@ class LyricsReassessmentService:
           rewritten (and re-versioned) on every pass anyway;
         * the decision core's version differs from ``MATCHER_VERSION`` (the ``+best-of-v1``
           promotion suffix is dropped first, so a ``step2-v2+best-of-v1`` row is swept too);
-        * not already stamped under the running version (``evidence.resweep.matcher_version``)
+        * not already stamped under the running version (``evidence.resweep.matcher_version``,
+          or ``evidence.resweep_shadow`` in shadow mode — ``resweep_stamp_key``)
           — the stamp is what makes this arm terminate, and a version bump invalidates every
           stamp at once, which is how the sweep re-opens itself;
         * not hand-fixed (``manual_fix`` / ``basis='manual'``): the guard would keep such a
@@ -602,6 +629,7 @@ class LyricsReassessmentService:
         ``step10-v1`` sorts after ``step9-v1`` — lexical order would not. Within a version,
         stalest first.
         """
+        stamp_key = resweep_stamp_key()  # a constant, never caller input
         rows = self.session.execute(
             text(
                 f"""
@@ -618,7 +646,7 @@ class LyricsReassessmentService:
                 WHERE NOT (tl.evidence ? 'excluded_by')
                   AND tl.match_status IN ('matched', 'no_lyrics')
                   AND split_part(COALESCE(tl.matcher_version, ''), '+', 1) <> :current_version
-                  AND COALESCE(tl.evidence #>> '{{resweep,matcher_version}}', '')
+                  AND COALESCE(tl.evidence #>> '{{{stamp_key},matcher_version}}', '')
                       <> :current_version
                   AND NOT (tl.evidence ? 'manual_fix')
                   AND COALESCE(tl.evidence ->> 'match_basis', '') <> 'manual'

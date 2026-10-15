@@ -181,6 +181,9 @@ def new_metrics() -> Dict[str, Any]:
         "resweep_kept": 0,        # different body, but not a strictly larger cluster
         "resweep_parked": 0,      # the running matcher could not match; stored row kept
         "resweep_locked": 0,      # hand-fixed row; never replaced
+        # shadow mode (LYRICS_RESWEEP_SHADOW): what the real pass would rewrite; nothing written
+        "resweep_would_replace": 0,
+        "resweep_would_supersede": 0,
     }
 
 
@@ -290,6 +293,10 @@ def run_eval_batch(
                 logger.error("%s: CONSISTENCY VIOLATION track %s matched (basis=%s) "
                              "but invariant failed — row NOT written",
                              log_prefix, row["id"], outcome.match_basis)
+                if touch_on_guard_kept:
+                    # Rotate it like a guard-kept row: a deterministic violation must not
+                    # hold the head of a stalest-first queue (or the re-sweep) every run.
+                    writer.touch(row["id"])
                 continue
 
             verdict = should_write(row, outcome, candidates) if should_write is not None else True
