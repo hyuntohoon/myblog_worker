@@ -311,7 +311,8 @@ class SpotifyUserClient:
         """GET /me/albums?limit=50&offset=… — paginate the owner's saved-albums
         Library, following total/next, and return the raw album objects (each item
         is {"added_at": …, "album": {"id": …, "name": …, …}} → we unwrap to the
-        inner album object so callers read album.id / album.name directly)."""
+        inner album object so callers read album.id / album.name directly; the
+        item's ``added_at`` rides along as ``album["_added_at"]``)."""
         url = f"{settings.SPOTIFY_API_BASE}/me/albums"
         albums: List[Dict[str, Any]] = []
         offset = 0
@@ -327,6 +328,9 @@ class SpotifyUserClient:
             for it in items:
                 album = (it or {}).get("album")
                 if album and album.get("id"):
+                    # FEAT-spotify-library-autosync: carry the saved time on the album
+                    # dict (the newest-saved order needs it); other callers ignore it.
+                    album["_added_at"] = (it or {}).get("added_at")
                     albums.append(album)
             total = payload.get("total")
             offset += len(items)

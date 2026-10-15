@@ -46,6 +46,13 @@ class _FakeStore:
         self.bucket_id: Optional[Any] = None      # the special bucket's id (None = absent)
         self.items: List[Dict[str, Any]] = []     # review_bucket_items rows
         self.side: Dict[Any, Dict[str, Any]] = {} # album uuid -> spotify_library_albums row
+        # V61 run row: claim refused when run_blocked; every finish outcome recorded.
+        self.run_blocked = False
+        self.claims = 0
+        self.finished: List[str] = []
+        self.pending_after: List[bool] = []        # per finish: a request landed mid-pass
+        self.added_at: Dict[Any, str] = {}        # album uuid -> spotify_added_at
+        self.research_calls = 0
 
     def add_album(self, spotify_id: str) -> Any:
         aid = uuid.uuid4()
@@ -65,6 +72,26 @@ class _FakeSession:
         sql = " ".join(str(stmt).split())  # collapse whitespace for substring matching
         p = params or {}
         s = self.store
+
+        if "UPDATE spotify_library_sync_runs SET started_at" in sql:
+            if s.run_blocked:
+                return _Result([])
+            s.claims += 1
+            return _Result([_Row(started_at=s.claims)])
+
+        if "UPDATE spotify_library_sync_runs SET finished_at" in sql:
+            s.finished.append(p["o"])
+            pending = s.pending_after.pop(0) if s.pending_after else False
+            return _Result([_Row(pending=pending)])
+
+        if "SET spotify_added_at" in sql:
+            for aid, ts in zip(p["ids"], p["ts"]):
+                s.added_at[aid] = ts
+            return _Result()
+
+        if "INSERT INTO album_research" in sql:
+            s.research_calls += 1
+            return _Result()
 
         if "FROM review_buckets WHERE kind = 'spotify_library'" in sql:
             return _Result([_Row(id=s.bucket_id)] if s.bucket_id is not None else [])
@@ -196,7 +223,10 @@ class _FakeSpotify:
         self.contains_calls: List[List[str]] = []
 
     def get_saved_albums(self):
-        return [{"id": sid, "name": f"Album {sid}"} for sid in self._saved]
+        return [
+            {"id": sid, "name": f"Album {sid}", "_added_at": f"2026-10-{i + 1:02d}T00:00:00Z"}
+            for i, sid in enumerate(self._saved)
+        ]
 
     def check_saved_albums(self, spotify_ids):
         self.contains_calls.append(list(spotify_ids))
@@ -420,7 +450,7 @@ def test_idempotent_rerun_is_a_noop():
     first = run_library_sync(_session_factory(store), client, writes_enabled=True)
     assert first == {  # nothing to do
         "added": 0, "removed": 0, "pulled": 0, "failed": 0, "skipped_unknown": 0,
-        "writes_enabled": True, "needs_reauth": False,
+        "writes_enabled": True, "needs_reauth": False, "research_queued": 0,
     }
     saved_before = list(client.saved_calls)
     removed_before = list(client.removed_calls)
@@ -527,3 +557,91 @@ def test_save_failure_marks_failed_without_aborting_pull():
     # the PULL still happened despite the save failure
     assert res["pulled"] == 1
     assert any(it["album_id"] == pull_aid for it in store.items)
+
+
+# ── FEAT-spotify-library-autosync: run claim, finish stamp, added_at, research ──
+
+class _ExplodingSpotify(_FakeSpotify):
+    def get_saved_albums(self):
+        raise RuntimeError("boom (transient)")
+
+
+@pytest.mark.unit
+def test_refused_claim_never_reads_spotify_or_stamps_a_finish():
+    store = _FakeStore()
+    store.bucket_id = uuid.uuid4()
+    store.run_blocked = True
+    client = _ExplodingSpotify(saved=["s1"])  # would raise if read
+    res = run_library_sync(_session_factory(store), client, writes_enabled=True)
+    assert res == {"skipped": "serviced_or_running"}
+    assert store.finished == []
+
+
+@pytest.mark.unit
+def test_no_change_pass_still_stamps_finish():
+    """The bug this RFC fixes: a steady-state library changed no row, so nothing
+    marked the pass as done. The run row must finish anyway."""
+    store = _FakeStore()
+    store.bucket_id = uuid.uuid4()
+    client = _FakeSpotify(saved=[])
+    run_library_sync(_session_factory(store), client, writes_enabled=True)
+    assert store.claims == 1
+    assert len(store.finished) == 1 and store.finished[0].startswith("added=0 removed=0 pulled=0")
+
+
+@pytest.mark.unit
+def test_reauth_abort_and_exception_both_stamp_finish():
+    store = _FakeStore()
+    store.bucket_id = uuid.uuid4()
+
+    class _Revoked(_FakeSpotify):
+        def get_saved_albums(self):
+            raise RuntimeError("invalid_grant: revoked")
+
+    run_library_sync(_session_factory(store), _Revoked(), writes_enabled=True)
+    assert store.finished == ["needs_reauth"]
+
+    with pytest.raises(RuntimeError):
+        run_library_sync(_session_factory(store), _ExplodingSpotify(), writes_enabled=True)
+    assert store.finished == ["needs_reauth", "error"]
+
+
+@pytest.mark.unit
+def test_saved_time_is_stamped_for_saved_catalog_albums_and_research_runs():
+    store = _FakeStore()
+    store.bucket_id = uuid.uuid4()
+    a1 = store.add_album("s1")
+    a2 = store.add_album("s2")
+    client = _FakeSpotify(saved=["s1", "s2", "unknown"])
+    res = run_library_sync(_session_factory(store), client, writes_enabled=True)
+    assert store.added_at == {a1: "2026-10-01T00:00:00Z", a2: "2026-10-02T00:00:00Z"}
+    assert store.research_calls == 1
+    assert "research_queued" in res
+
+
+@pytest.mark.unit
+def test_a_request_landing_mid_pass_gets_one_more_pass_not_more():
+    """The running pass's claim refuses the new request's own message, so the pass
+    itself must go again — once (MAX_PASSES), never in a loop."""
+    store = _FakeStore()
+    store.bucket_id = uuid.uuid4()
+    store.pending_after = [True, True, True]
+    client = _FakeSpotify(saved=[])
+    run_library_sync(_session_factory(store), client, writes_enabled=True)
+    assert store.claims == 2 and len(store.finished) == 2
+
+
+@pytest.mark.unit
+def test_a_failing_research_enqueue_keeps_the_pulls():
+    store = _FakeStore()
+    store.bucket_id = uuid.uuid4()
+    store.add_album("s1")
+
+    class _Session(_FakeSession):
+        def execute(self, stmt, params=None):
+            if "INSERT INTO album_research" in str(stmt):
+                raise RuntimeError("research table drifted")
+            return super().execute(stmt, params)
+
+    res = run_library_sync(lambda: _Session(store), _FakeSpotify(saved=["s1"]), writes_enabled=True)
+    assert res["pulled"] == 1 and len(store.items) == 1

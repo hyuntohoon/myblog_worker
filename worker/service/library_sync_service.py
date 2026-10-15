@@ -46,6 +46,27 @@ from worker.clients.spotify_user_client import SpotifyScopeError
 
 logger = logging.getLogger(__name__)
 
+# FEAT-spotify-library-autosync — run bookkeeping (V61 spotify_library_sync_runs).
+# A delivery is skipped when the run row says the request was already serviced within
+# this window (SQS at-least-once / a duplicate POST that slipped through). Mirrors the
+# backend's LIBRARY_SYNC_DEBOUNCE_SECONDS (myblog_backend bucket_service).
+SYNC_DEBOUNCE_SECONDS = 30
+# A started pass that never finished (Lambda timeout / crash) stops blocking a new
+# claim after this long, measured from started_at. Tied to the worker Lambda timeout
+# (infra/lambda.tf, 120 s): longer, so a live pass is never overlapped; shorter than
+# the backend's 300 s stale-request window (measured from requested_at), so the
+# backend's re-request after a crash is always claimable when it arrives.
+STALE_RUN_SECONDS = 150
+# Passes per message. A request that lands WHILE a pass runs is refused by the claim
+# (the pass is running) and its message acked — so the running pass checks on finish
+# and goes once more. One extra is enough: anything later is a new message.
+MAX_PASSES = 2
+# Prompt version for research rows this worker enqueues. Third copy of the constant
+# (myblog_backend research_service.PROMPT_VERSION, scripts/research_poller.py). It can
+# never create a SECOND note: the enqueue skips any album that already has a research
+# row of ANY version, so a drift here only labels a brand-new row.
+RESEARCH_PROMPT_VERSION = "v2"
+
 
 def _is_needs_reauth(exc: Exception) -> bool:
     """The token refresh raises a RuntimeError carrying 'invalid_grant' when the
@@ -202,7 +223,7 @@ def _mark_pending_needs_attention(session_factory) -> None:
         logger.warning("failed to mark pending rows needs_attention on reauth: %s", e)
 
 
-def run_library_sync(
+def _reconcile(
     session_factory,
     spotify_user,
     enqueue_unknown: Optional[Callable[[List[str]], None]] = None,
@@ -235,11 +256,14 @@ def run_library_sync(
     # L = saved spotify_ids (de-duped, first-seen order for stable PULL positions).
     saved_ids: List[str] = []
     seen: set = set()
+    added_at_by_sid: Dict[str, str] = {}
     for alb in saved_albums:
         sid = alb.get("id")
         if sid and sid not in seen:
             seen.add(sid)
             saved_ids.append(sid)
+            if alb.get("_added_at"):
+                added_at_by_sid[sid] = alb["_added_at"]
 
     summary: Dict[str, Any] = {
         "added": 0,
@@ -249,6 +273,7 @@ def run_library_sync(
         "skipped_unknown": 0,
         "writes_enabled": writes_enabled,
         "needs_reauth": False,
+        "research_queued": 0,
     }
     unknown_ids: List[str] = []
 
@@ -448,6 +473,30 @@ def run_library_sync(
 
             summary["skipped_unknown"] = len(unknown_ids)
 
+            # 4d. Spotify saved time for the newest-saved order (V61). Every saved,
+            #     catalog-known album, every pass; only rows whose value differs are
+            #     written. Concurrent passes are excluded by the run claim.
+            # 4e. Auto-research (owner, 2026-10-15): queue the bucket's note-less
+            #     albums per its research_mode. PULLs are raw SQL, so add_item's
+            #     enqueue never sees them; this is their only path in.
+            # Both ride a SAVEPOINT: they are additions to the reconcile, and a
+            # failure in either must not roll back the PULLs / ADD-REMOVE states
+            # above (whose Spotify writes have already happened).
+            try:
+                with session.begin_nested():
+                    _stamp_added_at(session, [
+                        (sid_to_uuid[sid], added_at_by_sid[sid])
+                        for sid in saved_ids
+                        if sid in sid_to_uuid and sid in added_at_by_sid
+                    ])
+            except Exception as e:
+                logger.error("saved-time stamp failed (reconcile kept): %s", e, exc_info=True)
+            try:
+                with session.begin_nested():
+                    summary["research_queued"] = _enqueue_research(session, bucket_id)
+            except Exception as e:
+                logger.error("research enqueue failed (reconcile kept): %s", e, exc_info=True)
+
     # Enqueue unknown saved albums OUTSIDE the tx (best-effort; never blocks reconcile).
     if unknown_ids and enqueue_unknown is not None:
         try:
@@ -456,11 +505,176 @@ def run_library_sync(
             logger.warning("enqueue of unknown saved albums failed: %s", e)
 
     logger.info(
-        "library sync: added=%d removed=%d pulled=%d failed=%d unknown=%d writes=%s",
+        "library sync: added=%d removed=%d pulled=%d failed=%d unknown=%d research=%d writes=%s",
         summary["added"], summary["removed"], summary["pulled"],
-        summary["failed"], summary["skipped_unknown"], writes_enabled,
+        summary["failed"], summary["skipped_unknown"], summary["research_queued"],
+        writes_enabled,
     )
     return summary
+
+
+def _stamp_added_at(session, pairs: List[tuple]) -> int:
+    """Write spotify_added_at for (album_id, added_at ISO string) pairs. Passes
+    are mutually exclusive (the run claim) and the backend never writes this table,
+    so there is no concurrent writer to deadlock with; the sort only keeps the
+    parameter arrays deterministic."""
+    if not pairs:
+        return 0
+    pairs = sorted(pairs, key=lambda p: str(p[0]))
+    result = session.execute(
+        text(
+            """
+            UPDATE spotify_library_albums AS s
+               SET spotify_added_at = v.added_at,
+                   updated_at       = now()
+              FROM unnest(CAST(:ids AS uuid[]), CAST(:ts AS timestamptz[]))
+                   AS v(album_id, added_at)
+             WHERE s.album_id = v.album_id
+               AND s.spotify_added_at IS DISTINCT FROM v.added_at
+            """
+        ),
+        {"ids": [p[0] for p in pairs], "ts": [p[1] for p in pairs]},
+    )
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
+def _enqueue_research(session, bucket_id) -> int:
+    """Queue research for the library bucket's albums per research_mode ('all' =
+    every album, 'selected' = checked ones, 'off' = none). An album with a research
+    row of ANY prompt version is skipped, and the (album_id, prompt_version) unique
+    backstops a race — so a re-run, or a re-PULL, never asks twice."""
+    result = session.execute(
+        text(
+            """
+            INSERT INTO album_research (album_id, prompt_version, status)
+            SELECT DISTINCT i.album_id, :pv, 'queued'
+              FROM review_bucket_items i
+              JOIN review_buckets b ON b.id = i.bucket_id
+             WHERE i.bucket_id = :bid
+               AND i.item_type = 'album'
+               AND i.album_id IS NOT NULL
+               AND (b.research_mode = 'all'
+                    OR (b.research_mode = 'selected' AND i.research_selected))
+               AND NOT EXISTS (
+                   SELECT 1 FROM album_research ar WHERE ar.album_id = i.album_id
+               )
+             ORDER BY i.album_id
+            ON CONFLICT ON CONSTRAINT uq_album_research_album_prompt DO NOTHING
+            """
+        ),
+        {"bid": bucket_id, "pv": RESEARCH_PROMPT_VERSION},
+    )
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
+def _claim_run(session, bucket_id) -> Optional[Any]:
+    """Take the run row (V61) for this pass. Refused when a pass is already running
+    (started after the last finish, and not stale) or when the latest request was
+    already serviced within SYNC_DEBOUNCE_SECONDS — a duplicate delivery. Returns
+    the claim time (started_at), or None when refused."""
+    session.execute(
+        text(
+            "INSERT INTO spotify_library_sync_runs (bucket_id) VALUES (:bid) "
+            "ON CONFLICT (bucket_id) DO NOTHING"
+        ),
+        {"bid": bucket_id},
+    )
+    row = session.execute(
+        text(
+            """
+            UPDATE spotify_library_sync_runs
+               SET started_at = now()
+             WHERE bucket_id = :bid
+               AND (started_at IS NULL
+                    OR (finished_at IS NOT NULL AND finished_at >= started_at)
+                    OR started_at < now() - make_interval(secs => :stale))
+               AND NOT (finished_at IS NOT NULL
+                        AND finished_at > now() - make_interval(secs => :debounce)
+                        AND (requested_at IS NULL OR requested_at <= finished_at))
+            RETURNING started_at
+            """
+        ),
+        {"bid": bucket_id, "stale": STALE_RUN_SECONDS, "debounce": SYNC_DEBOUNCE_SECONDS},
+    ).first()
+    return row.started_at if row is not None else None
+
+
+def _outcome(summary: Optional[Dict[str, Any]]) -> str:
+    if summary is None:
+        return "error"
+    if summary.get("needs_reauth"):
+        return "needs_reauth" + (f" ({summary['reason']})" if summary.get("reason") else "")
+    return (
+        f"added={summary.get('added', 0)} removed={summary.get('removed', 0)} "
+        f"pulled={summary.get('pulled', 0)} failed={summary.get('failed', 0)} "
+        f"unknown={summary.get('skipped_unknown', 0)} "
+        f"research={summary.get('research_queued', 0)}"
+    )[:200]
+
+
+def _finish_run(session_factory, bucket_id, outcome: str, started_at) -> bool:
+    """Stamp the finish on EVERY pass that claimed the run — a no-change pass, a
+    re-auth abort and an exception alike — so the backend's gate and the board's poll
+    see the run end.
+
+    finished_at is the pass's CLAIM time, not now(): the pass read Spotify after
+    that moment, so it services exactly the requests made before it. A request made
+    while it ran stays newer than finished_at — still pending — and the return value
+    tells the caller to go again (its own message was refused by the running pass).
+    Best-effort: never masks the pass's own exception; False on failure."""
+    try:
+        with session_factory() as session, session.begin():
+            row = session.execute(
+                text(
+                    "UPDATE spotify_library_sync_runs "
+                    "SET finished_at = :started, last_outcome = :o WHERE bucket_id = :bid "
+                    "RETURNING (requested_at IS NOT NULL AND requested_at > :started) AS pending"
+                ),
+                {"bid": bucket_id, "o": outcome[:200], "started": started_at},
+            ).first()
+            return bool(row.pending) if row is not None else False
+    except Exception as e:  # pragma: no cover - best-effort
+        logger.warning("failed to stamp library sync finish: %s", e)
+        return False
+
+
+def run_library_sync(
+    session_factory,
+    spotify_user,
+    enqueue_unknown: Optional[Callable[[List[str]], None]] = None,
+    writes_enabled: bool = False,
+) -> Dict[str, Any]:
+    """Entry point for the {"job": "spotify_library_sync"} message. Claims the V61
+    run row in a short transaction BEFORE any Spotify call, reconciles, and always
+    stamps the finish. A refused claim (already running / just serviced) is a no-op
+    that never reads Spotify. See _reconcile for the algorithm."""
+    result: Dict[str, Any] = {"skipped": "serviced_or_running"}
+    for attempt in range(MAX_PASSES):
+        with session_factory() as session, session.begin():
+            bucket_id = _find_special_bucket_id(session)
+            if bucket_id is None:
+                logger.info("no kind='spotify_library' bucket — nothing to reconcile")
+                return {"bucket": "absent"}
+            started_at = _claim_run(session, bucket_id)
+        if started_at is None:
+            if attempt == 0:
+                logger.info("library sync skipped — a run is in progress or the request was already serviced")
+            return result
+
+        summary: Optional[Dict[str, Any]] = None
+        pending = False
+        try:
+            summary = _reconcile(
+                session_factory, spotify_user,
+                enqueue_unknown=enqueue_unknown, writes_enabled=writes_enabled,
+            )
+            result = summary
+        finally:
+            pending = _finish_run(session_factory, bucket_id, _outcome(summary), started_at)
+        if not pending:
+            return result
+        logger.info("library sync: a request arrived mid-pass — running again")
+    return result
 
 
 def _maybe_write(writes_enabled: bool, fn: Callable[[], None], *, op: str, ids: List[str]):
