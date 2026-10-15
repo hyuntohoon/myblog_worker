@@ -184,8 +184,8 @@ def test_incremental_lost_race_closes_guard_transaction_before_next_provider_cal
 
             original_guard = service._still_uncorpused
 
-            def guard(row, outcome):
-                keep = original_guard(row, outcome)
+            def guard(row, outcome, candidates=None):
+                keep = original_guard(row, outcome, candidates)
                 if row["id"] == first_id:
                     released_second.set()
                 return keep
