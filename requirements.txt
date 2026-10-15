@@ -4,4 +4,4 @@ sqlalchemy
 psycopg[binary]
 boto3
 musicbrainzngs>=0.7
-myblog-shared-db @ git+https://github.com/hyuntohoon/myblog_shared_db.git@e4e98b99f346a9131b128a029879739cc2b1b772
+myblog-shared-db @ git+https://github.com/hyuntohoon/myblog_shared_db.git@08b2ee72630ef6d6db714b3fef0ddd8c0c907733
