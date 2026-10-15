@@ -263,7 +263,7 @@ def test_noise_trio_resolves_at_source_in_loop():
     assert params["match_status"] == STATUS_MATCHED
     evidence = json.loads(params["evidence"])
     assert evidence["match_basis"] == "exact-title"
-    assert params["matcher_version"] == "step3-v1"  # no +best-of suffix
+    assert params["matcher_version"] == "step4-v1"  # no +best-of suffix
     assert params["lyric_synced"] == "[00:01.00] la la"  # richest agreeing rep
 
 

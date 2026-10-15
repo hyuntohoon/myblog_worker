@@ -28,10 +28,13 @@ from worker.service.lyrics_matcher import (
     STATUS_NO_LYRICS,
     STATUS_REVIEW_REQUIRED,
     Candidate,
+    CONTENT_AGREE_THRESHOLD,
     MatchOutcome,
     TitleNormalizer,
     _artist_identity_ok,
     canonical_base_title,
+    content_shingles,
+    content_similarity,
     duration_matches,
     exact_base_equal,
     extract_version_tokens,
@@ -124,6 +127,11 @@ def promote_best(
         return outcome
 
     from_status = outcome.match_status
+    if (outcome.evidence or {}).get("reason") == "content_disagreement":
+        # decide_match parked it because no two candidate bodies agree; picking the
+        # richest here would reintroduce exactly the content-blind choice it refused
+        # (FEAT-lyrics-match-correction RC1).
+        return _parked(outcome, "content_disagreement", from_status)
     plausible = _plausible(title, artist_names, aliases, duration_sec, candidates)
     if not plausible:
         # Re-fetch drift: the pool that parked this row is no longer visible.
@@ -166,21 +174,36 @@ def promote_best(
     if not tier1:
         return _parked(outcome, "no_tier1_candidate", from_status)
 
-    # Richest lyric wins (synced > plain); duration gap then id only make the
-    # pick deterministic among same-song duplicate uploads — they are NOT the
-    # gated tier-2/4 promotion criteria.
+    # Content consensus first (FEAT-lyrics-match-correction RC1): the body most
+    # tier-1 candidates share. Then richest lyric (synced > plain); duration gap
+    # then id only make the pick deterministic among same-song duplicate uploads —
+    # they are NOT the gated tier-2/4 promotion criteria.
+    shingles = {id(c): content_shingles(c) for c in tier1}
+    support = {
+        id(c): sum(
+            1 for o in tier1
+            if o is c or content_similarity(shingles[id(c)], shingles[id(o)]) >= CONTENT_AGREE_THRESHOLD
+        )
+        for c in tier1
+    }
+
     def _rank(c: Candidate):
         gap = (
             abs(float(duration_sec) - float(c.duration_sec))
             if duration_sec is not None and c.duration_sec is not None
             else float("inf")
         )
-        return (not bool(c.synced_lyrics), not bool(c.plain_lyrics), gap, str(c.id))
+        return (-support[id(c)], not bool(c.synced_lyrics), not bool(c.plain_lyrics),
+                gap, str(c.id))
 
     chosen = sorted(tier1, key=_rank)[0]
     cand_tokens = extract_version_tokens(chosen.title)
 
     ev = dict(outcome.evidence or {})
+    # Top-level like an exact-title row, so every matched row names its source the
+    # same way (FEAT-lyrics-match-correction Step 1).
+    ev["lrclib_id"] = chosen.id
+    ev["content_cluster_size"] = support[id(chosen)]
     ev["promotion"] = {
         "chosen": {
             "lrclib_id": chosen.id,
