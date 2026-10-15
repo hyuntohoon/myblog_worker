@@ -241,8 +241,8 @@ def replacement_verdict(
     **Shadow mode** (``LYRICS_RESWEEP_SHADOW``, on until the owner has read a full shadow
     drain): a swept row the guard would rewrite is kept instead, and the block records
     ``would_replace`` / ``would_supersede`` under ``evidence["resweep_shadow"]``. The one
-    exception is a ``best-of-*`` row — its supersession by a stronger basis predates Step 2
-    and runs from the regular queue anyway. Why: the lateral rule compares the STORED body
+    exception is a ``matched`` best-of row superseded by a strictly stronger basis
+    (``_queue_supersession``) — that predates Step 2 and runs from the regular queue anyway. Why: the lateral rule compares the STORED body
     with today's pick, so a row an older matcher got right by picking a minority body (the
     Korean ``Go Go`` among Japanese uploads) would be overwritten by the majority; how many
     such rows exist is unknown until a shadow drain counts them.
