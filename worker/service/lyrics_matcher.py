@@ -851,9 +851,15 @@ class TrackLyricsWriter:
                     INSERT INTO track_lyrics
                         (track_id, match_status, evidence,
                          lyric_plain, lyric_synced, matcher_version)
-                    VALUES
-                        (:track_id, :match_status, CAST(:evidence AS jsonb),
-                         :lyric_plain, :lyric_synced, :matcher_version)
+                    SELECT CAST(:track_id AS uuid), CAST(:match_status AS text),
+                           CAST(:evidence AS jsonb), CAST(:lyric_plain AS text),
+                           CAST(:lyric_synced AS text), CAST(:matcher_version AS text)
+                    -- A first row is refused too when it attaches a rejected candidate
+                    -- (a track can carry rejections before it has a row).
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM track_lyrics_rejections r
+                         WHERE r.track_id = CAST(:track_id AS uuid)
+                           AND CAST(r.lrclib_id AS text) = CAST(:picked_id AS text))
                     ON CONFLICT (track_id) DO UPDATE SET
                         match_status   = EXCLUDED.match_status,
                         evidence       = EXCLUDED.evidence,
@@ -873,6 +879,7 @@ class TrackLyricsWriter:
                     "lyric_plain": _strip_nul(_lyric_plain_for(outcome)),
                     "lyric_synced": _strip_nul(outcome.lyric_synced),
                     "matcher_version": outcome.matcher_version,
+                    "picked_id": _picked_lrclib_id(outcome),
                 },
             )
             self.session.commit()
@@ -933,6 +940,15 @@ class TrackLyricsWriter:
                 "matcher_version": outcome.matcher_version,
             },
         )
+
+
+def _picked_lrclib_id(outcome: MatchOutcome) -> Optional[str]:
+    """The LRCLIB id an outcome attaches, as text (top level, or a best-of promotion's)."""
+    ev = outcome.evidence or {}
+    picked = ev.get("lrclib_id")
+    if picked is None and isinstance(ev.get("promotion"), dict):
+        picked = ev["promotion"].get("lrclib_id")
+    return None if picked is None else str(picked)
 
 
 def _strip_nul(value):

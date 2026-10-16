@@ -247,3 +247,27 @@ def test_a_rejection_made_after_the_decision_is_refused_at_write_time(factory, t
         assert writer.write_one(other) == "written"  # any other candidate still may
     finally:
         session.close()
+
+
+def test_a_first_row_attaching_a_rejected_candidate_is_refused(factory, tracks):
+    """Re-review note: a track can carry rejections before it has any row (its refresh
+    stored a set but parked nothing); the plain INSERT path refuses as well."""
+    tid = tracks[2]
+    session = factory()
+    try:
+        session.execute(
+            text("INSERT INTO track_lyrics_rejections (track_id, lrclib_id, rejected_by) VALUES (:t, 2, 'owner')"),
+            {"t": tid},
+        )
+        session.commit()
+        writer = TrackLyricsWriter(session)
+        assert writer.write_one(_auto(tid)) == "refused"
+        assert session.execute(text("SELECT count(*) FROM track_lyrics WHERE track_id = :t"), {"t": tid}).scalar() == 0
+        other = _auto(tid)
+        other.evidence = {"lrclib_id": 3}
+        assert writer.write_one(other) == "written"
+        parked = _auto(tid)
+        parked.match_status, parked.lyric_plain, parked.evidence = "not_found", None, {"reason": "x"}
+        assert writer.write_one(parked) == "written"  # no id attached: never refused
+    finally:
+        session.close()

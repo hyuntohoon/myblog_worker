@@ -298,8 +298,11 @@ class TestWriterLock:
         session.execute.return_value.rowcount = 1
         TrackLyricsWriter(session).write_outcomes([_outcome()])
         sql = " ".join(str(session.execute.call_args[0][0]).split())
-        where = sql[sql.index("WHERE NOT"):]
-        assert where.startswith("WHERE NOT " + locked_row_sql("track_lyrics"))
+        # The first-insert path refuses a rejected candidate too (re-review note).
+        insert = sql[:sql.index("ON CONFLICT")]
+        assert "WHERE NOT EXISTS ( SELECT 1 FROM track_lyrics_rejections r" in insert
+        assert "CAST(:picked_id AS text)" in insert
+        where = sql[sql.index("WHERE NOT " + locked_row_sql("track_lyrics")):]
         # Re-read at write time, not only when the matcher decided (review finding 1).
         assert "NOT EXISTS ( SELECT 1 FROM track_lyrics_rejections r" in where
         assert "EXCLUDED.evidence ->> 'lrclib_id'" in where
