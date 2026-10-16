@@ -73,7 +73,7 @@ jobs:
           # must move with it — a bump that touches only the lock leaves CI loading a
           # schema without the new tables, which fails as "relation does not exist" and
           # reads like a missing migration rather than a stale workflow.
-          ref: b15bd71a13e8bde2724fd647319f288291d5165f
+          ref: b5d0670dc2cc54e4fa6d2393659de6eb4fce31dd
           token: ${{ secrets.SHARED_DB_PAT }}
           persist-credentials: false
           path: shared-db-schema

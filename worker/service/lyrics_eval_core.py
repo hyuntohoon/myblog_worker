@@ -20,6 +20,12 @@ from typing import Any, Callable, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from worker.clients.lrclib_client import LrclibClient, LrclibTransientError
+from worker.service.lyrics_candidates import (
+    drop_rejected,
+    judge_candidates,
+    load_rejections,
+    replace_candidate_set,
+)
 from worker.service.lyrics_matcher import (
     STATUS_AMBIGUOUS,
     STATUS_MATCHED,
@@ -184,6 +190,10 @@ def new_metrics() -> Dict[str, Any]:
         # shadow mode (LYRICS_RESWEEP_SHADOW): what the real pass would rewrite; nothing written
         "resweep_would_replace": 0,
         "resweep_would_supersede": 0,
+        # FEAT-lyrics-match-correction Step 3a: the writer refused the outcome at write time
+        # (owner lock, or a candidate rejected after this run read the rejections). Also
+        # counted in guard_kept.
+        "write_refused": 0,
     }
 
 
@@ -197,6 +207,7 @@ def run_eval_batch(
     should_write: Optional[WriteGate] = None,
     touch_on_guard_kept: bool = False,
     touch_on_consistency_error: bool = False,
+    persist_candidates: bool = False,
     log_prefix: str = "Lyrics eval",
 ) -> Dict[str, Any]:
     """Evaluate ``tracks`` against LRCLIB and persist outcomes, bounded by a wall clock.
@@ -220,11 +231,23 @@ def run_eval_batch(
     invocation corpused the track between our selection and our write: that row belongs to
     the peer's outcome, this run did nothing to it, and touching it would falsify a
     freshness timestamp we have no claim on.
+
+    **Rejected candidates** (FEAT-lyrics-match-correction Step 3a) are dropped from every
+    track's candidates before ``decide_match``, so no producer that runs through this loop
+    can attach, cluster or promote one again. The ids are read once, up front, and the read
+    transaction is committed before the LRCLIB loop starts.
+
+    ``persist_candidates``: also store the judged candidate set for the owner's panel
+    (``track_lyrics_candidates``). Only the explicit single-track re-check sets it — the
+    scheduled jobs never write the set (owner decision 2026-10-16). A failure to store it
+    is logged and never costs the evaluation itself.
     """
     metrics = new_metrics()
     if not tracks:
         logger.info("%s: nothing to process", log_prefix)
         return metrics
+
+    rejections = load_rejections(session, [row["id"] for row in tracks])
 
     logger.info("%s: %d tracks, concurrency=%d, budget=%.0fs",
                 log_prefix, len(tracks), concurrency, time_budget_sec)
@@ -254,12 +277,14 @@ def run_eval_batch(
             if time.monotonic() > deadline:
                 logger.warning("%s: time budget hit — deferring remainder", log_prefix)
                 break
-            row, candidates, exc = fut.result()
+            row, fetched, exc = fut.result()
             if exc is not None:
                 metrics["skipped_transient"] += 1
                 logger.warning("%s: skip track %s (%r) — LRCLIB transient: %s",
                                log_prefix, row["id"], row["title"], exc)
                 continue
+            rejected = rejections.get(str(row["id"]))
+            candidates = drop_rejected(fetched, rejected)
 
             outcome = decide_match(
                 track_id=row["id"],
@@ -284,6 +309,9 @@ def run_eval_batch(
                     duration_sec=row["duration_sec"],
                     candidates=candidates,
                 )
+
+            if persist_candidates:
+                _persist_candidates(session, row, fetched, outcome, rejected, log_prefix)
 
             # Consistency invariant (basis-aware): a matched row must satisfy the
             # invariant for its basis — exact-title requires version agreement; a
@@ -323,7 +351,17 @@ def run_eval_batch(
 
             if patch:
                 outcome.evidence = {**(outcome.evidence or {}), **patch}
-            writer.write_outcomes([outcome])  # per-row commit (sentinel included)
+            if writer.write_one(outcome) == "refused":  # per-row commit (sentinel included)
+                # The writer re-read the lock and the owner's rejections and refused (Step 3a):
+                # the row was locked, or the outcome attaches a candidate rejected after this
+                # run read them. Treated like a guard-kept row — nothing changed, and a caller
+                # that rotates its queue must still advance this row's cursor, or a locked row
+                # pins the head of a stalest-first selection (the demand job's ladder too).
+                metrics["guard_kept"] += 1
+                metrics["write_refused"] += 1
+                if touch_on_guard_kept:
+                    writer.touch(row["id"])
+                continue
             metrics["evaluated"] += 1
             metrics[outcome.match_status] = metrics.get(outcome.match_status, 0) + 1
             _count_promotion(metrics, outcome)
@@ -340,6 +378,31 @@ def run_eval_batch(
 
     logger.info("%s complete: %s", log_prefix, metrics)
     return metrics
+
+
+def _persist_candidates(
+    session: Session,
+    row: Dict[str, Any],
+    fetched: List[Candidate],
+    outcome: MatchOutcome,
+    rejected: Optional[set],
+    log_prefix: str,
+) -> None:
+    """Judge ``fetched`` against ``outcome`` and replace the track's stored set."""
+    try:
+        judged = judge_candidates(
+            title=row["title"],
+            artist_names=list(row["artist_names"] or []),
+            aliases=list(row["aliases"] or []),
+            duration_sec=row["duration_sec"],
+            candidates=fetched,
+            outcome=outcome,
+            rejected=rejected,
+        )
+        replace_candidate_set(session, row["id"], judged)
+    except Exception:  # noqa: BLE001 - the panel cache must never cost the evaluation
+        session.rollback()
+        logger.exception("%s: candidate set not stored for track %s", log_prefix, row["id"])
 
 
 def _count_supersession(

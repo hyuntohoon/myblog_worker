@@ -437,6 +437,10 @@ def _run_lyrics_reassessment(
         if track_id:
             metrics = svc.reassess_track(track_id, cooldown_sec=cooldown_sec)
             logger.info("Lyrics track re-check metrics: %s", metrics)
+            if metrics.get("skipped_transient"):
+                # One track, asked for by the owner's panel: an LRCLIB outage must not
+                # ack the message silently. Raising lets SQS redeliver it.
+                raise RuntimeError(f"lyrics re-check of {track_id} hit an LRCLIB transient error")
             return
         if album_id:
             metrics = svc.reassess_album(album_id, limit=limit, cooldown_sec=cooldown_sec)
@@ -444,6 +448,16 @@ def _run_lyrics_reassessment(
             return
         metrics = svc.reassess(limit=limit, sweep_limit=sweep_limit)
         logger.info("Lyrics reassessment metrics: %s", metrics)
+
+
+def _run_lyrics_pick(track_id: str | None, lrclib_id, actor: str | None) -> None:
+    """The owner's candidate-panel pick (FEAT-lyrics-match-correction Step 3a). Enqueued by
+    the backend's owner-only decision endpoint; re-fetches the LRCLIB body by id and writes
+    it locked (basis 'manual'). A transient LRCLIB error raises so SQS redelivers."""
+    from worker.service.lyrics_pick_service import LyricsPickService
+
+    with SessionLocal() as session:
+        LyricsPickService(session).pick(track_id, lrclib_id, actor)
 
 
 def _run_lyrics_demand_source(
@@ -778,6 +792,13 @@ def _handle(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     track_id=body.get("track_id"),
                     sweep_limit=body.get("sweep_limit"),
                 )
+                continue
+
+            # Owner pick from the lyrics candidate panel (FEAT-lyrics-match-correction
+            # Step 3a). SQS only: the backend enqueues it, nothing schedules it. Not covered
+            # by the automation pause — it is an owner action, not a background producer.
+            if body.get("job") == "lyrics_pick":
+                _run_lyrics_pick(body.get("track_id"), body.get("lrclib_id"), body.get("actor"))
                 continue
 
             if body.get("job") == "lyrics_demand_source":

@@ -736,12 +736,35 @@ class LRCLIBDumpMatcher:
         self.conn.close()
 
 
+# The owner's lock on a ``track_lyrics`` row (FEAT-lyrics-match-correction). A row is
+# locked when the owner fixed it: ``evidence.match_basis = 'manual'`` (a Step 3a panel
+# pick / "no lyrics"), or the pre-3a hand fix ``evidence.manual_fix``. Interpolated into
+# SQL with the row alias, so every reader and the writer test the same two keys.
+def locked_row_sql(alias: str) -> str:
+    """SQL predicate: the row ``alias`` carries the owner's lock."""
+    return (
+        f"(({alias}.evidence ? 'manual_fix') "
+        f"OR COALESCE({alias}.evidence ->> 'match_basis', '') = 'manual')"
+    )
+
+
+BASIS_MANUAL = "manual"
+MANUAL_MATCHER_VERSION = "manual"
+
+
 class TrackLyricsWriter:
     """Persist match outcomes to ``track_lyrics`` (per-row commit, failure isolated).
 
     RFC: commit per row + sentinel so the row leaves the pool. ``no_lyrics`` is
     written with ``lyric_plain=''`` to satisfy the V33 CHECK (non-NULL for
     resolved statuses matched/no_lyrics); unresolved statuses write NULL text.
+
+    **The lock is enforced here** (FEAT-lyrics-match-correction Step 3a). Every automatic
+    producer — incremental, reassessment, demand source and the workspace ``tools/lyrics_*``
+    batch tools, which import this class — writes through ``write_outcomes``, whose upsert
+    refuses to touch a locked row (``locked_row_sql``). The selections and the replacement
+    guard skip locked rows too, but this is the one place no new selection can forget.
+    Only ``write_manual`` (the owner's own pick) writes over a lock.
     """
 
     def __init__(self, session: Session):
@@ -804,52 +827,128 @@ class TrackLyricsWriter:
             self.session.rollback()
             return False
 
+    # Refused at write time, not only when the matcher decided: a decision can be minutes old
+    # by the time it is written (a 90 s LRCLIB batch), and the owner may have locked the row
+    # or rejected the very candidate meanwhile. Both are re-read inside the upsert.
+    _REFUSE_SQL = """
+        WHERE NOT {locked}
+          AND NOT EXISTS (
+              SELECT 1 FROM track_lyrics_rejections r
+               WHERE r.track_id = EXCLUDED.track_id
+                 AND CAST(r.lrclib_id AS text) = COALESCE(
+                         EXCLUDED.evidence ->> 'lrclib_id',
+                         EXCLUDED.evidence #>> '{{promotion,lrclib_id}}'))
+    """.format(locked=locked_row_sql("track_lyrics"))
+
+    def write_one(self, outcome: MatchOutcome) -> str:
+        """Upsert one outcome; per-row commit. Returns ``written``, ``refused`` (the row is
+        locked, or the outcome attaches a candidate the owner rejected for this track — not
+        a failure, nothing changed) or ``failed`` (rolled back and logged)."""
+        try:
+            result = self.session.execute(
+                text(
+                    """
+                    INSERT INTO track_lyrics
+                        (track_id, match_status, evidence,
+                         lyric_plain, lyric_synced, matcher_version)
+                    SELECT CAST(:track_id AS uuid), CAST(:match_status AS text),
+                           CAST(:evidence AS jsonb), CAST(:lyric_plain AS text),
+                           CAST(:lyric_synced AS text), CAST(:matcher_version AS text)
+                    -- A first row is refused too when it attaches a rejected candidate
+                    -- (a track can carry rejections before it has a row).
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM track_lyrics_rejections r
+                         WHERE r.track_id = CAST(:track_id AS uuid)
+                           AND CAST(r.lrclib_id AS text) = CAST(:picked_id AS text))
+                    ON CONFLICT (track_id) DO UPDATE SET
+                        match_status   = EXCLUDED.match_status,
+                        evidence       = EXCLUDED.evidence,
+                        lyric_plain    = EXCLUDED.lyric_plain,
+                        lyric_synced   = EXCLUDED.lyric_synced,
+                        matcher_version= EXCLUDED.matcher_version,
+                        updated_at     = NOW()
+                    """ + self._REFUSE_SQL
+                ),
+                {
+                    "track_id": outcome.track_id,
+                    "match_status": outcome.match_status,
+                    # JSONB bind: repo pattern is json.dumps(...) + CAST(:x AS jsonb)
+                    # (psycopg does not adapt a raw dict). ensure_ascii=False keeps
+                    # Hangul readable in the stored evidence.
+                    "evidence": json.dumps(_evidence_json(outcome), ensure_ascii=False),
+                    "lyric_plain": _strip_nul(_lyric_plain_for(outcome)),
+                    "lyric_synced": _strip_nul(outcome.lyric_synced),
+                    "matcher_version": outcome.matcher_version,
+                    "picked_id": _picked_lrclib_id(outcome),
+                },
+            )
+            self.session.commit()
+        except Exception as exc:  # noqa: BLE001 - isolation: one row must not abort the batch
+            logger.error("Failed to write track %s: %s", outcome.track_id, exc)
+            self.session.rollback()
+            return "failed"
+        if result.rowcount == 0:
+            logger.warning("Lyrics write refused (owner lock or rejection), track %s", outcome.track_id)
+            return "refused"
+        return "written"
+
     def write_outcomes(self, outcomes: List[MatchOutcome], batch_size: int = 100) -> int:
-        written = 0
-        failed = 0
+        counts = {"written": 0, "refused": 0, "failed": 0}
         for i, outcome in enumerate(outcomes):
-            try:
-                self.session.execute(
-                    text(
-                        """
-                        INSERT INTO track_lyrics
-                            (track_id, match_status, evidence,
-                             lyric_plain, lyric_synced, matcher_version)
-                        VALUES
-                            (:track_id, :match_status, CAST(:evidence AS jsonb),
-                             :lyric_plain, :lyric_synced, :matcher_version)
-                        ON CONFLICT (track_id) DO UPDATE SET
-                            match_status   = EXCLUDED.match_status,
-                            evidence       = EXCLUDED.evidence,
-                            lyric_plain    = EXCLUDED.lyric_plain,
-                            lyric_synced   = EXCLUDED.lyric_synced,
-                            matcher_version= EXCLUDED.matcher_version,
-                            updated_at     = NOW()
-                        """
-                    ),
-                    {
-                        "track_id": outcome.track_id,
-                        "match_status": outcome.match_status,
-                        # JSONB bind: repo pattern is json.dumps(...) + CAST(:x AS jsonb)
-                        # (psycopg does not adapt a raw dict). ensure_ascii=False keeps
-                        # Hangul readable in the stored evidence.
-                        "evidence": json.dumps(_evidence_json(outcome), ensure_ascii=False),
-                        "lyric_plain": _strip_nul(_lyric_plain_for(outcome)),
-                        "lyric_synced": _strip_nul(outcome.lyric_synced),
-                        "matcher_version": outcome.matcher_version,
-                    },
-                )
-                self.session.commit()
-                written += 1
-                if (i + 1) % batch_size == 0:
-                    logger.info("Wrote %d/%d outcomes", written, len(outcomes))
-            except Exception as exc:  # noqa: BLE001 - isolation: one row must not abort the batch
-                failed += 1
-                logger.error("Failed to write track %s: %s", outcome.track_id, exc)
-                self.session.rollback()
-                continue
-        logger.info("Write complete: %d success, %d failed", written, failed)
-        return written
+            counts[self.write_one(outcome)] += 1
+            if (i + 1) % batch_size == 0:
+                logger.info("Wrote %d/%d outcomes", counts["written"], len(outcomes))
+        logger.info("Write complete: %d success, %d failed, %d refused",
+                    counts["written"], counts["failed"], counts["refused"])
+        return counts["written"]
+
+    def write_manual(self, outcome: MatchOutcome) -> None:
+        """Write the owner's decision, over any lock (FEAT-lyrics-match-correction Step 3a).
+
+        The one writer path without the lock predicate: the lock IS the owner's verdict, so
+        the owner's next verdict replaces it. ``outcome`` must already carry
+        ``match_basis='manual'`` so the row it writes is locked in turn. Does not commit:
+        the caller commits it together with the translation re-queue, in one transaction.
+        Raises on failure — a pick is one row, and the caller wants to know.
+        """
+        if outcome.match_basis != BASIS_MANUAL:
+            raise ValueError("write_manual needs an outcome with match_basis='manual'")
+        self.session.execute(
+            text(
+                """
+                INSERT INTO track_lyrics
+                    (track_id, match_status, evidence,
+                     lyric_plain, lyric_synced, matcher_version)
+                VALUES
+                    (:track_id, :match_status, CAST(:evidence AS jsonb),
+                     :lyric_plain, :lyric_synced, :matcher_version)
+                ON CONFLICT (track_id) DO UPDATE SET
+                    match_status   = EXCLUDED.match_status,
+                    evidence       = EXCLUDED.evidence,
+                    lyric_plain    = EXCLUDED.lyric_plain,
+                    lyric_synced   = EXCLUDED.lyric_synced,
+                    matcher_version= EXCLUDED.matcher_version,
+                    updated_at     = NOW()
+                """
+            ),
+            {
+                "track_id": outcome.track_id,
+                "match_status": outcome.match_status,
+                "evidence": json.dumps(_evidence_json(outcome), ensure_ascii=False),
+                "lyric_plain": _strip_nul(_lyric_plain_for(outcome)),
+                "lyric_synced": _strip_nul(outcome.lyric_synced),
+                "matcher_version": outcome.matcher_version,
+            },
+        )
+
+
+def _picked_lrclib_id(outcome: MatchOutcome) -> Optional[str]:
+    """The LRCLIB id an outcome attaches, as text (top level, or a best-of promotion's)."""
+    ev = outcome.evidence or {}
+    picked = ev.get("lrclib_id")
+    if picked is None and isinstance(ev.get("promotion"), dict):
+        picked = ev["promotion"].get("lrclib_id")
+    return None if picked is None else str(picked)
 
 
 def _strip_nul(value):

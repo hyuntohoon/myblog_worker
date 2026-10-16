@@ -159,3 +159,14 @@ def _owner_pause_off(request, monkeypatch):
     if request.node.get_closest_marker("pause_check"):
         return
     monkeypatch.setattr("worker.handler.skip_if_paused", lambda event, session_factory: False)
+
+
+@pytest.fixture(autouse=True)
+def _no_lyrics_rejections(request, monkeypatch):
+    """`run_eval_batch` reads the owner's rejected candidates up front
+    (FEAT-lyrics-match-correction Step 3a) — one extra `session.execute` that every
+    MagicMock-session test counting statements would otherwise have to absorb. Stubbed
+    to "no rejections" everywhere except tests marked `rejections`, which exercise it."""
+    if request.node.get_closest_marker("rejections"):
+        return
+    monkeypatch.setattr("worker.service.lyrics_eval_core.load_rejections", lambda session, ids: {})

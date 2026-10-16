@@ -50,11 +50,13 @@ from worker.service.lyrics_matcher import (
     STATUS_NO_LYRICS,
     STATUS_NOT_FOUND,
     STATUS_REVIEW_REQUIRED,
+    BASIS_MANUAL,
     Candidate,
     MatchOutcome,
     body_shingles,
     content_shingles,
     content_similarity,
+    locked_row_sql,
     plausible_candidates,
 )
 
@@ -73,6 +75,10 @@ _BASIS_STRENGTH_MAP = {
     None: 0, "fuzzy-title": 1,
     "best-of-ambiguous": 2, "best-of-review": 2,
     "exact-title": 3, "mb-recording": 4, "isrc": 5,
+    # The owner's pick (FEAT-lyrics-match-correction Step 3a). Top of the ladder so no
+    # automatic basis ever outranks it — belt and braces: ``existing_locked`` refuses
+    # first, and the writer refuses a locked row whatever a gate answers.
+    BASIS_MANUAL: 6,
 }
 
 
@@ -180,7 +186,9 @@ def should_replace(
         # unlock is the only way back. Checked first: ``reassess_track`` selects any status.
         return False
     existing_status = row.get("existing_status")
-    if existing_status in _UNRESOLVED:
+    if existing_status is None or existing_status in _UNRESOLVED:
+        # No row yet (the Step 3a refresh of a never-evaluated track) or an unresolved one:
+        # nothing to protect.
         return True
     if outcome.match_status != STATUS_MATCHED:
         return False  # never downgrade a resolved good row to an unresolved/no_lyrics state
@@ -291,14 +299,13 @@ def replacement_verdict(
 # ``tl.track_id`` is in each GROUP BY, so these are functionally dependent on it. The
 # lyric bodies are NOT here: they are attached afterwards for the chosen rows only
 # (``_attach_stored_bodies``), so a pool-wide sort never carries 18k lyric texts.
-_EXISTING_ROW_COLUMNS = """\
+_EXISTING_ROW_COLUMNS = f"""\
                        tl.match_status                     AS existing_status,
                        (tl.evidence ->> 'match_basis')     AS existing_basis,
                        tl.matcher_version                  AS existing_matcher_version,
-                       ((tl.evidence ? 'manual_fix')
-                        OR (tl.evidence ->> 'match_basis') = 'manual') AS existing_locked,
+                       {locked_row_sql("tl")} AS existing_locked,
                        COALESCE(tl.evidence ->> 'lrclib_id',
-                                tl.evidence #>> '{promotion,lrclib_id}') AS existing_lrclib_id"""
+                                tl.evidence #>> '{{promotion,lrclib_id}}') AS existing_lrclib_id"""
 
 
 def _rows(rows) -> List[Dict[str, Any]]:
@@ -417,6 +424,10 @@ class LyricsReassessmentService:
         at selection (an explicit request is re-judged even when it would not be swept) —
         but not at the guard, so a locked row is judged, recorded as ``locked`` and never
         rewritten. ``cooldown_sec`` as in ``reassess_album``; pass ``0`` to force it.
+
+        Since Step 3a this is also the panel's refresh (the backend enqueues it with
+        ``cooldown_sec: 0``): it stores the judged candidate set, and it never selects or
+        attaches a candidate the owner rejected.
         """
         cooldown_sec = (
             cooldown_sec if cooldown_sec is not None else settings.LYRICS_EXPEDITE_COOLDOWN_SEC
@@ -431,6 +442,9 @@ class LyricsReassessmentService:
             should_write=replacement_verdict,
             touch_on_guard_kept=True,
             touch_on_consistency_error=True,
+            # The owner's panel reads what this re-check saw (Step 3a). Only this
+            # single-track path stores it; the scheduled arms never do.
+            persist_candidates=True,
             log_prefix=f"Lyrics expedite (track {track_id})",
         )
         metrics["track_id"] = str(track_id)
@@ -659,8 +673,7 @@ class LyricsReassessmentService:
                   AND split_part(COALESCE(tl.matcher_version, ''), '+', 1) <> :current_version
                   AND COALESCE(tl.evidence #>> '{{{stamp_key},matcher_version}}', '')
                       <> :current_version
-                  AND NOT (tl.evidence ? 'manual_fix')
-                  AND COALESCE(tl.evidence ->> 'match_basis', '') <> 'manual'
+                  AND NOT {locked_row_sql("tl")}
                 GROUP BY tl.track_id, t.id, t.title, t.duration_sec,
                          primary_artists.artist_names
                 ORDER BY
@@ -675,7 +688,12 @@ class LyricsReassessmentService:
         return _rows(rows)
 
     def _fetch_track(self, track_id: str, cooldown_sec: float) -> List[Dict[str, Any]]:
-        """One explicitly requested row, any status; exclusion and lock filters bypassed."""
+        """One explicitly requested track, any status; exclusion and lock filters bypassed.
+
+        ``LEFT JOIN``: since Step 3a the owner's panel refreshes a track that may never have
+        been evaluated. It then has no ``track_lyrics`` row (``existing_status`` None), the
+        guard has nothing to protect, and the outcome is written like the incremental
+        collector's first evaluation."""
         rows = self.session.execute(
             text(
                 f"""
@@ -683,14 +701,15 @@ class LyricsReassessmentService:
                        primary_artists.artist_names                     AS artist_names,
                        ARRAY_REMOVE(ARRAY_AGG(DISTINCT al.alias), NULL) AS aliases,
 {_EXISTING_ROW_COLUMNS}
-                FROM track_lyrics tl
-                JOIN tracks t         ON t.id = tl.track_id
+                FROM tracks t
+                LEFT JOIN track_lyrics tl ON tl.track_id = t.id
                 JOIN track_artists ta ON ta.track_id = t.id
                 JOIN artists a        ON a.id = ta.artist_id
                 LEFT JOIN LATERAL jsonb_array_elements_text(a.aliases) AS al(alias) ON true
 {PRIMARY_ARTIST_NAMES_LATERAL}
                 WHERE t.id = :track_id
-                  AND tl.updated_at < NOW() - make_interval(secs => :cooldown_sec)
+                  AND (tl.track_id IS NULL
+                       OR tl.updated_at < NOW() - make_interval(secs => :cooldown_sec))
                 GROUP BY tl.track_id, t.id, t.title, t.duration_sec,
                          primary_artists.artist_names
                 """
