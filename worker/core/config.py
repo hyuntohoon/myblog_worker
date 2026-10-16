@@ -206,9 +206,12 @@ class Settings(BaseSettings):
     # ({"job":"lyrics_reassessment","limit":0,"sweep_limit":N}).
     LYRICS_RESWEEP_BATCH_LIMIT: int = 100
     # Shadow mode: judge and stamp (evidence.resweep_shadow) but never rewrite a swept row
-    # other than a best-of supersession. On until the owner has reviewed a full shadow drain
-    # (the lateral rule can overwrite a correct minority body — BTS "Go Go").
-    LYRICS_RESWEEP_SHADOW: bool = True
+    # other than a best-of supersession. Off since the owner reviewed the 2026-10-16 full
+    # shadow drain: of 42 would-rewrite rows, the 16 judged regressions or unclear (the
+    # lateral rule can overwrite a correct minority body — BTS "Go Go") were hand-locked
+    # with evidence.manual_fix first. Turn it back on before a matcher bump whose drain
+    # has not been read.
+    LYRICS_RESWEEP_SHADOW: bool = False
 
     # How long a best-of-* matched row rests between supersession re-checks
     # (DATA-catalog-noise Step 3b). The reassessment queue puts the best-of backlog AHEAD of
