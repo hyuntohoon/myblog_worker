@@ -47,9 +47,12 @@ _REQUEUE_TRANSLATION_SQL = """
        SET status = 'requested', claimed_at = NULL, error = NULL,
            requested_at = NOW(), updated_at = NOW()
      WHERE track_id = :tid
-       AND status IN ('done', 'failed')
+       AND status IN ('done', 'failed', 'requested')
        AND origin IS DISTINCT FROM 'manual'
 """
+# 'requested' too: a poller claim in flight translates the OLD body; bumping updated_at and
+# clearing the claim makes that publish fail its claim check, and the row is re-claimed
+# against the new body.
 
 
 class LyricsPickService:
@@ -141,6 +144,19 @@ class LyricsPickService:
         new_body = (outcome.lyric_plain or "", outcome.lyric_synced or "")
         old_body = (state["lyric_plain"] or "", state["lyric_synced"] or "")
         try:
+            # Re-check the rejection inside the write transaction: the LRCLIB fetch took time,
+            # and the owner may have rejected this id meanwhile. The backend's reject takes the
+            # same row lock first, so the two serialize.
+            self.session.execute(
+                text("SELECT 1 FROM track_lyrics WHERE track_id = :tid FOR UPDATE"), {"tid": tid}
+            )
+            if self.session.execute(
+                text("SELECT 1 FROM track_lyrics_rejections WHERE track_id = :tid AND lrclib_id = :lid"),
+                {"tid": tid, "lid": lid},
+            ).first() is not None:
+                self.session.rollback()
+                logger.warning("Lyrics pick refused for track %s, id %s: rejected meanwhile", tid, lid)
+                return {"outcome": "refused", "reason": "rejected"}
             TrackLyricsWriter(self.session).write_manual(outcome)
             requeued = 0
             if status == STATUS_MATCHED and new_body != old_body:

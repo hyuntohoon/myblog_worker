@@ -15,6 +15,28 @@ from worker.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Every outbound request has an explicit timeout (CLAUDE.md; swept with backend #189's
+# SQS client fix). boto3's defaults are 60 s connect + 60 s read with retries.
+_SQS_CONNECT_TIMEOUT_SEC = 3
+_SQS_READ_TIMEOUT_SEC = 5
+_SQS_MAX_ATTEMPTS = 2
+
+
+def _sqs():
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        "sqs",
+        region_name=settings.AWS_DEFAULT_REGION,
+        endpoint_url=(settings.LOCALSTACK_ENDPOINT or None),
+        config=Config(
+            connect_timeout=_SQS_CONNECT_TIMEOUT_SEC,
+            read_timeout=_SQS_READ_TIMEOUT_SEC,
+            retries={"max_attempts": _SQS_MAX_ATTEMPTS, "mode": "standard"},
+        ),
+    )
+
 # Spotify /albums?ids= caps at 20 per call; the consumer chunks anyway, but keep
 # producer messages within the same bound.
 _MAX_PER_MESSAGE = 20
@@ -30,13 +52,7 @@ def enqueue_album_sync(album_ids: List[str]) -> None:
         logger.info("SQS_QUEUE_URL unset; skipping enqueue of %d unknown albums", len(album_ids))
         return
 
-    import boto3
-
-    sqs = boto3.client(
-        "sqs",
-        region_name=settings.AWS_DEFAULT_REGION,
-        endpoint_url=(settings.LOCALSTACK_ENDPOINT or None),
-    )
+    sqs = _sqs()
     for i in range(0, len(album_ids), _MAX_PER_MESSAGE):
         chunk = album_ids[i : i + _MAX_PER_MESSAGE]
         body = json.dumps({"album_ids": chunk, "market": settings.SPOTIFY_DEFAULT_MARKET})
@@ -66,13 +82,7 @@ def enqueue_follow_ingest(artist_sids: List[str]) -> int:
         logger.info("SQS_QUEUE_URL unset; skipping follow-ingest of %d artists", len(sids))
         return 0
 
-    import boto3
-
-    sqs = boto3.client(
-        "sqs",
-        region_name=settings.AWS_DEFAULT_REGION,
-        endpoint_url=(settings.LOCALSTACK_ENDPOINT or None),
-    )
+    sqs = _sqs()
     for i in range(0, len(sids), _FOLLOW_INGEST_CHUNK):
         body = json.dumps(
             {"job": "spotify_follow_ingest", "artist_sids": sids[i : i + _FOLLOW_INGEST_CHUNK]}
@@ -92,13 +102,7 @@ def enqueue_follow_import_rerun(user_id: str) -> bool:
         logger.info("SQS_QUEUE_URL unset; skipping follow-import rerun chain")
         return False
 
-    import boto3
-
-    sqs = boto3.client(
-        "sqs",
-        region_name=settings.AWS_DEFAULT_REGION,
-        endpoint_url=(settings.LOCALSTACK_ENDPOINT or None),
-    )
+    sqs = _sqs()
     sqs.send_message(
         QueueUrl=settings.SQS_QUEUE_URL,
         MessageBody=json.dumps(
@@ -123,13 +127,7 @@ def enqueue_discography_enumeration(hops: int = 0, delay_seconds: int = 0) -> bo
         logger.info("SQS_QUEUE_URL unset; skipping discography enumeration enqueue")
         return False
 
-    import boto3
-
-    sqs = boto3.client(
-        "sqs",
-        region_name=settings.AWS_DEFAULT_REGION,
-        endpoint_url=(settings.LOCALSTACK_ENDPOINT or None),
-    )
+    sqs = _sqs()
     kwargs = {
         "QueueUrl": settings.SQS_QUEUE_URL,
         "MessageBody": json.dumps(
@@ -153,13 +151,7 @@ def enqueue_lyrics_incremental() -> None:
         logger.info("SQS_QUEUE_URL unset; skipping lyrics-incremental chain")
         return
 
-    import boto3
-
-    sqs = boto3.client(
-        "sqs",
-        region_name=settings.AWS_DEFAULT_REGION,
-        endpoint_url=(settings.LOCALSTACK_ENDPOINT or None),
-    )
+    sqs = _sqs()
     sqs.send_message(
         QueueUrl=settings.SQS_QUEUE_URL,
         MessageBody=json.dumps({"job": "lyrics_incremental"}),

@@ -437,6 +437,10 @@ def _run_lyrics_reassessment(
         if track_id:
             metrics = svc.reassess_track(track_id, cooldown_sec=cooldown_sec)
             logger.info("Lyrics track re-check metrics: %s", metrics)
+            if metrics.get("skipped_transient"):
+                # One track, asked for by the owner's panel: an LRCLIB outage must not
+                # ack the message silently. Raising lets SQS redeliver it.
+                raise RuntimeError(f"lyrics re-check of {track_id} hit an LRCLIB transient error")
             return
         if album_id:
             metrics = svc.reassess_album(album_id, limit=limit, cooldown_sec=cooldown_sec)

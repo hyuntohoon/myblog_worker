@@ -212,3 +212,38 @@ def test_pick_locks_the_row_and_requeues_only_a_non_manual_translation(factory, 
         assert _row(session, poller_tr)[0] == "korean body"
     finally:
         session.close()
+
+
+def test_a_rejection_made_after_the_decision_is_refused_at_write_time(factory, tracks):
+    """Review finding 1: the run read rejections before its LRCLIB loop; the owner rejects
+    the candidate meanwhile and takes the row down. The late write must not put it back."""
+    tid, promoted, _ = tracks
+    session = factory()
+    try:
+        for t in (tid, promoted):
+            session.execute(
+                text("INSERT INTO track_lyrics (track_id, match_status, evidence, matcher_version) "
+                     "VALUES (:t, 'review_required', '{\"reason\": \"owner_rejected\"}'::jsonb, 'step4-v1')"),
+                {"t": t},
+            )
+            session.execute(
+                text("INSERT INTO track_lyrics_rejections (track_id, lrclib_id, rejected_by) "
+                     "VALUES (:t, 2, 'owner')"), {"t": t},
+            )
+        session.commit()
+        late = _auto(tid)  # evidence.lrclib_id = 2, the rejected id
+        best_of = _auto(promoted)
+        best_of.match_basis = "best-of-ambiguous"
+        best_of.evidence = {"promotion": {"lrclib_id": 2}}
+        writer = TrackLyricsWriter(session)
+        assert writer.write_one(late) == "refused"
+        assert writer.write_one(best_of) == "refused"
+        for t in (tid, promoted):
+            assert session.execute(
+                text("SELECT match_status FROM track_lyrics WHERE track_id = :t"), {"t": t}
+            ).scalar() == "review_required"
+        other = _auto(tid)
+        other.evidence = {"lrclib_id": 3}
+        assert writer.write_one(other) == "written"  # any other candidate still may
+    finally:
+        session.close()

@@ -190,6 +190,10 @@ def new_metrics() -> Dict[str, Any]:
         # shadow mode (LYRICS_RESWEEP_SHADOW): what the real pass would rewrite; nothing written
         "resweep_would_replace": 0,
         "resweep_would_supersede": 0,
+        # FEAT-lyrics-match-correction Step 3a: the writer refused the outcome at write time
+        # (owner lock, or a candidate rejected after this run read the rejections). Also
+        # counted in guard_kept.
+        "write_refused": 0,
     }
 
 
@@ -347,7 +351,17 @@ def run_eval_batch(
 
             if patch:
                 outcome.evidence = {**(outcome.evidence or {}), **patch}
-            writer.write_outcomes([outcome])  # per-row commit (sentinel included)
+            if writer.write_one(outcome) == "refused":  # per-row commit (sentinel included)
+                # The writer re-read the lock and the owner's rejections and refused (Step 3a):
+                # the row was locked, or the outcome attaches a candidate rejected after this
+                # run read them. Treated like a guard-kept row — nothing changed, and a caller
+                # that rotates its queue must still advance this row's cursor, or a locked row
+                # pins the head of a stalest-first selection (the demand job's ladder too).
+                metrics["guard_kept"] += 1
+                metrics["write_refused"] += 1
+                if touch_on_guard_kept:
+                    writer.touch(row["id"])
+                continue
             metrics["evaluated"] += 1
             metrics[outcome.match_status] = metrics.get(outcome.match_status, 0) + 1
             _count_promotion(metrics, outcome)

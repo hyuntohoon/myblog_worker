@@ -58,7 +58,7 @@ from myblog_shared_db.lyrics_demand import LyricsDemandStore, StaleDiscovery
 from worker.clients.lrclib_client import LrclibClient
 from worker.core.config import settings
 from worker.service.lyrics_eval_core import PRIMARY_ARTIST_NAMES_LATERAL, run_eval_batch
-from worker.service.lyrics_matcher import MatchOutcome
+from worker.service.lyrics_matcher import MatchOutcome, locked_row_sql
 from worker.service.lyrics_reassessment_service import should_replace
 
 logger = logging.getLogger(__name__)
@@ -417,6 +417,11 @@ class LyricsDemandSourceService:
                        ARRAY_REMOVE(ARRAY_AGG(DISTINCT al.alias), NULL) AS aliases,
                        tl.match_status                     AS existing_status,
                        (tl.evidence ->> 'match_basis')     AS existing_basis,
+                       -- The owner's lock (FEAT-lyrics-match-correction Step 3a): the
+                       -- replacement guard refuses first, so the row is guard-kept and
+                       -- touched, and its ladder advances instead of pinning the head.
+                       -- An aggregate so the GROUP BY need not carry tl.evidence.
+                       COALESCE(bool_or({locked_row_sql("tl")}), false) AS existing_locked,
                        lat.job_id                          AS job_id,
                        lat.work_id                         AS work_id,
                        lat.source_revision                 AS source_revision,

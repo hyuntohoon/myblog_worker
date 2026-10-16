@@ -293,12 +293,17 @@ def _outcome(basis="exact-title", status=STATUS_MATCHED):
 
 
 class TestWriterLock:
-    def test_automatic_upsert_refuses_a_locked_row(self):
+    def test_automatic_upsert_refuses_a_locked_row_and_a_rejected_candidate(self):
         session = MagicMock()
         session.execute.return_value.rowcount = 1
         TrackLyricsWriter(session).write_outcomes([_outcome()])
         sql = " ".join(str(session.execute.call_args[0][0]).split())
-        assert sql.endswith("WHERE NOT " + locked_row_sql("track_lyrics"))
+        where = sql[sql.index("WHERE NOT"):]
+        assert where.startswith("WHERE NOT " + locked_row_sql("track_lyrics"))
+        # Re-read at write time, not only when the matcher decided (review finding 1).
+        assert "NOT EXISTS ( SELECT 1 FROM track_lyrics_rejections r" in where
+        assert "EXCLUDED.evidence ->> 'lrclib_id'" in where
+        assert "EXCLUDED.evidence #>> '{promotion,lrclib_id}'" in where
 
     def test_a_refused_write_is_counted_locked_not_written(self):
         session = MagicMock()
@@ -362,13 +367,16 @@ def _state(**over):
     return st
 
 
-def _pick_session(state, requeued=1):
+def _pick_session(state, requeued=1, rejected_meanwhile=False):
     session = MagicMock()
     read = MagicMock()
     read.mappings.return_value.one.return_value = state
+    lock = MagicMock()
+    recheck = MagicMock()
+    recheck.first.return_value = (1,) if rejected_meanwhile else None
     write = MagicMock()
     requeue = MagicMock(rowcount=requeued)
-    session.execute.side_effect = [read, write, requeue]
+    session.execute.side_effect = [read, lock, recheck, write, requeue]
     return session
 
 
@@ -399,9 +407,11 @@ class TestPick:
         res = LyricsPickService(session, client).pick(_TID, "5", "owner-sub")
         assert res == {"outcome": "picked", "status": STATUS_MATCHED, "translation_requeued": 1}
         assert client.calls == [5]
-        read, write, requeue = _sqls(session)
+        read, lock, recheck, write, requeue = _sqls(session)
+        assert lock.endswith("FOR UPDATE")
+        assert recheck.startswith("SELECT 1 FROM track_lyrics_rejections")
         assert write.startswith("INSERT INTO track_lyrics") and "WHERE NOT" not in write
-        params = session.execute.call_args_list[1][0][1]
+        params = session.execute.call_args_list[3][0][1]
         ev = json.loads(params["evidence"])
         assert ev["match_basis"] == BASIS_MANUAL and ev["lrclib_id"] == 5
         assert ev["manual"]["by"] == "owner-sub" and ev["manual"]["action"] == "pick"
@@ -409,6 +419,7 @@ class TestPick:
         assert params["matcher_version"] == "manual"
         assert requeue.startswith("UPDATE track_lyrics_translations")
         assert "origin IS DISTINCT FROM 'manual'" in requeue
+        assert "status IN ('done', 'failed', 'requested')" in requeue
         assert session.commit.call_count == 2  # the read, then write + requeue together
 
     def test_same_body_does_not_requeue(self):
@@ -416,15 +427,22 @@ class TestPick:
         session = _pick_session(_state(lyric_plain=cand.plain_lyrics, lyric_synced=cand.synced_lyrics))
         res = LyricsPickService(session, _GetClient(cand)).pick(_TID, 5, "sub")
         assert res["translation_requeued"] == 0
-        assert len(_sqls(session)) == 2
+        assert len(_sqls(session)) == 4
 
     def test_instrumental_pick_is_locked_no_lyrics(self):
         session = _pick_session(_state())
         res = LyricsPickService(session, _GetClient(_c(5, None, instrumental=True))).pick(_TID, 5, "sub")
         assert res["status"] == STATUS_NO_LYRICS
-        params = session.execute.call_args_list[1][0][1]
+        params = session.execute.call_args_list[3][0][1]
         assert params["lyric_plain"] == "" and params["lyric_synced"] is None
-        assert len(_sqls(session)) == 2
+        assert len(_sqls(session)) == 4
+
+    def test_a_rejection_made_during_the_fetch_wins(self):
+        session = _pick_session(_state(), rejected_meanwhile=True)
+        res = LyricsPickService(session, _GetClient(_c(5, _BODY_A))).pick(_TID, 5, "sub")
+        assert res == {"outcome": "refused", "reason": "rejected"}
+        assert len(_sqls(session)) == 3  # never written
+        session.rollback.assert_called()
 
     def test_vanished_record_is_dropped(self):
         session = _pick_session(_state())
@@ -449,3 +467,81 @@ class TestHandlerRoute:
         }]}, None)
         assert seen == [(_TID, 5, "s")]
         assert res == {"batchItemFailures": []}
+
+
+# --------------------------------------------------------------------------
+# review findings (worker #117)
+# --------------------------------------------------------------------------
+class TestRefusedWriteInTheLoop:
+    """Finding 2: a refused write (lock or late rejection) is guard-kept, never "evaluated",
+    and a rotating caller advances the row's cursor."""
+
+    def _run(self, touch):
+        session = MagicMock()
+        session.execute.return_value.rowcount = 0  # the upsert's WHERE refused it
+        m = run_eval_batch(session, [_track_row()], concurrency=1, time_budget_sec=30,
+                           client=_FakeClient([_c(1, _BODY_A)]), touch_on_guard_kept=touch)
+        return m, _sqls(session)
+
+    def test_refused_is_guard_kept_and_touched_for_a_rotating_caller(self):
+        m, sqls = self._run(touch=True)
+        assert (m["evaluated"], m["guard_kept"], m["write_refused"]) == (0, 1, 1)
+        assert sqls[-1] == "UPDATE track_lyrics SET updated_at = NOW() WHERE track_id = :track_id"
+
+    def test_refused_is_not_touched_for_the_incremental_collector(self):
+        m, sqls = self._run(touch=False)
+        assert m["guard_kept"] == 1
+        assert not any(s.startswith("UPDATE track_lyrics SET updated_at") for s in sqls)
+
+
+class TestDemandSelectionProjectsTheLock:
+    def test_existing_locked_is_selected(self):
+        from worker.service.lyrics_demand_source_service import LyricsDemandSourceService
+
+        session = MagicMock()
+        session.execute.return_value.mappings.return_value.all.return_value = []
+        LyricsDemandSourceService(session)._fetch_due_tracks(5)
+        sql = " ".join(str(session.execute.call_args[0][0]).split())
+        assert f"COALESCE(bool_or({locked_row_sql('tl')}), false) AS existing_locked" in sql
+
+
+class TestUnlockedAndUnevaluated:
+    def test_an_unlocked_manual_row_is_replaced_by_the_next_match(self):
+        """The panel's unlock sets basis 'unlocked' (rung 0) on a 'manual'-version row:
+        the next re-check's exact-title match replaces it."""
+        row = {"existing_status": STATUS_MATCHED, "existing_basis": "unlocked",
+               "existing_matcher_version": "manual", "existing_locked": False}
+        assert should_replace(row, _outcome()) is True
+
+    def test_a_track_with_no_row_is_written_whatever_the_outcome(self):
+        row = {"existing_status": None}
+        parked = _outcome(status="not_found")
+        parked.match_basis = None
+        assert should_replace(row, parked) is True
+
+    def test_single_track_selection_left_joins_the_lyrics_row(self):
+        from worker.service.lyrics_reassessment_service import LyricsReassessmentService
+
+        session = MagicMock()
+        session.execute.return_value.fetchall.return_value = []
+        LyricsReassessmentService(session, client=_FakeClient())._fetch_track("tid", 0)
+        sql = " ".join(str(session.execute.call_args[0][0]).split())
+        assert "FROM tracks t LEFT JOIN track_lyrics tl ON tl.track_id = t.id" in sql
+        assert "(tl.track_id IS NULL OR tl.updated_at < NOW() - make_interval(secs => :cooldown_sec))" in sql
+
+
+class TestRecheckRedelivery:
+    def test_a_transient_error_on_the_panel_recheck_raises(self, monkeypatch):
+        import worker.handler as handler
+
+        class _Svc:
+            def __init__(self, session):
+                pass
+
+            def reassess_track(self, track_id, cooldown_sec=None):
+                return {"skipped_transient": 1}
+
+        monkeypatch.setattr("worker.service.lyrics_reassessment_service.LyricsReassessmentService", _Svc)
+        monkeypatch.setattr(handler, "SessionLocal", MagicMock())
+        with pytest.raises(RuntimeError):
+            handler._run_lyrics_reassessment(track_id=_TID, cooldown_sec=0)

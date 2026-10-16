@@ -186,7 +186,9 @@ def should_replace(
         # unlock is the only way back. Checked first: ``reassess_track`` selects any status.
         return False
     existing_status = row.get("existing_status")
-    if existing_status in _UNRESOLVED:
+    if existing_status is None or existing_status in _UNRESOLVED:
+        # No row yet (the Step 3a refresh of a never-evaluated track) or an unresolved one:
+        # nothing to protect.
         return True
     if outcome.match_status != STATUS_MATCHED:
         return False  # never downgrade a resolved good row to an unresolved/no_lyrics state
@@ -686,7 +688,12 @@ class LyricsReassessmentService:
         return _rows(rows)
 
     def _fetch_track(self, track_id: str, cooldown_sec: float) -> List[Dict[str, Any]]:
-        """One explicitly requested row, any status; exclusion and lock filters bypassed."""
+        """One explicitly requested track, any status; exclusion and lock filters bypassed.
+
+        ``LEFT JOIN``: since Step 3a the owner's panel refreshes a track that may never have
+        been evaluated. It then has no ``track_lyrics`` row (``existing_status`` None), the
+        guard has nothing to protect, and the outcome is written like the incremental
+        collector's first evaluation."""
         rows = self.session.execute(
             text(
                 f"""
@@ -694,14 +701,15 @@ class LyricsReassessmentService:
                        primary_artists.artist_names                     AS artist_names,
                        ARRAY_REMOVE(ARRAY_AGG(DISTINCT al.alias), NULL) AS aliases,
 {_EXISTING_ROW_COLUMNS}
-                FROM track_lyrics tl
-                JOIN tracks t         ON t.id = tl.track_id
+                FROM tracks t
+                LEFT JOIN track_lyrics tl ON tl.track_id = t.id
                 JOIN track_artists ta ON ta.track_id = t.id
                 JOIN artists a        ON a.id = ta.artist_id
                 LEFT JOIN LATERAL jsonb_array_elements_text(a.aliases) AS al(alias) ON true
 {PRIMARY_ARTIST_NAMES_LATERAL}
                 WHERE t.id = :track_id
-                  AND tl.updated_at < NOW() - make_interval(secs => :cooldown_sec)
+                  AND (tl.track_id IS NULL
+                       OR tl.updated_at < NOW() - make_interval(secs => :cooldown_sec))
                 GROUP BY tl.track_id, t.id, t.title, t.duration_sec,
                          primary_artists.artist_names
                 """
