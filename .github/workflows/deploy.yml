@@ -68,12 +68,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: hyuntohoon/myblog_shared_db
-          # FEAT-spotify-library-autosync: runtime and canonical schema both pin V61
-          # (spotify_library_sync_runs, claimed by the library sync). This ref is a SECOND copy of the pin in requirements.txt and
+          # FEAT-automation-admin 3c: runtime and canonical schema both pin V62
+          # (automation_control_events run-now stamps). This ref is a SECOND copy of the pin in requirements.txt and
           # must move with it — a bump that touches only the lock leaves CI loading a
           # schema without the new tables, which fails as "relation does not exist" and
           # reads like a missing migration rather than a stale workflow.
-          ref: 4544da2383bd5e5006670aef7883753e395aafb6
+          ref: b15bd71a13e8bde2724fd647319f288291d5165f
           token: ${{ secrets.SHARED_DB_PAT }}
           persist-credentials: false
           path: shared-db-schema

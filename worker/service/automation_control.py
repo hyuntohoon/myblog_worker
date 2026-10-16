@@ -1,5 +1,5 @@
 # worker/service/automation_control.py
-"""Owner pause for scheduled worker runs (FEAT-automation-admin Step 3b).
+"""Owner pause and run-now stamps for worker runs (FEAT-automation-admin 3b, 3c).
 
 The owner's automation page writes `automation_controls.paused` (V60). Before a
 top-level invocation runs (an EventBridge cron or a direct invoke), the handler
@@ -21,12 +21,22 @@ Scope, by design:
 The keys mirror the backend catalog (`app/services/automation_catalog.py`).
 `tests/test_automation_control.py` pins the full set, so a key added on one side
 only fails a test instead of silently never pausing.
+
+Run now (3c): the owner's page invokes this Lambda with the cron's own constant
+input (`myblog_shared_db.automation.WORKER_CRON_PAYLOADS`) plus
+`automation_run_id`, the audit row's request_id. The handler stamps that row's
+`started_at` when the run begins and `finished_at` + `run_outcome` when it ends.
+A stamp that fails is logged at ERROR and never blocks the run (fail-open, as
+the pause check): the page then shows an invoked run with no start, which is the
+truthful reading.
 """
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any, Callable, Dict, Optional
 
+from myblog_shared_db.automation import RUN_ID_FIELD
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -45,6 +55,10 @@ _PLAIN_JOBS = frozenset({
     "artist_photo_backfill",
     "isrc_backfill",
     "youtube_ref_refresh",
+    # Run-now only (3c): the alias cron itself sends the default scheduled event
+    # (source=aws.events, mapped below); the owner's run-now sends this instead,
+    # so the backend never forges an aws.events event.
+    "musicbrainz_alias_fill",
 })
 
 # Jobs split into one catalog row per EventBridge rule, by `event.mode`. The
@@ -75,7 +89,7 @@ def control_key(event: Dict[str, Any]) -> Optional[str]:
 
 
 def all_control_keys() -> frozenset:
-    keys = set(_PLAIN_JOBS) | {ALIAS_FILL_KEY}
+    keys = set(_PLAIN_JOBS)
     for prefix, _default, modes in _MODE_JOBS.values():
         keys |= {prefix + mode for mode in modes}
     return frozenset(keys)
@@ -113,3 +127,56 @@ def skip_if_paused(event: Dict[str, Any], session_factory: Callable[[], Session]
     if paused:
         logger.info("automation: %s is paused by the owner; skipping this run", key)
     return paused
+
+
+# ── run-now stamps (3c) ─────────────────────────────────────────────────────────
+
+# A retry (Lambda async retries a raised run) restamps the start and clears the end,
+# so the row reads "running" again instead of keeping the failed attempt's end.
+# `action = 'run'` keeps a stray id from touching a pause/resume row (V62 would
+# reject it anyway).
+_STAMP_START = text(
+    "UPDATE automation_control_events "
+    "SET started_at = clock_timestamp(), finished_at = NULL, run_outcome = NULL "
+    "WHERE request_id = :rid AND action = 'run'"
+)
+_STAMP_END = text(
+    "UPDATE automation_control_events "
+    "SET finished_at = clock_timestamp(), run_outcome = :outcome "
+    "WHERE request_id = :rid AND action = 'run'"
+)
+
+RUN_OUTCOMES = frozenset({"ok", "error", "skipped_paused"})
+
+
+def run_id_of(event: Dict[str, Any]) -> Optional[uuid.UUID]:
+    """The owner run-now id a top-level event carries, or None."""
+    raw = event.get(RUN_ID_FIELD)
+    if raw is None:
+        return None
+    try:
+        return uuid.UUID(str(raw))
+    except ValueError:
+        logger.warning("automation: ignoring a malformed %s", RUN_ID_FIELD)
+        return None
+
+
+def _stamp(statement, params: Dict[str, Any], session_factory: Callable[[], Session]) -> None:
+    try:
+        with session_factory() as db:
+            db.execute(text("SET TRANSACTION READ WRITE"))
+            db.execute(text("SET LOCAL statement_timeout = '5s'"))
+            db.execute(statement, params)
+            db.commit()
+    except Exception as error:  # noqa: BLE001 — a stamp never blocks the run
+        logger.error("automation run stamp failed for %s (%s)", params["rid"], type(error).__name__)
+
+
+def stamp_run_start(run_id: uuid.UUID, session_factory: Callable[[], Session]) -> None:
+    _stamp(_STAMP_START, {"rid": run_id}, session_factory)
+
+
+def stamp_run_end(run_id: uuid.UUID, outcome: str, session_factory: Callable[[], Session]) -> None:
+    if outcome not in RUN_OUTCOMES:
+        raise ValueError(outcome)
+    _stamp(_STAMP_END, {"rid": run_id, "outcome": outcome}, session_factory)
