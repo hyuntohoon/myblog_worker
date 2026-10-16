@@ -8,7 +8,12 @@ from worker.core.config import settings
 from worker.clients.spotify_client import spotify
 
 from worker.infra.db import SessionLocal
-from worker.service.automation_control import skip_if_paused
+from worker.service.automation_control import (
+    run_id_of,
+    skip_if_paused,
+    stamp_run_end,
+    stamp_run_start,
+)
 from worker.service.sync_service import AlbumSyncService, generate_and_save_aliases
 from worker.service.listening_sync_service import run_listening_sync
 
@@ -509,11 +514,32 @@ def _run_youtube_ref_refresh(limit: int | None = None) -> None:
         raise
 
 
+_PAUSED = {"skipped": "paused"}
+
+
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    # Owner run-now (FEAT-automation-admin 3c): a top-level invoke that carries
+    # `automation_run_id` stamps its audit row around the run. Everything else —
+    # EventBridge crons, SQS batches — goes straight through.
+    run_id = run_id_of(event) if "Records" not in event else None
+    if run_id is None:
+        return _handle(event, context)
+    stamp_run_start(run_id, SessionLocal)
+    try:
+        result = _handle(event, context)
+    except BaseException:
+        # Re-raised: the async retries and worker-cron-dlq still apply to a run-now.
+        stamp_run_end(run_id, "error", SessionLocal)
+        raise
+    stamp_run_end(run_id, "skipped_paused" if result == _PAUSED else "ok", SessionLocal)
+    return result
+
+
+def _handle(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # Owner pause (FEAT-automation-admin 3b). Top-level events only — EventBridge
     # crons and direct invokes. SQS messages are user/owner actions and never paused.
     if "Records" not in event and skip_if_paused(event, SessionLocal):
-        return {"skipped": "paused"}
+        return dict(_PAUSED)
 
     # EventBridge daily cron — YouTube mapping retention sweep + re-verification
     # (FEAT-youtube-playback-provider Step A5). Constant input
@@ -655,8 +681,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         _run_spotify_member_poll()
         return {}
 
-    # EventBridge scheduled rule (alias cron) — full event carries source=aws.events
-    if event.get("source") == "aws.events":
+    # EventBridge scheduled rule (alias cron) — full event carries source=aws.events.
+    # The owner's run-now (FEAT-automation-admin 3c) sends {"job": "musicbrainz_alias_fill"}
+    # instead, so nothing ever forges an aws.events event.
+    if event.get("source") == "aws.events" or event.get("job") == "musicbrainz_alias_fill":
         logger.info("EventBridge trigger: running alias generation")
         _run_alias_generation()
         return {}
