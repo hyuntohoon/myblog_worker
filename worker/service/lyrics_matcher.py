@@ -736,12 +736,35 @@ class LRCLIBDumpMatcher:
         self.conn.close()
 
 
+# The owner's lock on a ``track_lyrics`` row (FEAT-lyrics-match-correction). A row is
+# locked when the owner fixed it: ``evidence.match_basis = 'manual'`` (a Step 3a panel
+# pick / "no lyrics"), or the pre-3a hand fix ``evidence.manual_fix``. Interpolated into
+# SQL with the row alias, so every reader and the writer test the same two keys.
+def locked_row_sql(alias: str) -> str:
+    """SQL predicate: the row ``alias`` carries the owner's lock."""
+    return (
+        f"(({alias}.evidence ? 'manual_fix') "
+        f"OR COALESCE({alias}.evidence ->> 'match_basis', '') = 'manual')"
+    )
+
+
+BASIS_MANUAL = "manual"
+MANUAL_MATCHER_VERSION = "manual"
+
+
 class TrackLyricsWriter:
     """Persist match outcomes to ``track_lyrics`` (per-row commit, failure isolated).
 
     RFC: commit per row + sentinel so the row leaves the pool. ``no_lyrics`` is
     written with ``lyric_plain=''`` to satisfy the V33 CHECK (non-NULL for
     resolved statuses matched/no_lyrics); unresolved statuses write NULL text.
+
+    **The lock is enforced here** (FEAT-lyrics-match-correction Step 3a). Every automatic
+    producer — incremental, reassessment, demand source and the workspace ``tools/lyrics_*``
+    batch tools, which import this class — writes through ``write_outcomes``, whose upsert
+    refuses to touch a locked row (``locked_row_sql``). The selections and the replacement
+    guard skip locked rows too, but this is the one place no new selection can forget.
+    Only ``write_manual`` (the owner's own pick) writes over a lock.
     """
 
     def __init__(self, session: Session):
@@ -807,9 +830,10 @@ class TrackLyricsWriter:
     def write_outcomes(self, outcomes: List[MatchOutcome], batch_size: int = 100) -> int:
         written = 0
         failed = 0
+        locked = 0
         for i, outcome in enumerate(outcomes):
             try:
-                self.session.execute(
+                result = self.session.execute(
                     text(
                         """
                         INSERT INTO track_lyrics
@@ -825,7 +849,8 @@ class TrackLyricsWriter:
                             lyric_synced   = EXCLUDED.lyric_synced,
                             matcher_version= EXCLUDED.matcher_version,
                             updated_at     = NOW()
-                        """
+                        WHERE NOT {locked}
+                        """.format(locked=locked_row_sql("track_lyrics"))
                     ),
                     {
                         "track_id": outcome.track_id,
@@ -839,6 +864,13 @@ class TrackLyricsWriter:
                         "matcher_version": outcome.matcher_version,
                     },
                 )
+                if result.rowcount == 0:
+                    # The conflict row is locked: the owner's verdict stands. Not a failure
+                    # (nothing went wrong) and not a write (nothing changed).
+                    self.session.commit()
+                    locked += 1
+                    logger.warning("Locked lyrics row kept, track %s", outcome.track_id)
+                    continue
                 self.session.commit()
                 written += 1
                 if (i + 1) % batch_size == 0:
@@ -848,8 +880,47 @@ class TrackLyricsWriter:
                 logger.error("Failed to write track %s: %s", outcome.track_id, exc)
                 self.session.rollback()
                 continue
-        logger.info("Write complete: %d success, %d failed", written, failed)
+        logger.info("Write complete: %d success, %d failed, %d locked", written, failed, locked)
         return written
+
+    def write_manual(self, outcome: MatchOutcome) -> None:
+        """Write the owner's decision, over any lock (FEAT-lyrics-match-correction Step 3a).
+
+        The one writer path without the lock predicate: the lock IS the owner's verdict, so
+        the owner's next verdict replaces it. ``outcome`` must already carry
+        ``match_basis='manual'`` so the row it writes is locked in turn. Does not commit:
+        the caller commits it together with the translation re-queue, in one transaction.
+        Raises on failure — a pick is one row, and the caller wants to know.
+        """
+        if outcome.match_basis != BASIS_MANUAL:
+            raise ValueError("write_manual needs an outcome with match_basis='manual'")
+        self.session.execute(
+            text(
+                """
+                INSERT INTO track_lyrics
+                    (track_id, match_status, evidence,
+                     lyric_plain, lyric_synced, matcher_version)
+                VALUES
+                    (:track_id, :match_status, CAST(:evidence AS jsonb),
+                     :lyric_plain, :lyric_synced, :matcher_version)
+                ON CONFLICT (track_id) DO UPDATE SET
+                    match_status   = EXCLUDED.match_status,
+                    evidence       = EXCLUDED.evidence,
+                    lyric_plain    = EXCLUDED.lyric_plain,
+                    lyric_synced   = EXCLUDED.lyric_synced,
+                    matcher_version= EXCLUDED.matcher_version,
+                    updated_at     = NOW()
+                """
+            ),
+            {
+                "track_id": outcome.track_id,
+                "match_status": outcome.match_status,
+                "evidence": json.dumps(_evidence_json(outcome), ensure_ascii=False),
+                "lyric_plain": _strip_nul(_lyric_plain_for(outcome)),
+                "lyric_synced": _strip_nul(outcome.lyric_synced),
+                "matcher_version": outcome.matcher_version,
+            },
+        )
 
 
 def _strip_nul(value):

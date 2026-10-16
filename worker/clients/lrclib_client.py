@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import List
+from typing import List, Optional
 
 import httpx
 
@@ -76,6 +76,35 @@ class LrclibClient:
             except httpx.HTTPError as exc:
                 # A non-retryable HTTP error (4xx other than 404) — treat as a transient
                 # skip rather than fabricate a not_found; the row is retried next run.
+                last = repr(exc)
+                break
+        raise LrclibTransientError(last or "unknown")
+
+    def get_by_id(self, lrclib_id: int, *, max_retries: int = 3) -> Optional[Candidate]:
+        """GET ``/api/get/{id}`` -> ``Candidate`` (FEAT-lyrics-match-correction Step 3a pick).
+
+        404 -> ``None`` (the record is gone). network / 5xx / 429 -> retried with linear
+        backoff, then ``LrclibTransientError``, exactly like ``search_candidates``.
+        """
+        url = f"{settings.LYRICS_LRCLIB_GET_URL.rstrip('/')}/{int(lrclib_id)}"
+        last = None
+        for attempt in range(max_retries):
+            try:
+                resp = self._client.get(url)
+                if resp.status_code == 404:
+                    return None
+                if resp.status_code in _RETRYABLE_STATUS:
+                    last = f"HTTP {resp.status_code}"
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                return Candidate.from_api(data) if isinstance(data, dict) else None
+            except (httpx.TransportError, httpx.TimeoutException) as exc:
+                last = repr(exc)
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            except httpx.HTTPError as exc:
                 last = repr(exc)
                 break
         raise LrclibTransientError(last or "unknown")

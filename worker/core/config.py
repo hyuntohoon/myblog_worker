@@ -186,6 +186,9 @@ class Settings(BaseSettings):
     # Concurrency mirrors the Phase 2 finding (~2.5 req/s effective LRCLIB cap around 20-30
     # workers; higher only adds throttle-skips). URL is the same endpoint the batch used.
     LYRICS_LRCLIB_SEARCH_URL: str = "https://lrclib.net/api/search"
+    # One record by id — the owner's pick re-fetches the body here, never from the panel's
+    # stored preview (FEAT-lyrics-match-correction Step 3a).
+    LYRICS_LRCLIB_GET_URL: str = "https://lrclib.net/api/get"
     LYRICS_INCR_BATCH_LIMIT: int = 150
     LYRICS_INCR_CONCURRENCY: int = 20
     LYRICS_INCR_TIME_BUDGET_SEC: float = 90.0

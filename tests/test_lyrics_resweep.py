@@ -536,7 +536,13 @@ class TestReassessSweep:
         m = svc.reassess_track("815e9a06-ad9a-4ae7-bfdf-66638f90eeb7", cooldown_sec=0)
         svc._fetch_track.assert_called_once_with("815e9a06-ad9a-4ae7-bfdf-66638f90eeb7", 0)
         assert (m["resweep_locked"], m["evaluated"]) == (1, 0)
-        [(sql, params)] = _statements(session)
+        stmts = _statements(session)
+        # Step 3a: the single-track re-check also replaces the panel's candidate set —
+        # locked or not, the owner sees what this re-check saw.
+        panel = [sql for sql, _ in stmts if "track_lyrics_candidates" in sql]
+        assert panel[0] == "DELETE FROM track_lyrics_candidates WHERE track_id = :tid"
+        assert len(panel) == 1 + len({c.id for c in _bh_cands()})
+        [(sql, params)] = [st for st in stmts if "track_lyrics_candidates" not in st[0]]
         assert sql.startswith("UPDATE track_lyrics SET evidence")
         assert json.loads(params["patch"])["resweep"]["verdict"] == "locked"
 
@@ -568,8 +574,8 @@ class TestSweepSelectionSQL:
 
     def test_hand_fixed_and_excluded_rows_are_not_spent_on(self):
         sql, _ = self._sql()
-        assert "NOT (tl.evidence ? 'manual_fix')" in sql
-        assert "COALESCE(tl.evidence ->> 'match_basis', '') <> 'manual'" in sql
+        assert ("NOT ((tl.evidence ? 'manual_fix') "
+                "OR COALESCE(tl.evidence ->> 'match_basis', '') = 'manual')") in sql
         assert "NOT (tl.evidence ? 'excluded_by')" in sql
 
     def test_oldest_version_first_by_number_then_stalest(self):
