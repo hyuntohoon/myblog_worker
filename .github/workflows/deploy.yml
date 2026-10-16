@@ -151,7 +151,6 @@ jobs:
           DRY_RUN: "true"
         run: >-
           pytest tests/ -v
-          --alluredir=allure-results
           --junitxml=pytest-results.xml
 
       - name: Enforce zero DB-bound skips
@@ -200,13 +199,6 @@ jobs:
               )
               sys.exit(1)
           PY
-
-      - name: Upload Allure results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: allure-results
-          path: allure-results/
 
       - name: Upload JUnit results
         if: always()
