@@ -409,9 +409,10 @@ class TestShadowMode:
         assert "'{resweep_shadow,matcher_version}'" in sql
         assert "'{resweep,matcher_version}'" not in sql
 
-    def test_shadow_is_the_shipped_default(self, monkeypatch):
+    def test_real_pass_is_the_shipped_default(self, monkeypatch):
+        """Flipped after the owner-reviewed shadow drain (2026-10-16)."""
         from worker.core.config import Settings
-        assert Settings.model_fields["LYRICS_RESWEEP_SHADOW"].default is True
+        assert Settings.model_fields["LYRICS_RESWEEP_SHADOW"].default is False
 
 
 class TestLockedBeatsEverything:
