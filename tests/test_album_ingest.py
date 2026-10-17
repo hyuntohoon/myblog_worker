@@ -154,6 +154,7 @@ def test_happy_path_filters_known_and_gates_low_pop(monkeypatch):
         "classical_excluded": 0, "classical_holdout": 0,
         "confirm_candidates": 0, "confirm_flipped": 0, "confirm_inserted": 0,
         "confirm_gate_skipped": 0,
+        "tracked_enqueue_gate_skipped": 0, "tracked_confirm_gate_skipped": 0,
     }
     # non-watchlist artists keep the full-length-only sweep (OQ5 scope bound)
     assert all(g == "album" for _, g in catalog.artist_calls)
@@ -506,3 +507,42 @@ def test_announced_rows_flip_to_released_all_sources(monkeypatch):
     # flip guard keeps re-confirms rowcount-silent
     assert "IS DISTINCT FROM" in sql
     assert not session.sql_of(lambda s: "INSERT INTO artist_release_events" in s)
+
+
+@pytest.mark.unit
+def test_tracked_low_pop_release_counted_and_logged_not_enqueued(monkeypatch, caplog):
+    """Measurement for the deferred release-day auto-ingest decision (owner
+    2026-10-17): a tracked artist's novel in-window release held by
+    ALBUM_POP_MIN — on both the enqueue and the confirm-insert gate — is
+    counted and logged with its id, and behaviour is otherwise unchanged."""
+    monkeypatch.setattr(ais.settings, "INGEST_SINCE", "2026-01-01")
+    session = _FakeSession(eligible=[
+        ("trk", False, False, False, True),
+        ("watchA", True),
+    ])
+    catalog = _FakeCatalog(
+        {
+            "trk": [
+                {"id": "trk-new", "name": "New One", "album_type": "album",
+                 "release_date": "2026-07-12"},
+                # past the 90-day confirm lookback → not a release-day item
+                {"id": "trk-old", "name": "Old One", "album_type": "album",
+                 "release_date": "2026-02-01"},
+                {"id": "trk-hot", "name": "Hot One", "album_type": "single",
+                 "release_date": "2026-07-10"},
+            ],
+            "watchA": [{"id": "w-low", "name": "Low", "album_type": "album",
+                        "release_date": "2026-07-12"}],
+        },
+        {"trk-new": 4, "trk-old": 1, "trk-hot": 60, "w-low": 3},
+    )
+    with caplog.at_level("WARNING"):
+        counters, enqueued = _run(session, catalog)
+
+    assert enqueued == ["trk-hot"]
+    assert counters["tracked_enqueue_gate_skipped"] == 1
+    assert counters["tracked_confirm_gate_skipped"] == 1   # trk-new only
+    assert counters["confirm_gate_skipped"] == 2            # trk-new + w-low
+    assert "trk-new:pop=4" in caplog.text
+    assert "not inserted: trk-new:pop=4 date=2026-07-12" in caplog.text
+    assert "trk-old" not in caplog.text and "w-low:pop" not in caplog.text
