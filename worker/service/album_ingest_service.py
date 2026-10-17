@@ -151,6 +151,7 @@ def run_album_ingest(
         "classical_excluded": 0, "classical_holdout": 0,
         "confirm_candidates": 0, "confirm_flipped": 0, "confirm_inserted": 0,
         "confirm_gate_skipped": 0,
+        "tracked_enqueue_gate_skipped": 0, "tracked_confirm_gate_skipped": 0,
     }
 
     # Read the catalog cap + eligible-artist list in a short session, then CLOSE
@@ -209,7 +210,7 @@ def run_album_ingest(
     counters["tracked_swept"] = len(tracked_artists)
     tracked_ids = {e[1] for e in tracked_artists}
     merged = tracked_artists + [e for e in bucketed if e[1] not in tracked_ids]
-    sweep = [(spotify_id, artist_id, watch) for spotify_id, artist_id, watch, _tracked in merged]
+    sweep = merged
     counters["swept"] = len(sweep)
 
     # Slow external discovery loop — no DB session held open here.
@@ -217,18 +218,26 @@ def run_album_ingest(
     win_lo = today - timedelta(days=settings.RELEASE_CONFIRM_LOOKBACK_DAYS)
     win_hi = today + timedelta(days=settings.RELEASE_POLL_HORIZON_DAYS)
     fresh_ids: List[str] = []
+    # Measurement only (owner 2026-10-17, release-day auto-ingest decision
+    # deferred): novel tracked-artist releases inside the confirm window that
+    # the ALBUM_POP_MIN gate holds back are counted and logged, never enqueued.
+    tracked_recent: set = set()
     confirm_candidates: List[Dict[str, Any]] = []
-    for artist_sid, artist_id, watch in sweep:
+    for artist_sid, artist_id, watch, tracked in sweep:
         items = catalog_client.get_artist_albums(
             artist_sid, include_groups="album,single" if watch else "album"
         )
         counters["discovered"] += len(items)
         for alb in items:
-            if _release_date_key(alb.get("release_date", "")) >= since and alb.get("id"):
+            key = _release_date_key(alb.get("release_date", ""))
+            if key >= since and alb.get("id"):
                 fresh_ids.append(alb["id"])
+                if tracked and win_lo.isoformat() <= key <= today.isoformat():
+                    tracked_recent.add(alb["id"])
             if watch:
                 cand = _confirm_candidate(artist_id, alb, win_lo, win_hi)
                 if cand:
+                    cand["tracked"] = tracked
                     confirm_candidates.append(cand)
     # collab albums can surface under several swept artists in one tick
     fresh_ids = list(dict.fromkeys(fresh_ids))
@@ -259,6 +268,17 @@ def run_album_ingest(
             if a and a.get("id") and (a.get("popularity") or 0) >= settings.ALBUM_POP_MIN
         ]
     counters["passed_gate"] = len(passed)
+    tracked_held = sorted(
+        i for i in novel_ids
+        if i in tracked_recent and pop_by_id.get(i, 0) < settings.ALBUM_POP_MIN
+    )
+    counters["tracked_enqueue_gate_skipped"] = len(tracked_held)
+    if tracked_held:
+        logger.warning(
+            "album_ingest: tracked release below ALBUM_POP_MIN=%d, not enqueued: %s",
+            settings.ALBUM_POP_MIN,
+            " ".join(f"{i}:pop={pop_by_id.get(i, 0)}" for i in tracked_held),
+        )
 
     to_enqueue = passed[: settings.MAX_ENQUEUE_PER_TICK]
     if to_enqueue:
@@ -283,9 +303,8 @@ def run_album_ingest(
                 if a and a.get("id"):
                     pop_by_id[a["id"]] = a.get("popularity") or 0
         for c in confirm_candidates:
-            c["passes_gate"] = (
-                pop_by_id.get(c["spotify_album_id"], 0) >= settings.ALBUM_POP_MIN
-            )
+            c["popularity"] = pop_by_id.get(c["spotify_album_id"], 0)
+            c["passes_gate"] = c["popularity"] >= settings.ALBUM_POP_MIN
 
     # Step-5 release-day confirm (DB-only; external loop already over).
     confirm_release_events(session_factory, confirm_candidates, counters)
@@ -299,6 +318,8 @@ def run_album_ingest(
         "confirm_flipped=%(confirm_flipped)d "
         "confirm_inserted=%(confirm_inserted)d "
         "confirm_gate_skipped=%(confirm_gate_skipped)d "
+        "tracked_enqueue_gate_skipped=%(tracked_enqueue_gate_skipped)d "
+        "tracked_confirm_gate_skipped=%(tracked_confirm_gate_skipped)d "
         "classical_excluded=%(classical_excluded)d "
         "classical_holdout=%(classical_holdout)d",
         counters,

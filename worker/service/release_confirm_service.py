@@ -180,6 +180,16 @@ def confirm_release_events(
             counters["confirm_gate_skipped"] = (
                 counters.get("confirm_gate_skipped", 0) + 1
             )
+            if cand.get("tracked"):
+                counters["tracked_confirm_gate_skipped"] = (
+                    counters.get("tracked_confirm_gate_skipped", 0) + 1
+                )
+                logger.warning(
+                    "release_confirm: tracked release below gate, not inserted: "
+                    "%s:pop=%s date=%s",
+                    cand["spotify_album_id"], cand.get("popularity"),
+                    cand["release_date"],
+                )
         else:
             inserts.append(
                 {
