@@ -359,35 +359,122 @@ def _load_secrets(param: str) -> dict:
         raise
 
 
+# --- Required-secret contract for the /myblog/worker SecureString ------------
+#
+# Derived from the runtime call sites, not from what the parameter happens to
+# contain today. This sweep ports myblog_backend's *mechanism*; it deliberately
+# does NOT widen the set, which is the one this service already enforced. The
+# required/optional split matters more here than in the other two services: this
+# Lambda hosts many independent scheduled jobs, so requiring a key that gates
+# ONE job would take every other job down at import time.
+#
+# DATABASE_URL — every job reads or writes the catalog; absence is a total
+#   outage of the worker.
+# SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET — the client-credentials mint used
+#   by album ingest, artist enrich, the release sweep and the SQS album-sync
+#   consumer, i.e. the worker's primary reason to exist.
+#
+# LASTFM_API_KEY and GENIUS_ACCESS_TOKEN are OPTIONAL on purpose: each gates a
+# single job that no-ops when unset (the Last.fm poll, the Genius annotation
+# fetch). They must never join the required set — the comments on their Settings
+# fields say so, and this is where that promise is actually kept.
+# SPOTIFY_SECRETS_PARAM points at a *different* parameter (/myblog/spotify),
+# read on demand per job rather than at boot.
+REQUIRED_SECRET_KEYS: tuple[str, ...] = (
+    "DATABASE_URL",
+    "SPOTIFY_CLIENT_ID",
+    "SPOTIFY_CLIENT_SECRET",
+)
+OPTIONAL_SECRET_KEYS: tuple[str, ...] = ("LASTFM_API_KEY", "GENIUS_ACCESS_TOKEN")
+
+
+def _present(value: object) -> bool:
+    """True when `value` is a usable secret string.
+
+    A key written as `null`, `""`, or `"   "` is as absent as a key that is not
+    there at all — SSM parameters are hand-edited JSON and all three shapes have
+    a plausible way of happening. Non-strings are rejected rather than coerced:
+    every field these feed is typed `str`, and this model does not set
+    `validate_assignment`, so a JSON number assigned here would sit in a `str`
+    field until some caller concatenated it and raised somewhere unrelated.
+
+    The predicate is the same one ``myblog_backend`` and ``myblog_music`` apply;
+    the prose around it is per-service, so compare the ``return``, not the text.
+    """
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _apply_secrets(s: Settings, secrets: object, param: str) -> None:
+    """Copy the loaded secret payload onto `s`, failing closed on a missing key.
+
+    Presence is decided from the PAYLOAD, never from the resulting attribute.
+    The `if not s.DATABASE_URL` formulation this replaced asked the wrong
+    question in three ways, each demonstrated against this loader's twin rather
+    than inferred:
+
+    - `{"DATABASE_URL": "   "}` is truthy, so it was copied over and then passed
+      the check — the process booted holding a whitespace DSN.
+    - `{"SPOTIFY_CLIENT_ID": 12345}` is truthy too, and with no
+      `validate_assignment` on this model the `int` was stored verbatim in a
+      `str` field.
+    - A Lambda **env var** left behind under the same name satisfied the check
+      for a key the parameter never supplied. Dormant today
+      (`blogWorkerLambda` carries no such variable) but it is a hole that opens
+      silently.
+
+    Values are assigned verbatim. Whitespace is used to judge presence but never
+    stripped: these are compared byte-for-byte by the services that consume them
+    (Spotify rejects a trimmed secret; a DSN is no safer to rewrite silently).
+
+    Raises ValueError naming the parameter and the missing KEYS. No secret value
+    is included, and none is logged.
+    """
+    if not isinstance(secrets, dict):
+        raise ValueError(
+            f"{param} must hold a JSON object of secret keys; parsed as "
+            f"{type(secrets).__name__}. Fix the SecureString value."
+        )
+
+    missing = [k for k in REQUIRED_SECRET_KEYS if not _present(secrets.get(k))]
+    if missing:
+        raise ValueError(
+            f"Required secrets missing from {param}: {sorted(missing)}. "
+            "The parameter was read and parsed as JSON, so this is not an SSM or "
+            "IAM failure — these keys are absent, empty, or not strings. The "
+            "process refuses to start rather than serve on defaults: every job "
+            "in this Lambda reads the catalog, and the Spotify credentials mint "
+            "the client-credentials token ingest, enrich and album-sync need."
+        )
+
+    for key in OPTIONAL_SECRET_KEYS:
+        if not _present(secrets.get(key)):
+            logger.warning(
+                "%s has no usable %s; boot continues by design (this key is "
+                "optional — requiring it would take every other job in this "
+                "Lambda down for one integration). The job it gates no-ops "
+                "while it is absent.",
+                param,
+                key,
+            )
+
+    s.DATABASE_URL = secrets["DATABASE_URL"]
+    s.SPOTIFY_CLIENT_ID = secrets["SPOTIFY_CLIENT_ID"]
+    s.SPOTIFY_CLIENT_SECRET = secrets["SPOTIFY_CLIENT_SECRET"]
+    for key in OPTIONAL_SECRET_KEYS:
+        if _present(secrets.get(key)):
+            setattr(s, key, secrets[key])
+
+
 @lru_cache
 def get_settings() -> Settings:
     s = Settings()
+
+    # Gated on SECRETS_PARAM, which only a deployed environment sets
+    # (infra/lambda.tf). Local dev and the test suite leave it empty, take no
+    # SSM call, and are unaffected by the required-key contract above.
     if s.SECRETS_PARAM:
-        secrets = _load_secrets(s.SECRETS_PARAM)
-        if secrets.get("DATABASE_URL"):
-            s.DATABASE_URL = secrets["DATABASE_URL"]
-        if secrets.get("SPOTIFY_CLIENT_ID"):
-            s.SPOTIFY_CLIENT_ID = secrets["SPOTIFY_CLIENT_ID"]
-        if secrets.get("SPOTIFY_CLIENT_SECRET"):
-            s.SPOTIFY_CLIENT_SECRET = secrets["SPOTIFY_CLIENT_SECRET"]
-        # Last.fm key is OPTIONAL — absent ⇒ the poll no-ops; do NOT add to `missing`.
-        if secrets.get("LASTFM_API_KEY"):
-            s.LASTFM_API_KEY = secrets["LASTFM_API_KEY"]
-        # Genius token is OPTIONAL on the same terms — absent ⇒ the fetch job
-        # no-ops. It must never join `missing`, or every other job in this Lambda
-        # dies at import time because one optional integration is unconfigured.
-        if secrets.get("GENIUS_ACCESS_TOKEN"):
-            s.GENIUS_ACCESS_TOKEN = secrets["GENIUS_ACCESS_TOKEN"]
-        missing = [k for k, v in {
-            "DATABASE_URL": s.DATABASE_URL,
-            "SPOTIFY_CLIENT_ID": s.SPOTIFY_CLIENT_ID,
-            "SPOTIFY_CLIENT_SECRET": s.SPOTIFY_CLIENT_SECRET,
-        }.items() if not v]
-        if missing:
-            raise ValueError(
-                f"Required secrets missing after SSM load: {missing}. "
-                f"Check the {s.SECRETS_PARAM} SecureString and the Lambda role's ssm:GetParameter policy."
-            )
+        _apply_secrets(s, _load_secrets(s.SECRETS_PARAM), s.SECRETS_PARAM)
+
     # Loaded separately and NOT required — see YOUTUBE_SECRETS_PARAM above. The
     # failure is logged and swallowed, which is correct HERE and nowhere else in
     # this function, because the fallback state is "the YouTube job refuses to
