@@ -612,12 +612,14 @@ def _handle(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         _run_saved_tracks_sync(mode)
         return {}
 
-    # EventBridge/SQS trigger — ISRC backfill (FEAT-lyrics-corpus Step 1b).
+    # EventBridge weekly cron or direct invoke — ISRC backfill (FEAT-lyrics-corpus Step 1b).
+    # No SQS route: the Records loop has no isrc_backfill branch, so a blogSQS
+    # {"job":"isrc_backfill"} message is logged as unknown and dropped.
     # Bounded backfill: fetch tracks without an ISRC and without a prior attempt, enrich
     # from Spotify, write the ISRC to tracks.isrc or a miss marker to ext_refs.isrc_status.
     if event.get("job") == "isrc_backfill":
         limit = event.get("limit")  # None ⇒ settings.ISRC_BACKFILL_BATCH_LIMIT
-        logger.info("EventBridge/SQS trigger: running ISRC backfill (limit=%s)", limit)
+        logger.info("EventBridge trigger: running ISRC backfill (limit=%s)", limit)
         _run_isrc_backfill(limit=limit)
         return {}
 
