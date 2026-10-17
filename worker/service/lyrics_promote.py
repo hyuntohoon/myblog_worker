@@ -38,6 +38,7 @@ from worker.service.lyrics_matcher import (
     duration_matches,
     exact_base_equal,
     extract_version_tokens,
+    timing_ok_flags,
     plain_base_title,
 )
 
@@ -178,14 +179,16 @@ def promote_best(
     # tier-1 candidates share. Then richest lyric (synced > plain); duration gap
     # then id only make the pick deterministic among same-song duplicate uploads —
     # they are NOT the gated tier-2/4 promotion criteria.
-    shingles = {id(c): content_shingles(c) for c in tier1}
-    support = {
-        id(c): sum(
-            1 for o in tier1
-            if o is c or content_similarity(shingles[id(c)], shingles[id(o)]) >= CONTENT_AGREE_THRESHOLD
-        )
-        for c in tier1
-    }
+    shingles = [content_shingles(c) for c in tier1]
+    peers = [
+        [j for j in range(len(tier1))
+         if j == i or content_similarity(shingles[i], shingles[j]) >= CONTENT_AGREE_THRESHOLD]
+        for i in range(len(tier1))
+    ]
+    support = {id(c): len(peers[i]) for i, c in enumerate(tier1)}
+    # Then a sync that fits the track among same-support bodies (Step 4), as in
+    # decide_match's representative.
+    timing = {id(c): ok for c, ok in zip(tier1, timing_ok_flags(tier1, duration_sec, peers))}
 
     def _rank(c: Candidate):
         gap = (
@@ -193,8 +196,8 @@ def promote_best(
             if duration_sec is not None and c.duration_sec is not None
             else float("inf")
         )
-        return (-support[id(c)], not bool(c.synced_lyrics), not bool(c.plain_lyrics),
-                gap, str(c.id))
+        return (-support[id(c)], not timing[id(c)], not bool(c.synced_lyrics),
+                not bool(c.plain_lyrics), gap, str(c.id))
 
     chosen = sorted(tier1, key=_rank)[0]
     cand_tokens = extract_version_tokens(chosen.title)

@@ -460,6 +460,33 @@ def _run_lyrics_pick(track_id: str | None, lrclib_id, actor: str | None) -> None
         LyricsPickService(session).pick(track_id, lrclib_id, actor)
 
 
+def _run_lyrics_suspicion_sweep(
+    shadow: bool = True, limit: int | None = None, track_ids: List[str] | None = None,
+) -> None:
+    """Suspicion sweep (FEAT-lyrics-match-correction Step 4). Re-checks matched rows whose
+    sync overruns or ends early, fixes the ones a same-words upload with a fitting sync can
+    replace, and opens system reports on the owner's queue for the rest (plus the
+    shared-lrclib-id tripwire). Manual SQS job, no schedule. Shadow unless the message says
+    ``"shadow": false`` (shadow writes nothing and logs the would-be fixes/reports);
+    optional "limit" and "track_ids" (narrow the pass to those tracks)."""
+    from worker.service.lyrics_suspicion_service import LyricsSuspicionService
+
+    # A hand-written message: refuse a malformed one loudly instead of half-running it
+    # (a string "track_ids" would iterate as characters, a negative "limit" would slice).
+    if track_ids is not None and (
+        not isinstance(track_ids, list) or not all(isinstance(t, str) for t in track_ids)
+    ):
+        raise ValueError("lyrics_suspicion_sweep: track_ids must be a list of uuid strings")
+    if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 0):
+        raise ValueError("lyrics_suspicion_sweep: limit must be a non-negative integer")
+
+    with SessionLocal() as session:
+        metrics = LyricsSuspicionService(session).sweep(
+            shadow=shadow, limit=limit, track_ids=track_ids,
+        )
+        logger.info("Lyrics suspicion sweep metrics: %s", metrics)
+
+
 def _run_lyrics_demand_source(
     limit: int | None = None, job_limit: int | None = None
 ) -> None:
@@ -659,6 +686,15 @@ def _handle(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         )
         return {}
 
+    # Manual trigger — the Step 4 suspicion sweep (FEAT-lyrics-match-correction). Shadow
+    # unless "shadow" is literally false; optional "limit".
+    if event.get("job") == "lyrics_suspicion_sweep":
+        _run_lyrics_suspicion_sweep(
+            shadow=event.get("shadow") is not False, limit=event.get("limit"),
+            track_ids=event.get("track_ids"),
+        )
+        return {}
+
     # EventBridge/SQS trigger — targeted source collection for V57 album demand
     # (FEAT-lyrics-listening-experience Step 3). Constant input
     # {"job":"lyrics_demand_source"}; optional "limit"/"job_limit" override the settings.
@@ -799,6 +835,15 @@ def _handle(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             # by the automation pause — it is an owner action, not a background producer.
             if body.get("job") == "lyrics_pick":
                 _run_lyrics_pick(body.get("track_id"), body.get("lrclib_id"), body.get("actor"))
+                continue
+
+            # Step 4 suspicion sweep (FEAT-lyrics-match-correction): one manual SQS message.
+            # Shadow unless "shadow" is literally false.
+            if body.get("job") == "lyrics_suspicion_sweep":
+                _run_lyrics_suspicion_sweep(
+                    shadow=body.get("shadow") is not False, limit=body.get("limit"),
+                    track_ids=body.get("track_ids"),
+                )
                 continue
 
             if body.get("job") == "lyrics_demand_source":
