@@ -242,6 +242,25 @@ def test_handler_expedite_forwards_zero_cooldown(mock_reassess):
     )
 
 
+# ── FEAT-lyrics-match-correction Step 4: suspicion sweep routing ─────────────────
+
+@pytest.mark.unit
+@pytest.mark.parametrize("message,shadow", [
+    ({}, True),  # shadow unless asked otherwise
+    ({"shadow": "false"}, True),  # only the literal false turns it off
+    ({"shadow": False}, False),
+])
+@patch("worker.handler._run_lyrics_suspicion_sweep")
+def test_handler_suspicion_sweep_is_shadow_unless_false(mock_sweep, message, shadow):
+    body = {"job": "lyrics_suspicion_sweep", "limit": 5, "track_ids": ["t1"], **message}
+    lambda_handler({"Records": [{"body": json.dumps(body)}]}, None)
+    mock_sweep.assert_called_once_with(shadow=shadow, limit=5, track_ids=["t1"])
+
+    mock_sweep.reset_mock()
+    assert lambda_handler(body, None) == {}
+    mock_sweep.assert_called_once_with(shadow=shadow, limit=5, track_ids=["t1"])
+
+
 # --------------------------------------------------------------------------
 # Near-real-time lyrics chaining (album sync → SQS {"job":"lyrics_incremental"})
 # --------------------------------------------------------------------------
@@ -578,3 +597,13 @@ def test_a_negative_hop_counter_cannot_disable_the_loop_bound(
         _run_discography_enumeration(hops=-1_000_000)
         # Clamped to 0, so 0 + 1 < 1 is false and the chain stops here.
         enqueue.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bad", [{"track_ids": "abc"}, {"track_ids": [1]}, {"limit": -1}, {"limit": "5"}])
+def test_handler_suspicion_sweep_refuses_a_malformed_message(bad):
+    from worker.handler import _run_lyrics_suspicion_sweep
+    with pytest.raises(ValueError):
+        _run_lyrics_suspicion_sweep(
+            shadow=True, limit=bad.get("limit"), track_ids=bad.get("track_ids"),
+        )

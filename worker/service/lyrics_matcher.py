@@ -295,6 +295,79 @@ def content_similarity(a: Optional[frozenset], b: Optional[frozenset]) -> float:
     return len(a & b) / min(len(a), len(b))
 
 
+# Sync timing (FEAT-lyrics-match-correction Step 4). Measured on prod 2026-10-17: of the
+# synced rows whose last LRC timestamp runs past the track (> duration + 5 s) or stops
+# before 40 % of it, about a third serve the right words with a sync from another upload
+# while a same-words upload whose sync fits the track exists (4/13 and 5/13 determinable;
+# content-wrong 0/26). The rest share their timing with every same-words upload (an
+# interlude, a long outro): that timing is the recording's, not an error. A fitting sync
+# ranks right after content support, so it only chooses among bodies with the same words.
+TIMING_OVERRUN_SEC = 5.0
+TIMING_EARLY_END_FRACTION = 0.4
+# A fitting sync must not be a stub: a three-line upload ending at 1:30 fits a 3-minute
+# track too. It needs at least half the words and half the timed lines of the fullest
+# upload sharing its body.
+TIMING_PEER_FRACTION = 0.5
+
+_LRC_TIMESTAMP_VALUE_RE = re.compile(r"\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]")
+
+
+def lrc_timestamps(synced_lyrics: Optional[str]) -> List[float]:
+    """Every LRC timestamp of a synced body, in seconds, in file order."""
+    out: List[float] = []
+    for minutes, seconds, fraction in _LRC_TIMESTAMP_VALUE_RE.findall(synced_lyrics or ""):
+        value = int(minutes) * 60 + int(seconds)
+        if fraction:
+            value += int(fraction) / (10 ** len(fraction))
+        out.append(float(value))
+    return out
+
+
+def timing_signal(synced_lyrics: Optional[str], duration_sec: Optional[float]) -> Optional[str]:
+    """``duration_overrun`` / ``early_end`` when the sync does not fit the track, else None.
+
+    None also when there is nothing to judge (no synced body, no track duration)."""
+    stamps = lrc_timestamps(synced_lyrics)
+    if not stamps or duration_sec is None:
+        return None
+    last = max(stamps)
+    if last > float(duration_sec) + TIMING_OVERRUN_SEC:
+        return "duration_overrun"
+    if last < TIMING_EARLY_END_FRACTION * float(duration_sec):
+        return "early_end"
+    return None
+
+
+def sync_fits(synced_lyrics: Optional[str], duration_sec: Optional[float]) -> Optional[bool]:
+    """True / False when a synced body can be judged against the track, None otherwise."""
+    if not lrc_timestamps(synced_lyrics) or duration_sec is None:
+        return None
+    return timing_signal(synced_lyrics, duration_sec) is None
+
+
+def timing_ok_flags(
+    cands: List["Candidate"], duration_sec: Optional[float], peers: List[List[int]]
+) -> List[bool]:
+    """Per candidate: its sync fits the track and it is not a stub of its body.
+
+    ``peers[i]`` lists the candidates sharing ``cands[i]``'s body (``i`` included); the
+    caller decides what "sharing" means (the matcher also requires the same version
+    stance). Pure."""
+    shingles = [content_shingles(c) for c in cands]
+    stamps = [len(lrc_timestamps(c.synced_lyrics)) for c in cands]
+    out: List[bool] = []
+    for i, cand in enumerate(cands):
+        if not sync_fits(cand.synced_lyrics, duration_sec):
+            out.append(False)
+            continue
+        words = len(shingles[i] or ())
+        most_words = max(len(shingles[j] or ()) for j in peers[i])
+        most_stamps = max(stamps[j] for j in peers[i])
+        out.append(words >= TIMING_PEER_FRACTION * most_words
+                   and stamps[i] >= TIMING_PEER_FRACTION * most_stamps)
+    return out
+
+
 _ARTICLE_NOISE = {"the", "a", "an"}
 
 
@@ -525,26 +598,32 @@ def decide_match(
     def _agrees(cand: Candidate) -> bool:
         return not (extract_version_tokens(cand.title) ^ track_tokens)
 
-    def _support(entries: List[tuple]) -> Dict[int, int]:
-        """Per entry: how many same-stance candidates (itself included) share its body."""
+    def _peers(entries: List[tuple]) -> List[List[int]]:
+        """Per entry: the same-stance candidates (itself included) that share its body."""
         shingles = [content_shingles(e[0]) for e in entries]
         stance = [_agrees(e[0]) for e in entries]
-        out: Dict[int, int] = {}
-        for i, si in enumerate(shingles):
-            out[i] = 0 if si is None else sum(
-                1 for j, sj in enumerate(shingles)
+        return [
+            [] if si is None else [
+                j for j, sj in enumerate(shingles)
                 if sj is not None and stance[j] == stance[i]
                 and (i == j or content_similarity(si, sj) >= CONTENT_AGREE_THRESHOLD)
-            )
-        return out
+            ]
+            for i, si in enumerate(shingles)
+        ]
 
     def _representative(entries: List[tuple]) -> tuple:
-        support = _support(entries)
+        peers = _peers(entries)
+        support = {i: len(p) for i, p in enumerate(peers)}
+        # Step 4: among same-support bodies, one whose sync fits the track. Only after
+        # support, so it never trades the agreed words for a better clock.
+        timing = timing_ok_flags(
+            [e[0] for e in entries], duration_sec, [p or [i] for i, p in enumerate(peers)]
+        )
 
         def _key(i: int):
             cand, kind = entries[i][0], entries[i][1]
             full_equal = plain_base_title(cand.title) == plain_track
-            return (_agrees(cand), support[i], kind == "exact", full_equal,
+            return (_agrees(cand), support[i], timing[i], kind == "exact", full_equal,
                     bool(cand.synced_lyrics), bool(cand.plain_lyrics))
         best = sorted(range(len(entries)), key=_key, reverse=True)[0]
         peers_with_body = sum(

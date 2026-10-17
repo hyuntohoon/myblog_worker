@@ -68,12 +68,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: hyuntohoon/myblog_shared_db
-          # FEAT-automation-admin 3c: runtime and canonical schema both pin V62
-          # (automation_control_events run-now stamps). This ref is a SECOND copy of the pin in requirements.txt and
+          # FEAT-lyrics-match-correction Step 4: runtime and canonical schema both pin V64
+          # (track_lyrics_reports, for the suspicion sweep). This ref is a SECOND copy of the pin in requirements.txt and
           # must move with it — a bump that touches only the lock leaves CI loading a
           # schema without the new tables, which fails as "relation does not exist" and
           # reads like a missing migration rather than a stale workflow.
-          ref: b5d0670dc2cc54e4fa6d2393659de6eb4fce31dd
+          ref: 3b5770609199ed3f0c0682896c521abdb5f0c927
           token: ${{ secrets.SHARED_DB_PAT }}
           persist-credentials: false
           path: shared-db-schema
