@@ -607,3 +607,37 @@ def test_handler_suspicion_sweep_refuses_a_malformed_message(bad):
         _run_lyrics_suspicion_sweep(
             shadow=True, limit=bad.get("limit"), track_ids=bad.get("track_ids"),
         )
+
+
+@pytest.mark.unit
+def test_worker_info_reaches_the_root_handler_but_third_party_info_does_not():
+    """The Lambda runtime leaves the root at WARNING. Our own INFO must still reach its
+    handler (the Step 5 follow/refresh metrics are INFO), while httpx's INFO — which
+    carries `request.url`, query-string credentials included — must not."""
+    import logging
+
+    import worker.handler  # noqa: F401 — import applies the level
+
+    class _Capture(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    root = logging.getLogger()
+    capture = _Capture()
+    saved_level = root.level
+    root.addHandler(capture)
+    root.setLevel(logging.WARNING)
+    try:
+        logging.getLogger("worker.service.lyrics_discography_service").info("ours")
+        logging.getLogger("httpx").info("GET https://example.test/?api_key=SECRET")
+    finally:
+        root.removeHandler(capture)
+        root.setLevel(saved_level)
+
+    messages = [r.getMessage() for r in capture.records]
+    assert "ours" in messages
+    assert not any("api_key" in m for m in messages)
