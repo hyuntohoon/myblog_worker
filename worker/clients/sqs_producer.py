@@ -152,13 +152,7 @@ def enqueue_backcatalogue_ingest() -> bool:
         logger.info("SQS_QUEUE_URL unset; skipping back-catalogue ingest enqueue")
         return False
 
-    import boto3
-
-    sqs = boto3.client(
-        "sqs",
-        region_name=settings.AWS_DEFAULT_REGION,
-        endpoint_url=(settings.LOCALSTACK_ENDPOINT or None),
-    )
+    sqs = _sqs()
     sqs.send_message(
         QueueUrl=settings.SQS_QUEUE_URL,
         MessageBody=json.dumps({"job": "lyrics_backcatalogue_ingest"}),
