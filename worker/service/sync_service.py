@@ -97,6 +97,18 @@ class AlbumSyncService:
 
         # 1) 앨범 배치 조회 — runs BEFORE any session is opened.
         albums: List[Dict[str, Any]] = spotify.get_albums(album_ids, market=mkt)
+        self.sync_fetched_albums(albums)
+
+    def sync_fetched_albums(self, albums: List[Dict[str, Any]]) -> None:
+        """Steps 2-5 for a payload the caller has ALREADY read from GET /albums.
+
+        The back-catalogue ingest has to read each album to see its popularity before it
+        knows whether to keep it, and that response is the same object this method needs.
+        Going through `sync_albums_batch` would read every kept album a second time out of
+        a quota this project cannot replace.
+        """
+        if not albums:
+            return
 
         # 2) 데이터 수집 (순수 계산, DB 접속 없음)
         collected = self._collect(albums)

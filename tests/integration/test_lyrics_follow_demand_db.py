@@ -38,6 +38,7 @@ from worker.clients.spotify_member_client import (
 from worker.service.lyrics_discography_service import (
     ELIGIBLE_GROUPS,
     due_count,
+    refresh_due_count,
     reopen_stale_discographies,
     run_discography_enumeration,
 )
@@ -1227,3 +1228,69 @@ def test_the_due_count_agrees_with_what_a_run_will_claim(factory, members):
     _make_due(factory, art)
     assert due_count(factory) == baseline + 1
     assert art in _read_artists(factory, art)
+
+
+# ---------------------------------------------------------------------------
+# OPS-project-stabilization Step 2C — the refresh has to be reachable.
+#
+# `_REOPEN_STALE` runs only inside the enumeration job, and the job is started only by
+# the nudge. The nudge used to ask `due_count` alone, which is zero exactly when every
+# registration is complete — so in steady state nothing was ever re-opened, and
+# production sat at 34/34 complete for twelve days. `refresh_due_count` is the question
+# the nudge was missing.
+# ---------------------------------------------------------------------------
+
+def test_the_refresh_count_agrees_with_what_the_refresh_will_re_open(factory, members):
+    """Baseline first, for the reason given on the due-count test above."""
+    a = members["a"]
+    stale, fresh, nobody = (_sid(members, n) for n in ("rstale", "rfresh", "rnobody"))
+    for sid in (stale, fresh):
+        _manual_edge(factory, a, _catalog_artist(factory, sid))
+    _catalog_artist(factory, nobody)
+    baseline = refresh_due_count(factory, 24)
+    for sid in (stale, fresh, nobody):
+        _enumerated(factory, sid, [])
+    _settled(factory, stale, hours_ago=48)
+    _settled(factory, fresh, hours_ago=1)
+    _settled(factory, nobody, hours_ago=48)
+
+    assert stale not in _read_artists(factory, stale), \
+        "the defect's precondition: complete and stale is NOT due"
+    assert refresh_due_count(factory, 24) == baseline + 1, \
+        "only the stale artist somebody still follows; not the fresh one, not the unfollowed one"
+    assert refresh_due_count(factory, 0) == 0, "a disabled refresh asks for nothing"
+
+    assert reopen_stale_discographies(factory, 24) == baseline + 1
+    assert refresh_due_count(factory, 24) == 0, "re-opened rows are due, not stale: one tick"
+    assert not _is_complete(factory, stale)
+    assert _is_complete(factory, fresh) and _is_complete(factory, nobody)
+
+
+def test_all_complete_and_stale_with_no_new_follow_starts_a_refresh(factory, members):
+    """The cycle, end to end through the handler's own wiring: poll nudge -> message ->
+    enumeration job -> the stale discography is re-read. Nobody follows anyone new."""
+    from unittest.mock import patch
+
+    from worker import handler
+
+    a = members["a"]
+    art = _sid(members, "cycle")
+    _manual_edge(factory, a, _catalog_artist(factory, art))
+    _enumerated(factory, art, [])
+    _settled(factory, art, hours_ago=48)
+    catalog = _PagingCatalog({art: _album_objs(_sid(members, "cyclealb"), 1)})
+    sent = []
+
+    with patch.object(handler, "SessionLocal", factory), \
+         patch.object(handler, "spotify", catalog), \
+         patch("worker.clients.sqs_producer.enqueue_discography_enumeration",
+               side_effect=lambda **kw: sent.append(kw) or True):
+        handler._nudge_discography_enumeration()
+        assert len(sent) == 1, "the nudge must fire on a due refresh alone"
+        handler._run_discography_enumeration(hops=0)
+        nudges_after = len(sent)
+        handler._nudge_discography_enumeration()
+
+    assert (art, "album,single", 0) in catalog.calls, "the stale discography was re-read"
+    assert _is_complete(factory, art) and _albums_kept(factory, art) == 1
+    assert len(sent) == nudges_after, "and once refreshed, the next tick enqueues nothing"

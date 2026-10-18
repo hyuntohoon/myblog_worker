@@ -253,14 +253,36 @@ _DEFER = text(
 # Fenced on `_CONSUMED`, because THIS is the statement that turned a stale registration
 # into recurring provider traffic: it re-opened every completed artist on a timer with no
 # reference to whether anybody still followed them.
+_STALE = """
+           dd.complete
+       AND (dd.last_complete_at IS NULL
+            OR dd.last_complete_at < now() - CAST(:age AS interval))
+       AND """ + _CONSUMED.format(d="dd").strip() + """
+"""
+
 _REOPEN_STALE = text(
     """
     UPDATE lyrics_artist_discographies dd
        SET complete = false, next_offset = 0, next_attempt_at = NULL, updated_at = now()
-     WHERE dd.complete
-       AND (dd.last_complete_at IS NULL
-            OR dd.last_complete_at < now() - CAST(:age AS interval))
-       AND """ + _CONSUMED.format(d="dd").strip() + """
+     WHERE """ + _STALE.strip() + """
+    """
+)
+
+# What `_REOPEN_STALE` WOULD re-open, without re-opening it. The nudge asks this, and it
+# is the same predicate by construction for the reason `_COUNT_DUE` mirrors `_SELECT_DUE`:
+# a looser count enqueues a run every 15 minutes that re-opens nothing.
+#
+# It exists because the refresh used to be unreachable in steady state. `_REOPEN_STALE`
+# runs only inside the enumeration job, the job is started only by the nudge, and the
+# nudge asked `_COUNT_DUE` alone — which is zero exactly when every registration is
+# complete. So once the first pass finished, nothing was due, nothing was enqueued, and
+# nothing was ever re-opened; only a member following a NEW artist broke the cycle, and
+# that run then re-opened every stale row at once, which is why the refresh had ever
+# appeared to work. Production sat at 34/34 complete from 2026-09-19 to 2026-10-01.
+_COUNT_STALE = text(
+    """
+    SELECT count(*) FROM lyrics_artist_discographies dd
+     WHERE """ + _STALE.strip() + """
     """
 )
 
@@ -314,6 +336,23 @@ def reopen_stale_discographies(session_factory: Callable[[], Any], max_age_hours
         )
         session.commit()
     return result.rowcount or 0
+
+
+def refresh_due_count(session_factory: Callable[[], Any], max_age_hours: int) -> int:
+    """How many completed discographies `reopen_stale_discographies` would re-open now.
+
+    Read-only, and disabled by the same non-positive age that disables the refresh, so
+    turning the refresh off also stops the nudge asking for it.
+    """
+    if max_age_hours <= 0:
+        return 0
+    with session_factory() as session:
+        return int(
+            session.execute(
+                _COUNT_STALE,
+                {"age": f"{int(max_age_hours)} hours", "follow": FOLLOW_ORIGIN},
+            ).scalar_one()
+        )
 
 
 def due_count(session_factory: Callable[[], Any]) -> int:
