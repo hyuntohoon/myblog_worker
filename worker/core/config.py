@@ -13,6 +13,15 @@ class Settings(BaseSettings):
     # App / Env
     APP_NAME: str = "music-backend"
     ENV: str = "local"
+    # Level for this package's own loggers (`worker.*`) only. The Lambda runtime leaves the
+    # root at WARNING, so before this every `logger.info` here was dropped — including the
+    # member poll's follow summary and the discography refresh/enumeration metrics, which
+    # left Step 5 unobservable in CloudWatch (FEAT-lyrics-listening-experience smoke,
+    # 2026-10-18). Third-party loggers deliberately stay at the root's WARNING: httpx logs
+    # `request.url` at INFO, so lowering the root would put any query-string credential
+    # (Last.fm's `api_key`) into CloudWatch. Set to WARNING in the Lambda env to revert
+    # without a deploy.
+    WORKER_LOG_LEVEL: str = "INFO"
 
     DATABASE_URL: str = ""
 

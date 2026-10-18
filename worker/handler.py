@@ -18,6 +18,8 @@ from worker.service.sync_service import AlbumSyncService, generate_and_save_alia
 from worker.service.listening_sync_service import run_listening_sync
 
 logger = logging.getLogger(__name__)
+# Our own namespace only, never the root — see `Settings.WORKER_LOG_LEVEL`.
+logging.getLogger("worker").setLevel(settings.WORKER_LOG_LEVEL.upper())
 
 
 def _run_listening_sync(is_manual_refresh: bool = False) -> None:
