@@ -99,33 +99,99 @@ def _run_spotify_member_poll() -> None:
         max_users=settings.SPOTIFY_MEMBER_MAX_USERS_PER_TICK,
     )
     _nudge_discography_enumeration()
+    _nudge_backcatalogue_ingest()
 
 
 def _nudge_discography_enumeration() -> None:
-    """Start an enumeration run if, and only if, artists are actually due.
+    """Start an enumeration run if, and only if, there is something for it to read.
 
-    Skipping the enqueue when nothing is due is what keeps the steady state free — most
-    15-minute ticks have nothing to enumerate, because a member's follows change far less
-    often than the poll runs. The count is NOT a single index probe: `_COUNT_DUE` carries
-    the same consumer fence as `_SELECT_DUE` (it has to, or this would enqueue work the
-    run then declines), so it is a scan of the registration table with two anti-joins —
-    cheap at the current scale and worth measuring before the table grows. Never allowed
-    to fail the poll: enumeration is recoverable work and the next tick asks again.
+    Two things qualify: artists that owe pages (`due_count`), and completed discographies
+    whose refresh has come due (`refresh_due_count`). The second is not an optimisation, it
+    is what makes the refresh reachable at all — the run is the only thing that re-opens a
+    stale discography, and asking `due_count` alone meant that once every registration was
+    complete nothing was ever due, so nothing was ever enqueued to re-open them
+    (OPS-project-stabilization finding 3). The run re-opens them first, after which they
+    are simply due, so this arm is true for one tick per refresh interval and not again.
+
+    Skipping the enqueue when neither holds is what keeps the steady state free — most
+    15-minute ticks have nothing to enumerate. Neither count is a single index probe: both
+    carry the same consumer fence as the statements they stand in for (they have to, or
+    this would enqueue work the run then declines), so each is a scan of the registration
+    table with two anti-joins — cheap at the current scale and worth measuring before the
+    table grows. Never allowed to fail the poll: enumeration is recoverable work and the
+    next tick asks again.
     """
     if not settings.LYRICS_FOLLOW_DEMAND_ENABLED:
         return
     try:
         from worker.clients.sqs_producer import enqueue_discography_enumeration
-        from worker.service.lyrics_discography_service import due_count
+        from worker.service.lyrics_discography_service import due_count, refresh_due_count
 
         due = due_count(SessionLocal)
-        if due:
-            logger.info("discography enumeration due for %d artist(s) — enqueuing", due)
+        stale = refresh_due_count(SessionLocal, settings.LYRICS_DISCOGRAPHY_REFRESH_HOURS)
+        if due or stale:
+            logger.info(
+                "discography enumeration: %d artist(s) due, %d refresh(es) due — enqueuing",
+                due, stale,
+            )
             enqueue_discography_enumeration()
     except Exception as e:
         logger.warning(
             "discography enumeration nudge failed (poll unaffected): %s", type(e).__name__
         )
+
+
+def _nudge_backcatalogue_ingest() -> None:
+    """Start a back-catalogue ingest run if follow releases are waiting on the catalog.
+
+    Same shape as the enumeration nudge and for the same reason: once the backlog is read,
+    releases under the gate are resting and nothing is waiting, so the steady state is one
+    count per poll and no message. Never allowed to fail the poll.
+    """
+    if not settings.LYRICS_FOLLOW_DEMAND_ENABLED:
+        return
+    if settings.LYRICS_BACKCATALOGUE_BATCHES_PER_RUN <= 0:
+        return
+    try:
+        from worker.clients.sqs_producer import enqueue_backcatalogue_ingest
+        from worker.service.lyrics_backcatalogue_service import waiting_count
+
+        waiting = waiting_count(SessionLocal)
+        if waiting:
+            logger.info("back-catalogue ingest: %d release(s) waiting — enqueuing", waiting)
+            enqueue_backcatalogue_ingest()
+    except Exception as e:
+        logger.warning(
+            "back-catalogue ingest nudge failed (poll unaffected): %s", type(e).__name__
+        )
+
+
+def _run_backcatalogue_ingest() -> None:
+    """Read waiting follow releases and write the ones that clear the curation gate
+    (OPS-project-stabilization Step 2C). Triggered by {"job": "lyrics_backcatalogue_ingest"}
+    on blogSQS, which the member poll enqueues while releases are waiting. No EventBridge
+    schedule, like the enumeration it follows: it has work only after a follow or a
+    refresh finds a release the catalog does not hold.
+
+    The kill switch is checked here as well as in the nudge, because a message already in
+    flight would otherwise spend provider reads after the owner threw it.
+    """
+    if not settings.LYRICS_FOLLOW_DEMAND_ENABLED:
+        logger.info("back-catalogue ingest skipped — LYRICS_FOLLOW_DEMAND_ENABLED=false")
+        return
+
+    from worker.service.lyrics_backcatalogue_service import run_backcatalogue_ingest
+
+    run_backcatalogue_ingest(
+        SessionLocal,
+        spotify,
+        AlbumSyncService(SessionLocal).sync_fetched_albums,
+        pop_min=settings.ALBUM_POP_MIN,
+        max_catalog_albums=settings.MAX_CATALOG_ALBUMS,
+        max_batches=settings.LYRICS_BACKCATALOGUE_BATCHES_PER_RUN,
+        rest_days=settings.LYRICS_BACKCATALOGUE_REST_DAYS,
+        market=settings.SPOTIFY_DEFAULT_MARKET,
+    )
 
 
 def _run_member_demand_bootstrap(user_id: Any) -> None:
@@ -169,6 +235,7 @@ def _run_member_demand_bootstrap(user_id: Any) -> None:
     # above has just registered every artist this member follows, and none of them is
     # enumerated yet. Start reading immediately instead of waiting for the next cron.
     _nudge_discography_enumeration()
+    _nudge_backcatalogue_ingest()
 
 
 def _run_follow_import(user_id: Any, rerun: bool = False) -> None:
@@ -208,9 +275,10 @@ def _run_discography_enumeration(hops: int = 0) -> None:
 
     Triggered by {"job": "lyrics_discography_enumerate"} on the blogSQS queue, which
     the member poll enqueues whenever it observes due work. Deliberately NOT a new
-    EventBridge schedule: enumeration is demand-driven — it only has work when a member
-    follows someone new — so a fixed cron would be two indexed no-op SELECTs a minute
-    for the months between joins.
+    EventBridge schedule: enumeration is demand-driven — it has work when a member follows
+    someone new, and once per LYRICS_DISCOGRAPHY_REFRESH_HOURS when the completed
+    discographies come due for their refresh — so the poll's nudge, which already knows
+    which of the two holds, is the scheduler.
 
     The run is bounded (artists per run x pages per artist) and resumable from each
     artist's checkpoint, which is D5's distinction: a bound on one invocation is an
@@ -795,6 +863,12 @@ def _handle(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             # member poll when due work exists, and self-chained while it remains.
             if body.get("job") == "lyrics_discography_enumerate":
                 _run_discography_enumeration(hops=body.get("hops") or 0)
+                continue
+
+            # Back-catalogue ingest for follow demand (OPS-project-stabilization Step
+            # 2C). Enqueued by the member poll while follow releases wait on the catalog.
+            if body.get("job") == "lyrics_backcatalogue_ingest":
+                _run_backcatalogue_ingest()
                 continue
 
             # Follow-import fan-out: catalog-ingest a chunk of followed artists

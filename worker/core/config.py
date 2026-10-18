@@ -328,6 +328,21 @@ class Settings(BaseSettings):
     # the hop cap stops a loop that a permanently-failing artist would otherwise sustain.
     LYRICS_DISCOGRAPHY_MAX_HOPS: int = 20
 
+    # OPS-project-stabilization Step 2C — back-catalogue ingest for follow demand. Reads
+    # the releases a follow wants that `albums` does not hold and writes the ones at or
+    # above ALBUM_POP_MIN (owner decision 2026-10-01: the existing curation gate, not a
+    # new one). It has no switch of its own: LYRICS_FOLLOW_DEMAND_ENABLED stops it, in
+    # both the nudge and the consumer, and 0 batches disables it alone.
+    #
+    # One batch is one GET /albums call (20 ids). At 2 per 15-minute poll the 686
+    # releases waiting on 2026-10-01 take about four and a half hours — a bound on one
+    # invocation, not on scope: whatever is left is still waiting on the next tick.
+    LYRICS_BACKCATALOGUE_BATCHES_PER_RUN: int = 2
+    # How long a release under the gate (or one Spotify no longer serves) rests before
+    # it is read again. Popularity moves, so "never" would strand a release that later
+    # clears the bar; 30 days costs 1/20 of a provider call per resting release.
+    LYRICS_BACKCATALOGUE_REST_DAYS: int = 30
+
     # ISRC backfill (FEAT-lyrics-corpus Step 1b, worker EventBridge job). Bounded like every
     # other scheduled job so a run always finishes inside the 120s Lambda timeout: 500 tracks
     # is 10 Spotify chunks of 50, and the budget stops the loop rather than letting a 429
