@@ -27,6 +27,7 @@ from sqlalchemy.orm import sessionmaker
 from worker.service.lyrics_backcatalogue_service import (
     BELOW_GATE,
     CLAIMED,
+    FAILED,
     INGESTED,
     NOT_IN_CATALOG,
     UNAVAILABLE,
@@ -271,7 +272,7 @@ def test_a_short_response_files_no_verdict_at_all(factory, world):
 
     assert metrics["failed"] == 1 and metrics["ingested"] == 0
     assert not _album_exists(factory, a) and not _album_exists(factory, b)
-    assert {_job(factory, a)["last_reason"], _job(factory, b)["last_reason"]} == {CLAIMED}
+    assert {_job(factory, a)["last_reason"], _job(factory, b)["last_reason"]} == {FAILED}
 
 
 # ---------------------------------------------------------------------------
@@ -388,11 +389,11 @@ def test_a_provider_failure_writes_nothing_and_the_release_is_read_again_later(f
 
     job = _job(factory, album)
     assert metrics["failed"] == 1 and metrics["read"] == 0
-    assert job["last_reason"] == CLAIMED, "no verdict was filed for a read that did not happen"
-    assert timedelta(0) < job["next_attempt_at"] - job["now"] <= timedelta(seconds=300)
+    assert job["last_reason"] == FAILED, "a failed read files no catalog verdict, only a rest"
+    assert timedelta(hours=23) < job["next_attempt_at"] - job["now"] <= timedelta(hours=24)
 
-    # Until the lease expires the release is not retried, so a dead provider costs one
-    # call per lease and not one per tick.
+    # Until the rest is over the release is not retried. The lease alone (300 s) is
+    # shorter than the 15-minute tick, so without the rest it would be one call per tick.
     retry = _Catalog({album: _album(world, album, 90)})
     _resolve(factory)
     _run(factory, retry)
@@ -416,7 +417,7 @@ def test_a_failed_catalog_write_files_no_verdict(factory, world):
         pop_min=_POP_MIN, max_catalog_albums=10**9)
 
     assert metrics["failed"] == 1 and metrics["ingested"] == 0
-    assert _job(factory, album)["last_reason"] == CLAIMED
+    assert _job(factory, album)["last_reason"] == FAILED
 
 
 def test_one_invocation_reads_at_most_its_batch_budget(factory, world):
@@ -508,3 +509,34 @@ def test_an_album_arriving_by_another_path_ends_the_rest(factory, world):
 
     assert _job(factory, rested)["album_id"] is not None
     assert _job(factory, laddered)["album_id"] is None, "a laddered deferral is not cut short"
+
+
+def test_a_batch_that_always_fails_neither_repeats_every_tick_nor_blocks_the_backlog(factory, world):
+    """Review finding (PR #125): claims are oldest-first and the lease is shorter than the
+    tick, so a batch that fails every time used to be claimed and read again on every
+    poll, for ever, with every younger release waiting behind it."""
+    poison = _sid(world, "poison")
+    _follow(factory, world, [poison])
+    healthy = _sid(world, "healthy")
+    _follow(factory, world, [healthy])  # created later -> behind the poison in claim order
+
+    class _Poison(_Catalog):
+        def get_albums(self, ids, market=None):
+            self.calls.append(list(ids))
+            if poison in ids:
+                raise RuntimeError("400 on this id")
+            return [self.by_id.get(i) for i in ids]
+
+    catalog = _Poison({healthy: _album(world, healthy, 90)})
+    # One id per batch so the two releases sit in different batches.
+    with patch("worker.service.lyrics_backcatalogue_service.BATCH_SIZE", 1):
+        first = _run(factory, catalog, max_batches=1)
+        assert first["failed"] == 1 and _job(factory, poison)["last_reason"] == FAILED
+
+        # Next tick: the claim lease would have lapsed by now; the rest has not.
+        _resolve(factory)
+        second = _run(factory, catalog, max_batches=1)
+
+    assert second["ingested"] == 1, "the release behind the failing one is read"
+    assert [c for c in catalog.calls if poison in c] == [[poison]], "the failing batch is not re-read"
+    assert _in_catalog(factory, healthy) >= 1

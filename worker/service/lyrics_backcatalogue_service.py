@@ -61,6 +61,7 @@ CLAIMED = "album_ingest_claimed"
 INGESTED = "album_ingested"
 BELOW_GATE = "album_below_popularity_gate"
 UNAVAILABLE = "album_unavailable"
+FAILED = "album_ingest_failed"
 
 # GET /albums takes at most 20 ids, so one batch is exactly one provider call.
 BATCH_SIZE = 20
@@ -129,6 +130,7 @@ def run_backcatalogue_ingest(
     max_catalog_albums: int,
     max_batches: int = 2,
     rest_days: int = 30,
+    failure_rest_hours: int = 24,
     lease_seconds: int = 300,
     time_budget_sec: float = 60.0,
     market: Optional[str] = None,
@@ -138,8 +140,12 @@ def run_backcatalogue_ingest(
     `sync_fetched` receives the GET /albums objects that passed and writes them to the
     catalog in its own transactions (`AlbumSyncService.sync_fetched_albums`).
 
-    Never raises for a provider or sync failure: the claimed jobs keep their lease, the
-    resolver returns them to the pool when it expires, and a later run reads them again.
+    Never raises for a provider or sync failure. The batch that failed rests for
+    `failure_rest_hours` under its own reason and the run stops. Without that rest the
+    claim would lapse inside one 15-minute tick (the lease is shorter than the tick), the
+    oldest-first claim would pick the very same batch again, and one release that fails
+    every time would cost a provider call per tick for ever while holding the whole
+    backlog behind it. Claimed jobs the run did not reach keep only their lease.
     Returns a metrics dict; `remaining` is what is still waiting afterwards.
     """
     metrics = {
@@ -170,6 +176,15 @@ def run_backcatalogue_ingest(
     headroom = max_catalog_albums - album_count
     started = time.monotonic()
 
+    def _rest_failed(batch: List[tuple]) -> None:
+        # Sorted by job id, like the verdict write-back below.
+        with session_factory() as session:
+            now = session.execute(text("SELECT now()")).scalar_one()
+            store = LyricsDemandStore(session.connection())
+            for job_id, _sid in sorted(batch, key=lambda b: str(b[0])):
+                store.defer_catalog(job_id, FAILED, now + timedelta(hours=failure_rest_hours))
+            session.commit()
+
     for start in range(0, len(claimed), BATCH_SIZE):
         if time.monotonic() - started >= time_budget_sec:
             break
@@ -183,17 +198,19 @@ def run_backcatalogue_ingest(
             metrics["failed"] += 1
             logger.warning(
                 "backcatalogue_ingest: GET /albums failed for %d id(s): %s — "
-                "claims left to expire", len(ids), type(e).__name__,
+                "batch rests %dh", len(ids), type(e).__name__, failure_rest_hours,
             )
+            _rest_failed(batch)
             break
         if len(albums) != len(ids):
             # The response is positional. A short one cannot be matched to the request,
             # and guessing would file one release's verdict against another's job.
             metrics["failed"] += 1
             logger.warning(
-                "backcatalogue_ingest: GET /albums returned %d object(s) for %d id(s)",
-                len(albums), len(ids),
+                "backcatalogue_ingest: GET /albums returned %d object(s) for %d id(s) — "
+                "batch rests %dh", len(albums), len(ids), failure_rest_hours,
             )
+            _rest_failed(batch)
             break
         metrics["read"] += len(ids)
 
@@ -223,8 +240,9 @@ def run_backcatalogue_ingest(
                 metrics["failed"] += 1
                 logger.exception(
                     "backcatalogue_ingest: catalog write failed for %d album(s) — "
-                    "claims left to expire", len(passed),
+                    "batch rests %dh", len(passed), failure_rest_hours,
                 )
+                _rest_failed(batch)
                 break
             headroom -= len(passed)
 
