@@ -137,11 +137,13 @@ class Settings(BaseSettings):
     ALBUM_POP_MIN: int = 20
     SWEEP_ARTISTS_PER_TICK: int = 30
     MAX_ENQUEUE_PER_TICK: int = 60
-    # 5000 -> 8000 (OPS-project-stabilization Step 2C, owner 2026-10-01). The cap is a
+    # 5000 -> 8000 (OPS-project-stabilization Step 2C, owner 2026-10-01); 8000 -> 12000
+    # (FEAT-lyrics-listening-experience Step 5, owner 2026-10-20). The cap is a
     # curation checkpoint, not a storage limit, and run_album_ingest returns before
-    # sweeping once it is reached — which also stops release-calendar confirmation.
-    # The catalog reached 5000 on 2026-10-05 growing ~190/week; 8000 is ~14 weeks.
-    MAX_CATALOG_ALBUMS: int = 8000
+    # sweeping once it is reached — which also stops release-calendar confirmation —
+    # and run_backcatalogue_ingest stops reading. The catalog was 6173 on 2026-10-19,
+    # growing ~300-340/week outside follow back-catalogue; 12000 is ~4 months.
+    MAX_CATALOG_ALBUMS: int = 12000
     # RFC DATA-catalog-noise-and-lyrics-coverage Step 2. Reversible by flipping
     # this flag; the ingest filter deletes nothing from the catalog.
     INGEST_EXCLUDE_CLASSICAL: bool = True
